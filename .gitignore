@@ -1,29 +1,37 @@
-# ---- OS / Editor ----
-.DS_Store
-.vscode/
-.idea/
-
-# ---- Python ----
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
 .env
 *.env
-.ruff_cache/
 
-# ---- Rust / Anchor ----
+# Editors / IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Receipts & local state
+receipts/
+merkle_state.json
+pool_merkle_state.json
+
+# Solana / Anchor / Rust
 target/
 .anchor/
 .programs/
 .idl/
 .solana/
+Cargo.lock
 
-# ---- Node (future) ----
+# Node (future)
 node_modules/
 dist/
 build/
 
+<<<<<<< HEAD
 <<<<<<< HEAD
 # Marimo
 marimo/_static/
@@ -51,3 +59,17 @@ pool_merkle_state.json
 # Local receipts (optional; ignore if you don't want them in git)
 receipts/
 >>>>>>> 624483a (update .gitignore rules)
+=======
+# Keys & secrets (NEVER commit)
+keys/
+*.key
+*.pem
+*.p12
+*.der
+*.b58
+*.json
+
+# Databases / misc
+*.db
+*.sqlite
+>>>>>>> e61e03b (Update .gitignore rules)
