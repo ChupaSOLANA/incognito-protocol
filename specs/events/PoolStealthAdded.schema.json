@@ -1,0 +1,25 @@
+{
+  "$id": "PoolStealthAdded.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PoolStealthAdded",
+  "type": "object",
+  "required": [
+    "event_id",
+    "kind",
+    "ts",
+    "owner_pub",
+    "stealth_pub",
+    "eph_pub_b58",
+    "counter"
+  ],
+  "properties": {
+    "event_id": { "type": "string", "minLength": 1 },
+    "kind": { "const": "PoolStealthAdded" },
+    "ts": { "type": "string", "format": "date-time" },
+    "owner_pub": { "type": "string", "minLength": 32 },
+    "stealth_pub": { "type": "string", "minLength": 32 },
+    "eph_pub_b58": { "type": "string", "minLength": 32 },
+    "counter": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

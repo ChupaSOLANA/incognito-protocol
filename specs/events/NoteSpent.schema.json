@@ -1,0 +1,16 @@
+{
+  "$id": "NoteSpent.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NoteSpent",
+  "type": "object",
+  "required": ["event_id", "kind", "ts", "nullifier", "commitment", "epoch"],
+  "properties": {
+    "event_id": { "type": "string", "minLength": 1 },
+    "kind": { "const": "NoteSpent" },
+    "ts": { "type": "string", "format": "date-time" },
+    "nullifier": { "type": "string", "pattern": "^[0-9a-fA-F]+$" },
+    "commitment": { "type": "string", "pattern": "^[0-9a-fA-F]+$" },
+    "epoch": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

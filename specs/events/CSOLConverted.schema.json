@@ -1,0 +1,15 @@
+{
+  "$id": "CSOLConverted.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CSOLConverted",
+  "type": "object",
+  "required": ["event_id", "kind", "ts", "amount", "direction"],
+  "properties": {
+    "event_id": { "type": "string", "minLength": 1 },
+    "kind": { "const": "CSOLConverted" },
+    "ts": { "type": "string", "format": "date-time" },
+    "amount": { "type": "integer", "minimum": 0, "description": "lamports" },
+    "direction": { "enum": ["to_csol", "from_csol"] }
+  },
+  "additionalProperties": false
+}

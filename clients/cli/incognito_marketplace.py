@@ -7,6 +7,8 @@ from __future__ import annotations
 import os, sys, shlex, time, json, secrets, tempfile, subprocess
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from typing import List, Tuple, Optional, Dict, Any
+from clients.cli.emit import emit, events_replay
+
 
 # ======== Color accents (no deps) ========
 class C:
@@ -159,6 +161,16 @@ def get_sol_balance(pubkey: str, quiet: bool = False) -> float:
     except ValueError:
         raise SystemExit(f"Unable to parse SOL balance from: {out}")
 
+# ======== Event helpers ========
+def _lamports(amount_str: str | Decimal | float) -> int:
+    """Convert SOL decimal into lamports (int) for events storage."""
+    d = Decimal(str(amount_str))
+    return int((d * Decimal("1000000000")).to_integral_value(rounding=ROUND_DOWN))
+
+def _epoch() -> int:
+    """Very simple minute-bucket epoch for metrics."""
+    return int(time.time() // 60)
+
 # ======== Receipts ========
 def _write_receipt(kind: str, payload: dict) -> None:
     os.makedirs("receipts", exist_ok=True)
@@ -290,6 +302,15 @@ def add_pool_stealth_record(owner_pubkey: str, stealth_pubkey: str, eph_pub_b58:
     recs.append(rec)
     st["records"] = recs
     _save_pool_state(st)
+    # Emit PoolStealthAdded (log-only projection)
+    try:
+        emit("PoolStealthAdded",
+             owner_pub=owner_pubkey,
+             stealth_pub=stealth_pubkey,
+             eph_pub_b58=eph_pub_b58,
+             counter=int(counter))
+    except Exception as _e:
+        print(f"{C.DIM}[events] PoolStealthAdded failed to emit: {_e}{C.RST}")
     return c
 
 # ======== Amount/Prompt helpers ========
@@ -337,6 +358,18 @@ def add_note(st: dict, recipient_pub: str, amount_str: str, note_hex: str, nonce
     notes.append(rec)
     st["notes"] = notes
     _rebuild_and_reindex_wrapper(st)
+
+    # Emit NoteIssued
+    try:
+        emit("NoteIssued",
+             commitment=commitment,
+             amount=_lamports(amount_str),
+             recipient_tag_hex=rec["recipient_tag_hex"],
+             blind_sig_hex=blind_sig_hex,
+             epoch=_epoch())
+    except Exception as _e:
+        print(f"{C.DIM}[events] NoteIssued failed to emit: {_e}{C.RST}")
+
     return rec
 
 def add_note_with_precomputed_commitment(
@@ -364,6 +397,18 @@ def add_note_with_precomputed_commitment(
     notes.append(rec)
     st["notes"] = notes
     _rebuild_and_reindex_wrapper(st)
+
+    # Emit NoteIssued
+    try:
+        emit("NoteIssued",
+             commitment=commitment_hex,
+             amount=_lamports(amount_str),
+             recipient_tag_hex=recipient_tag_hex,
+             blind_sig_hex=blind_sig_hex,
+             epoch=_epoch())
+    except Exception as _e:
+        print(f"{C.DIM}[events] NoteIssued failed to emit: {_e}{C.RST}")
+
     return rec
 
 def _tag_hex_for_pub(pub: str) -> str:
@@ -515,7 +560,7 @@ def flow_shielded_deposit_split_to_pool() -> None:
     print(f"Ephemeral pub (for receipt): {eph_pub_b58}")
     print(f"Pool stealth addr          : {stealth_pool_addr}")
 
-    # Index Merkle Pool (owner_pubkey = pool_pub)
+    # Index Merkle Pool (owner_pubkey = pool_pub) + emit PoolStealthAdded inside helper
     c_hex = add_pool_stealth_record(pool_pub, stealth_pool_addr, eph_pub_b58, 0)
     print(f"Pool stealth commitment: {c_hex}")
 
@@ -550,6 +595,12 @@ def flow_shielded_deposit_split_to_pool() -> None:
     mt = _build_merkle_from_wrapper(_load_wrapper_state())
     root_hex = mt.root().hex()
     rtag = recipient_tag(rec_pubkey).hex()[:16]
+
+    # Emit latest MerkleRootUpdated (wrapper changed)
+    try:
+        emit("MerkleRootUpdated", epoch=_epoch(), root_hex=root_hex)
+    except Exception as _e:
+        print(f"{C.DIM}[events] MerkleRootUpdated failed: {_e}{C.RST}")
 
     print("\n--- Shielded Deposit Receipt ---")
     print(f"Depositor     : {users[depositor_idx]}")
@@ -645,12 +696,19 @@ def flow_blind_note_handoff() -> None:
             raise SystemExit(f"[BlindSig] Verification failed on input (idx={idx})")
         used_inputs.append({"index": idx, "commitment": n["commitment"]})
 
-    # Mark inputs as spent + nullifiers
+    # Mark inputs as spent + nullifiers (+ emit NoteSpent)
     for n in chosen:
         n["spent"] = True
         try:
             nf = make_nullifier(bytes.fromhex(n["note_hex"]))
             mark_nullifier(st, nf)
+            try:
+                emit("NoteSpent",
+                     nullifier=nf,
+                     commitment=n["commitment"],
+                     epoch=_epoch())
+            except Exception as _e:
+                print(f"{C.DIM}[events] NoteSpent failed to emit: {_e}{C.RST}")
         except Exception:
             pass
 
@@ -689,6 +747,13 @@ def flow_blind_note_handoff() -> None:
 
     _rebuild_and_reindex_wrapper(st)
     new_root = _build_merkle_from_wrapper(st).root().hex()
+
+    # Emit MerkleRootUpdated (wrapper changed)
+    try:
+        emit("MerkleRootUpdated", epoch=_epoch(), root_hex=new_root)
+    except Exception as _e:
+        print(f"{C.DIM}[events] MerkleRootUpdated failed: {_e}{C.RST}")
+
     print(f"\n{C.OK}Blind handoff done.{C.RST} New Merkle root: {new_root}")
     print("Next steps: Recipient can run 'Shielded Withdraw' to receive cSOL.")
 
@@ -799,6 +864,13 @@ def flow_withdraw_simple() -> None:
         try:
             nf = make_nullifier(bytes.fromhex(n["note_hex"]))
             mark_nullifier(st, nf)
+            try:
+                emit("NoteSpent",
+                     nullifier=nf,
+                     commitment=n["commitment"],
+                     epoch=_epoch())
+            except Exception as _e:
+                print(f"{C.DIM}[events] NoteSpent failed to emit: {_e}{C.RST}")
         except Exception:
             pass
 
@@ -815,6 +887,19 @@ def flow_withdraw_simple() -> None:
     _rebuild_and_reindex_wrapper(st)
     mt2 = _build_merkle_from_wrapper(st)
     new_root = mt2.root().hex()
+
+    # Emit CSOLConverted (notes -> cSOL delivered)
+    try:
+        emit("CSOLConverted", amount=_lamports(amt_str), direction="to_csol")
+    except Exception as _e:
+        print(f"{C.DIM}[events] CSOLConverted(to_csol) failed: {_e}{C.RST}")
+
+    # Emit MerkleRootUpdated (wrapper changed)
+    try:
+        emit("MerkleRootUpdated", epoch=_epoch(), root_hex=new_root)
+    except Exception as _e:
+        print(f"{C.DIM}[events] MerkleRootUpdated failed: {_e}{C.RST}")
+
     print(f"New Merkle root: {new_root}")
 
     _write_receipt("withdraw", {
@@ -893,7 +978,7 @@ def flow_convert_csol_to_sol_split() -> None:
     parts = random_split_amounts(amount_dec, n_out)
     for i, p in enumerate(parts, 1):
         eph_pub_b58, stealth_addr = generate_stealth_for_recipient(recipient_pubkey)
-        add_pool_stealth_record(recipient_pubkey, stealth_addr, eph_pub_b58, 0)
+        add_pool_stealth_record(recipient_pubkey, stealth_addr, eph_pub_b58, 0)  # emits PoolStealthAdded
         outputs.append({"amount": _fmt_amt(p), "stealth": stealth_addr, "eph_pub_b58": eph_pub_b58})
         print(f"  Out {i}/{n_out}: {_fmt_amt(p)} SOL -> {stealth_addr} (eph {eph_pub_b58})")
 
@@ -906,6 +991,12 @@ def flow_convert_csol_to_sol_split() -> None:
 
     print("[8/8] Conversion complete.")
     print(f"\n{C.OK}Converted {amt_str} cSOL → SOL via {n_out} stealth outputs to self.{C.RST}")
+
+    # Emit CSOLConverted (from cSOL)
+    try:
+        emit("CSOLConverted", amount=_lamports(amt_str), direction="from_csol")
+    except Exception as _e:
+        print(f"{C.DIM}[events] CSOLConverted(from_csol) failed: {_e}{C.RST}")
 
     _write_receipt("convert", {
         "owner_pub": recipient_pubkey,
@@ -1051,6 +1142,12 @@ def flow_sweep_stealth_to_pubkey() -> None:
         "ts": int(time.time()),
     })
 
+    # Emit SweepDone
+    try:
+        emit("SweepDone", owner_pub=owner_pub, count=len(plan))
+    except Exception as _e:
+        print(f"{C.DIM}[events] SweepDone failed to emit: {_e}{C.RST}")
+
 def print_merkle_status() -> None:
     # Wrapper (notes)
     wst = _load_wrapper_state()
@@ -1083,9 +1180,15 @@ def flow_prune_reindex() -> None:
     st = _load_wrapper_state()
     _rebuild_and_reindex_wrapper(st)
     mt = _build_merkle_from_wrapper(st)
+    new_root = mt.root().hex()
     print("Prune & reindex done.")
-    print(f"New root: {mt.root().hex()}")
-    _write_receipt("prune_reindex", {"new_root": mt.root().hex(), "ts": int(time.time())})
+    print(f"New root: {new_root}")
+    _write_receipt("prune_reindex", {"new_root": new_root, "ts": int(time.time())})
+    # Emit MerkleRootUpdated
+    try:
+        emit("MerkleRootUpdated", epoch=_epoch(), root_hex=new_root)
+    except Exception as _e:
+        print(f"{C.DIM}[events] MerkleRootUpdated failed: {_e}{C.RST}")
 
 # ======== Bootstrapping: ensure blind signer key exists ========
 try:
@@ -1111,6 +1214,7 @@ def main() -> None:
         print("6. Sweep Stealth → destination pubkey (consolidate)")
         print("7. Show Merkle Trees (Wrapper & Pool)")
         print("8. Status (users, notes, pool)")
+        print("9. Replay State from Event Log")
         print("q. Quit")
         choice = input("> ").strip().lower()
 
@@ -1130,6 +1234,9 @@ def main() -> None:
             print_merkle_status()
         elif choice == "8":
             flow_status()
+        elif choice == "9":
+            n = events_replay()
+            print(f"{C.OK}Replayed {n} events and rebuilt state from tx_log.{C.RST}")
         elif choice == "q":
             print("Bye.")
             break

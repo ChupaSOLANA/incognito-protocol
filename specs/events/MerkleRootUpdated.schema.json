@@ -1,0 +1,15 @@
+{
+  "$id": "MerkleRootUpdated.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MerkleRootUpdated",
+  "type": "object",
+  "required": ["event_id", "kind", "ts", "epoch", "root_hex"],
+  "properties": {
+    "event_id": { "type": "string", "minLength": 1 },
+    "kind": { "const": "MerkleRootUpdated" },
+    "ts": { "type": "string", "format": "date-time" },
+    "epoch": { "type": "integer", "minimum": 0 },
+    "root_hex": { "type": "string", "pattern": "^[0-9a-fA-F]+$" }
+  },
+  "additionalProperties": false
+}
