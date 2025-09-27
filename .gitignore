@@ -1,4 +1,6 @@
+# --------------------
 # Python
+# --------------------
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -6,19 +8,42 @@ __pycache__/
 .env
 *.env
 
+# --------------------
 # Editors / IDE
+# --------------------
 .vscode/
 .idea/
 
+# --------------------
 # OS
+# --------------------
 .DS_Store
 
-# Receipts & local state
+# --------------------
+# Tests / Coverage / Misc
+# --------------------
+.ipynb_checkpoints
+.coverage*
+.pytest_cache/
+.cache
+*.log
+
+# --------------------
+# Databases
+# --------------------
+*.db
+*.sqlite
+
+# --------------------
+# Receipts & Local State
+# --------------------
 receipts/
 merkle_state.json
 pool_merkle_state.json
 
+# --------------------
 # Solana / Anchor / Rust
+# --------------------
 target/
 .anchor/
 .programs/
@@ -26,50 +51,23 @@ target/
 .solana/
 Cargo.lock
 
+# --------------------
 # Node (future)
+# --------------------
 node_modules/
 dist/
 build/
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
-
-ops/ledger/
-=======
-# ---- Test / Coverage / Misc ----
-.ipynb_checkpoints
-.coverage*
-.pytest_cache/
-.cache
-*.db
-*.sqlite
-
-# ---- Project-specific (critical) ----
+# --------------------
+# Project-specific (critical)
+# --------------------
 keys/
 blind_keys/
 
-# Local state files
-merkle_state.json
-pool_merkle_state.json
-
-# Local receipts (optional; ignore if you don't want them in git)
-receipts/
->>>>>>> 624483a (update .gitignore rules)
-=======
 # Keys & secrets (NEVER commit)
-keys/
 *.key
 *.pem
 *.p12
 *.der
 *.b58
 *.json
-
-# Databases / misc
-*.db
-*.sqlite
->>>>>>> e61e03b (Update .gitignore rules)
