@@ -92,7 +92,7 @@ def fmt_amt(x) -> str:
 def ensure_state():
     st.session_state.setdefault("active_keyfile", None)
     st.session_state.setdefault("active_pub", None)
-    st.session_state.setdefault("blur_amounts", True)
+    st.session_state.setdefault("blur_amounts", False)
     st.session_state.setdefault("auto_refresh", False)
     st.session_state.setdefault("auto_refresh_interval", 10)
 ensure_state()
@@ -308,9 +308,12 @@ with tab_handoff:
     st.subheader("Off-chain Blind Handoff (notes A → B)")
     recip_pub = recipient_selector("handoff_recipient", active_key, active_pub)
     amt_h = st.text_input("Amount (SOL)", value="5", key="handoff_amt")
-    nout = st.number_input("Number of blinded outputs", value=2, min_value=1, step=1)
     if st.button("Handoff", type="primary"):
-        payload = {"sender_keyfile": active_key, "recipient_pub": recip_pub.strip(), "amount_sol": amt_h.strip(), "n_outputs": int(nout)}
+        payload = {
+            "sender_keyfile": active_key,
+            "recipient_pub": recip_pub.strip(),
+            "amount_sol": amt_h.strip(),
+        }
         flash("Submitting handoff…")
         c, res = api_post("/handoff", payload)
         if c == 200:
@@ -365,37 +368,98 @@ with tab_stealth:
 with tab_sweep:
     st.subheader("Sweep funds from stealth → destination pubkey")
 
-    # Show total sweepable using the same filtered stealth_data
     if stealth_data:
+        items = stealth_data.get("items", [])
         total = stealth_data.get("total_sol", "0")
+
         shown_total = "•••" if st.session_state["blur_amounts"] else total
         st.info(f"Sweepable total (≥ {MIN_STEALTH_SOL} SOL per address): **{shown_total} SOL**")
-    else:
-        st.warning("Sweepable total not available.")
 
-    others = other_known_wallet_pks(active_key)
-    dest_pub = st.text_input(
-        "Destination pubkey",
-        value=(others[0]["pubkey"] if others else active_pub),
-        help="You can paste any pubkey; default is first other known user or yourself.",
-    )
-    all_amt_sw = st.checkbox("Sweep ALL available (excl. buffer)", value=True, key="sweep_all")
-    amt_sw = None
-    if not all_amt_sw:
-        amt_sw = st.text_input("Amount (SOL)", value="1.5", key="sweep_amt")
-    if st.button("Sweep", type="primary"):
-        payload = {"owner_pub": active_pub, "secret_keyfile": active_key, "dest_pub": dest_pub.strip()}
-        if not all_amt_sw and amt_sw:
-            payload["amount_sol"] = amt_sw.strip()
-        flash("Submitting sweep…")
-        c, res = api_post("/sweep", payload)
-        if c == 200:
-            flash("Sweep sent ✅", "success")
-            st.json(res)
-            safe_rerun()
+        # Build options list and lookup maps
+        options = []
+        opt_to_pub = {}
+        pub_to_bal = {}
+        for it in items:
+            pk = it.get("stealth_pubkey")
+            bal = str(it.get("balance_sol") or "0")
+            label = f"{short(pk, 8)}  —  {fmt_amt(bal)} SOL"
+            options.append(label)
+            opt_to_pub[label] = pk
+            pub_to_bal[pk] = bal
+
+        if not options:
+            st.warning("No stealth addresses above the threshold.")
         else:
-            flash("Sweep failed ❌", "error")
-            st.error(res)
+            # Keep selection in session state so Select all works
+            st.session_state.setdefault("sweep_selected", [])
+
+            # Select all button only
+            if st.button("Select all"):
+                st.session_state["sweep_selected"] = options[:]  # all labels
+                safe_rerun()
+
+            # Multiselect widget bound to session state
+            selected_labels = st.multiselect(
+                "Stealth addresses",
+                options=options,
+                default=st.session_state["sweep_selected"],
+                help="Pick one or many. Use Select all to include every listed address.",
+                key="sweep_multisel",
+            )
+            st.session_state["sweep_selected"] = selected_labels
+
+            # Convert to pubkeys and compute selected total
+            selected_pubkeys = [opt_to_pub[l] for l in selected_labels]
+            from decimal import Decimal
+            selected_total_dec = sum(Decimal(str(pub_to_bal[pk])) for pk in selected_pubkeys) if selected_pubkeys else Decimal("0")
+            selected_total_str = fmt_amt(selected_total_dec)
+            shown_selected_total = "•••" if st.session_state["blur_amounts"] else selected_total_str
+
+            st.success(f"Selected: **{len(selected_pubkeys)} / {len(options)}** addresses · Total: **{shown_selected_total} SOL**")
+
+            # Destination + amount UI
+            others = other_known_wallet_pks(active_key)
+            dest_pub = st.text_input(
+                "Destination pubkey",
+                value="",
+                help="You can paste any pubkey.",
+            ).strip()
+
+            all_amt_sw = st.checkbox(
+                "Sweep ALL available from selected addresses (excl. buffer)",
+                value=True,
+                key="sweep_all",
+            )
+            amt_sw = None
+            if not all_amt_sw:
+                # Prefill with selected total
+                amt_sw = st.text_input("Amount (SOL)", value=selected_total_str, key="sweep_amt").strip()
+
+            if st.button("Sweep", type="primary"):
+                if not dest_pub:
+                    st.error("Destination pubkey required.")
+                else:
+                    payload = {
+                        "owner_pub": active_pub,
+                        "secret_keyfile": active_key,
+                        "dest_pub": dest_pub,
+                    }
+                    if selected_pubkeys:
+                        payload["stealth_pubkeys"] = selected_pubkeys
+                    if not all_amt_sw and amt_sw:
+                        payload["amount_sol"] = amt_sw
+                    flash("Submitting sweep…")
+                    c, res = api_post("/sweep", payload)
+                    if c == 200:
+                        flash("Sweep sent ✅", "success")
+                        st.json(res)
+                        safe_rerun()
+                    else:
+                        flash("Sweep failed ❌", "error")
+                        st.error(res)
+    else:
+        st.warning("Stealth info not available from API.")
+
 
 # --- Overview ---
 with tab_overview:

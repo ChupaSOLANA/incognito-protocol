@@ -72,7 +72,7 @@ from services.crypto_core.blind_api import (  # noqa: E402
     load_pub as bs_load_pub,
     verify as bs_verify,
 )
-from services.crypto_core.splits import greedy_coin_select, random_split_amounts  # noqa: E402
+from services.crypto_core.splits import greedy_coin_select, split_bounded  # noqa: E402
 
 # ===== Shell helpers =====
 def _hint(msg: str) -> str:
@@ -742,15 +742,14 @@ def flow_blind_note_handoff() -> None:
         return
 
     req_amt = _ask_amount_or_all("Amount to handoff (or 'all')", avail)
-    n_out_raw = input("Number of blinded outputs to B (default 2): ").strip()
-    n_out = int(n_out_raw) if (n_out_raw and n_out_raw.isdigit()) else 2
-    n_out = max(n_out, 1)
 
+    # --- coin selection (inputs) ---
     notes = list_unspent_notes_for_recipient(st, sender_pub)
     chosen, total = greedy_coin_select(notes, req_amt)
     if not chosen:
         raise SystemExit("Coin selection failed.")
 
+    # --- verify Merkle & blind signatures on inputs ---
     mt = _build_merkle_from_wrapper(st)
     root_hex = mt.root().hex()
     pub = bs_load_pub()
@@ -774,6 +773,7 @@ def flow_blind_note_handoff() -> None:
             raise SystemExit(f"[BlindSig] Verification failed on input (idx={idx})")
         used_inputs.append({"index": idx, "commitment": n["commitment"]})
 
+    # --- mark inputs spent + emit ---
     for n in chosen:
         n["spent"] = True
         try:
@@ -786,27 +786,27 @@ def flow_blind_note_handoff() -> None:
         except Exception:
             pass
 
-    parts = random_split_amounts(req_amt, n_out)
+    # --- single output to B ---
     outputs = []
-    print("\n[Outputs -> B]")
-    for i, p in enumerate(parts, 1):
-        note = secrets.token_bytes(32)
-        nonce = secrets.token_bytes(16)
-        amount_str = _fmt_amt(p)
-        commitment = make_commitment(note, amount_str, nonce, recipient_pub)
-        blind_sig_hex = issue_blind_sig_for_commitment_hex(commitment)
-        add_note_with_precomputed_commitment(
-            st,
-            amount_str=amount_str,
-            commitment_hex=commitment,
-            note_hex=note.hex(),
-            nonce_hex=nonce.hex(),
-            blind_sig_hex=blind_sig_hex,
-            recipient_tag_hex=tag_hex,
-        )
-        outputs.append({"amount": amount_str, "commitment": commitment, "sig_hex": blind_sig_hex})
-        print(f"  Out {i}/{n_out}: {amount_str} SOL | commit={commitment[:16]}… | sig={blind_sig_hex[:16]}…")
+    print("\n[Output -> B]")
+    note = secrets.token_bytes(32)
+    nonce = secrets.token_bytes(16)
+    amount_str = _fmt_amt(req_amt)
+    commitment = make_commitment(note, amount_str, nonce, recipient_pub)
+    blind_sig_hex = issue_blind_sig_for_commitment_hex(commitment)
+    add_note_with_precomputed_commitment(
+        st,
+        amount_str=amount_str,
+        commitment_hex=commitment,
+        note_hex=note.hex(),
+        nonce_hex=nonce.hex(),
+        blind_sig_hex=blind_sig_hex,
+        recipient_tag_hex=tag_hex,
+    )
+    outputs.append({"amount": amount_str, "commitment": commitment, "sig_hex": blind_sig_hex})
+    print(f"  Out: {amount_str} SOL | commit={commitment[:16]}… | sig={blind_sig_hex[:16]}…")
 
+    # --- change back to A (if inputs > requested) ---
     total_dec = Decimal(str(total))
     change = (total_dec - req_amt).quantize(Decimal("0.000000001"), rounding=ROUND_DOWN)
     chg_amt = None
@@ -817,6 +817,7 @@ def flow_blind_note_handoff() -> None:
         chg_amt = _fmt_amt(change)
         print(f"Change back to A: {chg_amt} SOL")
 
+    # --- rebuild & emit new root ---
     _rebuild_and_reindex_wrapper(st)
     new_root = _build_merkle_from_wrapper(st).root().hex()
     try:
@@ -833,12 +834,13 @@ def flow_blind_note_handoff() -> None:
             "to_pub": recipient_pub,
             "amount": _fmt_amt(req_amt),
             "inputs_used": used_inputs,
-            "outputs_created": outputs,
+            "outputs_created": outputs,  # now contains exactly 1 item
             "change_back_to_sender": chg_amt,
             "new_merkle_root": new_root,
             "ts": int(time.time()),
         },
     )
+
 
 
 def flow_withdraw_simple() -> None:
@@ -1074,7 +1076,7 @@ def flow_convert_csol_to_sol_split() -> None:
 
     print("[6/8] Prepare stealth SOL outputs (to self) – paid by Treasury")
     outputs = []
-    parts = random_split_amounts(amount_dec, n_out)
+    parts = split_bounded(amount_dec, n_out, low=0.5, high=1.5)
     for i, p in enumerate(parts, 1):
         eph_pub_b58, stealth_addr = generate_stealth_for_recipient(recipient_pubkey)
         add_pool_stealth_record(recipient_pubkey, stealth_addr, eph_pub_b58, 0)

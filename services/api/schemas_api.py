@@ -55,11 +55,9 @@ class DepositRes(Ok):
 
 # ----- Handoff -----
 class HandoffReq(_DecimalAsStr):
-    sender_keyfile: str = Field(..., description="Sender keyfile path (owner of notes).")
-    recipient_pub: str = Field(..., description="Recipient public key (base58).")
-    amount_sol: condecimal(gt=0) = Field(..., description="Amount to handoff (SOL).")
-    n_outputs: conint(ge=1) = Field(2, description="Number of blinded outputs.")
-
+    sender_keyfile: str
+    recipient_pub: str
+    amount_sol: condecimal(gt=0)
 
 class HandoffRes(Ok):
     inputs_used: List[dict]
@@ -121,6 +119,9 @@ class SweepReq(_DecimalAsStr):
     dest_pub: str = Field(..., description="Destination public key (base58).")
     amount_sol: Optional[condecimal(gt=0)] = Field(
         None, description="Amount to sweep; if omitted, sweep all (minus buffers)."
+    )
+    stealth_pubkeys: Optional[List[str]] = Field(
+        None, description="Optional list of specific stealth addresses to sweep from (overrides automatic selection)."
     )
 
 

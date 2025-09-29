@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from decimal import Decimal, ROUND_DOWN
 from typing import List
+import json
 
 from fastapi import FastAPI, HTTPException
 
@@ -168,25 +169,23 @@ def handoff(req: HandoffReq):
 
         inputs_used.append({"index": idx, "commitment": n["commitment"]})
 
-    from services.crypto_core.splits import random_split_amounts
+    from services.crypto_core.splits import split_bounded
 
-    parts = random_split_amounts(req.amount_sol, max(1, int(req.n_outputs)))
     outputs = []
     tag_hex = ca.recipient_tag(req.recipient_pub).hex()
     import secrets
 
-    for p in parts:
-        note_hex = secrets.token_bytes(32).hex()
-        nonce_hex = secrets.token_bytes(16).hex()
-        amt_str = ca.fmt_amt(p)
-        commitment = ca.make_commitment(bytes.fromhex(note_hex), amt_str, bytes.fromhex(nonce_hex), req.recipient_pub)
-        try:
-            sig = ca.issue_blind_sig_for_commitment_hex(commitment)
-        except Exception:
-            sig = ""
-        # >>> IMPORTANT : écrire les outputs dans le même `st` partagé
-        ca.add_note_with_precomputed(st, amt_str, commitment, note_hex, nonce_hex, sig, tag_hex)
-        outputs.append({"amount": amt_str, "commitment": commitment, "sig_hex": sig})
+    note_hex = secrets.token_bytes(32).hex()
+    nonce_hex = secrets.token_bytes(16).hex()
+    amt_str = ca.fmt_amt(req.amount_sol)
+    commitment = ca.make_commitment(bytes.fromhex(note_hex), amt_str, bytes.fromhex(nonce_hex), req.recipient_pub)
+    try:
+        sig = ca.issue_blind_sig_for_commitment_hex(commitment)
+    except Exception:
+        sig = ""
+    ca.add_note_with_precomputed(st, amt_str, commitment, note_hex, nonce_hex, sig, tag_hex)
+    outputs.append({"amount": amt_str, "commitment": commitment, "sig_hex": sig})
+
 
     total_dec = Decimal(str(total))
     change = (total_dec - req.amount_sol).quantize(Decimal("0.000000001"), rounding=ROUND_DOWN)
@@ -354,9 +353,9 @@ def convert(req: ConvertReq):
         except Exception:
             pass
 
-    from services.crypto_core.splits import random_split_amounts
+    from services.crypto_core.splits import split_bounded
 
-    parts = random_split_amounts(Decimal(req.amount_sol), max(1, int(req.n_outputs)))
+    parts = split_bounded(Decimal(req.amount_sol), max(1, int(req.n_outputs)), low=0.5, high=1.5)
     outputs = []
     for p in parts:
         eph, stealth_addr = ca.generate_stealth_for_recipient(sender_pub)
@@ -407,19 +406,34 @@ def list_stealth(owner_pub: str, include_balances: bool = True, min_sol: float =
 @app.post("/sweep", response_model=SweepRes)
 def sweep(req: SweepReq):
     pst = ca.load_pool_state()
+    # Select records that match owner_pub
     recs = [r for r in pst.get("records", []) if r.get("owner_pubkey") == req.owner_pub]
     if not recs:
-        raise HTTPException(status_code=400, detail="No stealth records")
+        raise HTTPException(status_code=400, detail="No stealth records for owner")
 
     SWEEP_BUFFER_SOL = Decimal("0.001")
-    candidates, total_balance = [], Decimal("0")
+    candidates = []
+    total_balance = Decimal("0")
+
+    # If user provided explicit stealth_pubkeys, filter to those exact addresses.
+    if req.stealth_pubkeys:
+        allowed = set(req.stealth_pubkeys)
+        recs = [r for r in recs if r.get("stealth_pubkey") in allowed]
+        if not recs:
+            raise HTTPException(status_code=400, detail="None of the requested stealth addresses are owned by this owner")
+
+    # Gather balances for chosen recs
     for r in recs:
-        b = Decimal(str(ca.get_sol_balance(r["stealth_pubkey"], quiet=True)))
+        try:
+            b = Decimal(str(ca.get_sol_balance(r["stealth_pubkey"], quiet=True)))
+        except Exception:
+            b = Decimal("0")
         if b >= SWEEP_BUFFER_SOL:
             candidates.append({**r, "balance": b})
             total_balance += b
+
     if total_balance <= 0:
-        raise HTTPException(status_code=400, detail="No non-zero balances")
+        raise HTTPException(status_code=400, detail="No sweepable balances (all below buffer)")
 
     req_amt = total_balance if req.amount_sol is None else Decimal(req.amount_sol)
     candidates.sort(key=lambda x: x["balance"], reverse=True)
@@ -433,17 +447,17 @@ def sweep(req: SweepReq):
             continue
         amt = min(sendable, remain)
         if amt > 0:
-            plan.append((r["stealth_pubkey"], r["eph_pub_b58"], amt, r["counter"]))
+            plan.append((r["stealth_pubkey"], r["eph_pub_b58"], amt, r.get("counter", 0)))
             remain = (remain - amt).quantize(Decimal("0.000000001"), rounding=ROUND_DOWN)
 
-    import json
-    import tempfile
-
+    # secret key handling (unchanged)
     with open(req.secret_keyfile, "r") as f:
         raw_secret = json.load(f)
     rec_sk64 = ca.read_secret_64_from_json_value(raw_secret)
 
     sent_total, txs = Decimal("0"), []
+    import tempfile
+
     for stealth_addr, eph, amt, counter in plan:
         kp = ca.derive_stealth_from_recipient_secret(rec_sk64, eph, counter)
         arr = list(bytes(kp.secret_key))
