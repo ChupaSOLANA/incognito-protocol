@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from decimal import Decimal, ROUND_DOWN
 from typing import List
 import json
@@ -40,6 +41,24 @@ app = FastAPI(title="Incognito Protocol API", version="0.1.0")
 
 def _fmt(x: Decimal | float | str) -> str:
     return str(Decimal(str(x)).quantize(Decimal("0.000000001")))
+
+
+# --- Helper: serialize solders.Keypair to a temp JSON keyfile (64-byte array) ---
+def _write_temp_keypair_from_solders(kp) -> str:
+    """
+    Serialize a solders.Keypair to a temp JSON file as a 64-byte array (secret||pub),
+    compatible with solana CLI / spl-token.
+    """
+    try:
+        sk_bytes = kp.to_bytes()  # solders API
+    except Exception as e:
+        raise RuntimeError(f"Cannot serialize Keypair: {e}")
+    arr = list(sk_bytes)
+    fd, tmp_path = tempfile.mkstemp(prefix="stealth_", suffix=".json")
+    os.close(fd)
+    with open(tmp_path, "w") as f:
+        json.dump(arr, f)
+    return tmp_path
 
 
 # ---------- Metrics ----------
@@ -185,7 +204,6 @@ def handoff(req: HandoffReq):
         sig = ""
     ca.add_note_with_precomputed(st, amt_str, commitment, note_hex, nonce_hex, sig, tag_hex)
     outputs.append({"amount": amt_str, "commitment": commitment, "sig_hex": sig})
-
 
     total_dec = Decimal(str(total))
     change = (total_dec - req.amount_sol).quantize(Decimal("0.000000001"), rounding=ROUND_DOWN)
@@ -450,28 +468,24 @@ def sweep(req: SweepReq):
             plan.append((r["stealth_pubkey"], r["eph_pub_b58"], amt, r.get("counter", 0)))
             remain = (remain - amt).quantize(Decimal("0.000000001"), rounding=ROUND_DOWN)
 
-    # secret key handling (unchanged)
+    # secret key handling
     with open(req.secret_keyfile, "r") as f:
         raw_secret = json.load(f)
     rec_sk64 = ca.read_secret_64_from_json_value(raw_secret)
 
     sent_total, txs = Decimal("0"), []
-    import tempfile
 
     for stealth_addr, eph, amt, counter in plan:
+        # derive stealth keypair and write a temp keyfile compatible with solana CLI
         kp = ca.derive_stealth_from_recipient_secret(rec_sk64, eph, counter)
-        arr = list(bytes(kp.secret_key))
-        fd, path = tempfile.mkstemp(prefix="stealth_", suffix=".json")
-        os.close(fd)
+        tmp_path = _write_temp_keypair_from_solders(kp)
         try:
-            with open(path, "w") as f:
-                json.dump(arr, f)
-            tx_out = ca.solana_transfer(path, req.dest_pub, ca.fmt_amt(amt))
+            tx_out = ca.solana_transfer(tmp_path, req.dest_pub, ca.fmt_amt(amt))
             txs.append(tx_out)
             sent_total += amt
         finally:
             try:
-                os.remove(path)
+                os.remove(tmp_path)
             except Exception:
                 pass
 

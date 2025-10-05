@@ -7,11 +7,11 @@ from typing import Tuple
 
 try:
     import nacl.bindings as nb
-    from solana.keypair import Keypair
+    from solders.keypair import Keypair
     from nacl.signing import SigningKey
 except Exception as e:
     raise SystemExit(
-        "Missing deps for stealth: pip install pynacl base58 solana\n" + str(e)
+        "Missing deps for stealth: pip install pynacl base58 solders solana\n" + str(e)
     )
 
 DOMAIN_TAG = b"sol-stealth-v1"
@@ -44,7 +44,7 @@ def generate_stealth_for_recipient(recipient_pub_b58: str, counter: int = DEFAUL
     eph_pub = nb.crypto_scalarmult_base(eph_scalar)
     shared = nb.crypto_scalarmult(eph_scalar, rec_curve_pub)
     kp = derive_one_time(shared, eph_pub, counter)
-    return base58.b58encode(eph_pub).decode(), str(kp.public_key)
+    return base58.b58encode(eph_pub).decode(), str(kp.pubkey())
 
 def derive_stealth_from_recipient_secret(recipient_sk64: bytes, eph_pub_b58: str, counter: int = 0) -> Keypair:
     curve_sk = ed25519_sk_to_curve25519(recipient_sk64)

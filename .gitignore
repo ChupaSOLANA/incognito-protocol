@@ -71,3 +71,10 @@ blind_keys/
 *.der
 *.b58
 *.json
+
+# Ledger / RocksDB (large, local)
+ops/ledger/
+ops/ledger/**
+*.sst
+*.ldb
+*.log

@@ -1,7 +1,14 @@
 # dashboard/app/dashboard.py
-import os, sys, json, time, subprocess, requests, pathlib
+import os
+import sys
+import json
+import time
+import subprocess
+import requests
+import pathlib
 from decimal import Decimal
 import streamlit as st
+from pathlib import Path
 
 # ---------------- Config ----------------
 st.set_page_config(page_title="Incognito – Demo", page_icon="🕶️", layout="wide")
@@ -24,12 +31,18 @@ try:
     _total_available_for_recipient = mp.total_available_for_recipient  # (state, pubkey) -> Decimal
     _load_wrapper_state = mp._load_wrapper_state
 except Exception as e:
-    MINT = os.getenv("MINT", "6ScGfdRoKuk4gjHVbFjBMwxLdgqxx5gHwKLaZTTj3Zrw")
+    MINT_KEYFILE = Path("/Users/alex/Desktop/incognito-protocol-1/keys/mint.json")
+
+    def _pubkey_from_keyfile(path: Path) -> str:
+        r = subprocess.run(["solana-keygen", "pubkey", str(path)], capture_output=True, text=True, check=True)
+        return r.stdout.strip()
+
+    MINT: str = os.getenv("MINT") or _pubkey_from_keyfile(MINT_KEYFILE)
     st.warning(f"[dashboard] Could not import clients.cli.incognito_marketplace: {e}")
 
 # --------------- Utils ------------------
 def short(pk: str, n=6) -> str:
-    return pk if not pk or len(pk) <= 2*n else f"{pk[:n]}…{pk[-n:]}"
+    return pk if not pk or len(pk) <= 2 * n else f"{pk[:n]}…{pk[-n:]}"
 
 def list_user_keyfiles(keys_dir: str = "keys"):
     if not os.path.isdir(keys_dir):
@@ -79,9 +92,25 @@ def api_post(path: str, payload: dict):
             body = r.json()
         except Exception:
             body = {"raw": r.text}
+
+        # --- Hook: après succès, mettre à jour la root on-chain ---
+        if r.status_code == 200 and path in ("/deposit", "/withdraw", "/handoff", "/convert", "/sweep"):
+            try:
+                solana_dir = Path(REPO_ROOT) / "contracts" / "solana"
+                subprocess.run(
+                    ["npx", "ts-node", "scripts/compute_and_update_roots.ts"],
+                    cwd=solana_dir,
+                    check=True,
+                )
+                print(f"[sync] on-chain Merkle root updated after {path}")
+            except subprocess.CalledProcessError as e:
+                print(f"[sync] Root update failed after {path}: {e}")
+
         return r.status_code, body
+
     except Exception as e:
         return 0, {"error": str(e)}
+
 
 def fmt_amt(x) -> str:
     try:
@@ -95,6 +124,8 @@ def ensure_state():
     st.session_state.setdefault("blur_amounts", False)
     st.session_state.setdefault("auto_refresh", False)
     st.session_state.setdefault("auto_refresh_interval", 10)
+    # sweep selection stored as list of label strings (kept in sync / sanitized)
+    st.session_state.setdefault("sweep_selected", [])
 ensure_state()
 
 def safe_rerun():
@@ -108,10 +139,14 @@ def safe_rerun():
 
 def flash(msg: str, kind: str = "info", seconds: float = 1.5):
     ph = st.empty()
-    if   kind == "success": ph.success(msg)
-    elif kind == "warning": ph.warning(msg)
-    elif kind == "error":   ph.error(msg)
-    else:                   ph.info(msg)
+    if kind == "success":
+        ph.success(msg)
+    elif kind == "warning":
+        ph.warning(msg)
+    elif kind == "error":
+        ph.error(msg)
+    else:
+        ph.info(msg)
     time.sleep(seconds)
     ph.empty()
 
@@ -376,9 +411,9 @@ with tab_sweep:
         st.info(f"Sweepable total (≥ {MIN_STEALTH_SOL} SOL per address): **{shown_total} SOL**")
 
         # Build options list and lookup maps
-        options = []
-        opt_to_pub = {}
-        pub_to_bal = {}
+        options: list[str] = []
+        opt_to_pub: dict[str, str] = {}
+        pub_to_bal: dict[str, str] = {}
         for it in items:
             pk = it.get("stealth_pubkey")
             bal = str(it.get("balance_sol") or "0")
@@ -390,7 +425,7 @@ with tab_sweep:
         if not options:
             st.warning("No stealth addresses above the threshold.")
         else:
-            # Keep selection in session state so Select all works
+            # Keep selection in session state so Select all works; sanitize it below
             st.session_state.setdefault("sweep_selected", [])
 
             # Select all button only
@@ -398,20 +433,36 @@ with tab_sweep:
                 st.session_state["sweep_selected"] = options[:]  # all labels
                 safe_rerun()
 
+            # --- SANITIZE saved selection so Streamlit never receives defaults that aren't in options ---
+            # This prevents the StreamlitAPIException you saw when the options list changed.
+            prev_selected = st.session_state.get("sweep_selected", [])
+            if prev_selected:
+                sanitized = [x for x in prev_selected if x in options]
+                if len(sanitized) != len(prev_selected):
+                    # Some previous defaults were no longer valid; update session to the sanitized set.
+                    st.session_state["sweep_selected"] = sanitized
+                # ensure we use the sanitized value for default below
+                default_for_widget = st.session_state["sweep_selected"]
+            else:
+                default_for_widget = []
+
             # Multiselect widget bound to session state
             selected_labels = st.multiselect(
                 "Stealth addresses",
                 options=options,
-                default=st.session_state["sweep_selected"],
+                default=default_for_widget,
                 help="Pick one or many. Use Select all to include every listed address.",
                 key="sweep_multisel",
             )
+            # Keep session state in sync with widget (this will be a subset of options by construction)
             st.session_state["sweep_selected"] = selected_labels
 
             # Convert to pubkeys and compute selected total
-            selected_pubkeys = [opt_to_pub[l] for l in selected_labels]
+            selected_pubkeys = [opt_to_pub[l] for l in selected_labels if l in opt_to_pub]
             from decimal import Decimal
-            selected_total_dec = sum(Decimal(str(pub_to_bal[pk])) for pk in selected_pubkeys) if selected_pubkeys else Decimal("0")
+            selected_total_dec = (
+                sum(Decimal(str(pub_to_bal[pk])) for pk in selected_pubkeys) if selected_pubkeys else Decimal("0")
+            )
             selected_total_str = fmt_amt(selected_total_dec)
             shown_selected_total = "•••" if st.session_state["blur_amounts"] else selected_total_str
 
@@ -448,18 +499,20 @@ with tab_sweep:
                         payload["stealth_pubkeys"] = selected_pubkeys
                     if not all_amt_sw and amt_sw:
                         payload["amount_sol"] = amt_sw
+
                     flash("Submitting sweep…")
                     c, res = api_post("/sweep", payload)
                     if c == 200:
                         flash("Sweep sent ✅", "success")
                         st.json(res)
+                        # clear selection to avoid stale defaults after a sweep changed balances
+                        st.session_state["sweep_selected"] = []
                         safe_rerun()
                     else:
                         flash("Sweep failed ❌", "error")
                         st.error(res)
     else:
         st.warning("Stealth info not available from API.")
-
 
 # --- Overview ---
 with tab_overview:

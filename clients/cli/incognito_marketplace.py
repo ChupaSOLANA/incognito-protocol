@@ -15,6 +15,8 @@ import tempfile
 import time
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+
 
 from clients.cli.emit import emit, events_replay
 
@@ -36,7 +38,14 @@ def _short(pk: str) -> str:
 KEYS_DIR: str = "./keys"
 TREASURY_KEYPAIR: str = os.path.join(KEYS_DIR, "pool.json")
 WRAPPER_KEYPAIR: str = os.path.join(KEYS_DIR, "wrapper.json")
-MINT: str = "6ScGfdRoKuk4gjHVbFjBMwxLdgqxx5gHwKLaZTTj3Zrw"  # cSOL Token-2022
+MINT_KEYFILE = Path("/Users/alex/Desktop/incognito-protocol-1/keys/mint.json")
+MINT: str = "ESPU74xbyRqhRTeWUbGqMf3G9CU8oD12bpHP7oypYZnp"  # cSOL Token-2022
+
+def _pubkey_from_keyfile(path: Path) -> str:
+        r = subprocess.run(["solana-keygen", "pubkey", str(path)], capture_output=True, text=True, check=True)
+        return r.stdout.strip()
+
+MINT: str = os.getenv("MINT") or _pubkey_from_keyfile(MINT_KEYFILE)
 
 FEE_PAYER: Optional[str] = None  # not used globally; per-call derived
 STEALTH_FEE_SOL = "0.05"
@@ -84,6 +93,51 @@ def _hint(msg: str) -> str:
     if "owner does not match" in m.lower():
         m += f"  {C.DIM}(Pass the correct --owner for that token account.){C.RST}"
     return m
+
+# en haut : construire le chemin absolu vers le dossier anchor
+ROOT_DIR = Path(__file__).resolve().parents[2]      # /.../incognito-protocol-1/clients/cli/.. => ajuste si différent
+SOLANA_CONTRACTS_DIR = ROOT_DIR / "contracts" / "solana"
+TS_UPDATE_SCRIPT = SOLANA_CONTRACTS_DIR / "scripts" / "compute_and_update_roots.ts"
+TS_NODE_BIN = os.getenv("TS_NODE_BIN", "npx")  # on utilise npx pour résoudre les deps locales
+
+def _update_onchain_roots() -> None:
+    if not TS_UPDATE_SCRIPT.exists():
+        print(f"{C.DIM}[roots] script introuvable: {TS_UPDATE_SCRIPT}{C.RST}")
+        return
+
+    # s'assurer que le dossier contracts/solana contient Anchor.toml
+    anchor_toml = SOLANA_CONTRACTS_DIR / "Anchor.toml"
+    if not anchor_toml.exists():
+        print(f"{C.WARN}[roots] Anchor.toml absent: {anchor_toml}{C.RST}  (aborting update)")
+        return
+
+    env = os.environ.copy()
+    env.setdefault("RPC_URL", env.get("RPC_URL", "http://127.0.0.1:8899"))
+    # Utiliser npx pour utiliser ts-node installé localement dans le projet
+    # cmd = ["ts-node", str(TS_UPDATE_SCRIPT)]   # si tu as ts-node global
+    cmd = [TS_NODE_BIN, "--yes", "ts-node", str(TS_UPDATE_SCRIPT)]
+
+    try:
+        # <-- IMPORTANT: passer cwd=SOLANA_CONTRACTS_DIR pour que Anchor trouve Anchor.toml
+        out = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+            cwd=str(SOLANA_CONTRACTS_DIR),
+        )
+        if out.stdout.strip():
+            # affiche la dernière ligne utile (ou tout si tu préfères)
+            print(f"{C.DIM}[roots]{C.RST} {out.stdout.strip().splitlines()[-1]}")
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        stdout = (e.stdout or "").strip()
+        print(f"{C.WARN}[roots] update échoué (rc={e.returncode}){C.RST}")
+        if stdout:
+            print("stdout:", stdout.splitlines()[-5:])
+        if stderr:
+            print("stderr:", stderr.splitlines()[-10:])
 
 
 def _run(cmd: List[str]) -> str:
@@ -289,6 +343,7 @@ def _load_wrapper_state() -> dict:
 
 
 def _save_wrapper_state(st: dict) -> None:
+    # Save only; do NOT push on-chain automatically.
     _save_state(WRAPPER_MERKLE_STATE_PATH, _normalize_wrapper_state(st))
 
 
@@ -338,10 +393,10 @@ def _load_pool_state() -> dict:
 
 
 def _save_pool_state(st: dict) -> None:
+    # Save only; do NOT push on-chain automatically.
     leaves = [r["commitment"] for r in st.get("records", [])]
     to_save = {"records": st.get("records", []), "leaves": leaves}
     _save_state(POOL_MERKLE_STATE_PATH, to_save)
-
 
 def make_pool_stealth_commitment(stealth_pubkey: str, eph_pub_b58: str, counter: int = 0) -> str:
     payload = b"pst|" + stealth_pubkey.encode() + b"|" + eph_pub_b58.encode() + b"|" + str(counter).encode()
@@ -546,7 +601,8 @@ def _wait_pool_increase(pubkey: str, baseline: float, expected_increase_dec: Dec
 
 
 def _write_temp_keypair(kp) -> str:
-    sk_bytes = bytes(kp.secret_key)
+    # solders.Keypair → 64 bytes (secret||pub)
+    sk_bytes = kp.to_bytes()
     arr = list(sk_bytes)
     fd, path = tempfile.mkstemp(prefix="stealth_", suffix=".json")
     os.close(fd)
@@ -723,6 +779,8 @@ def flow_shielded_deposit_split_to_pool() -> None:
         },
     )
     print(f"{C.OK}Shielded deposit completed.{C.RST}")
+    # Trigger on-chain root update once per flow
+    _update_onchain_roots()
 
 
 def flow_blind_note_handoff() -> None:
@@ -840,6 +898,8 @@ def flow_blind_note_handoff() -> None:
             "ts": int(time.time()),
         },
     )
+    # Trigger on-chain root update once per flow
+    _update_onchain_roots()
 
 
 
@@ -1012,6 +1072,8 @@ def flow_withdraw_simple() -> None:
         },
     )
     print(f"\n{C.OK}Shielded withdraw completed.{C.RST}")
+    # Trigger on-chain root update once per flow
+    _update_onchain_roots()
 
 
 def flow_convert_csol_to_sol_split() -> None:
@@ -1115,6 +1177,8 @@ def flow_convert_csol_to_sol_split() -> None:
             "ts": int(time.time()),
         },
     )
+    # Pool changed → update on-chain root once per flow
+    _update_onchain_roots()
 
 
 def flow_list_stealth_for_owner() -> None:
@@ -1218,7 +1282,7 @@ def flow_sweep_stealth_to_pubkey() -> None:
     for i, (stealth_addr, eph_pub_b58, amt, counter) in enumerate(plan, 1):
         print(f"[{i}/{len(plan)}] Sweep {_fmt_amt(amt)} SOL from {stealth_addr} → {dest_pub}")
         kp = derive_stealth_from_recipient_secret(rec_sk64, eph_pub_b58, counter)
-        if str(kp.public_key) != stealth_addr:
+        if str(kp.pubkey()) != stealth_addr:
             print("  Warning: derived pubkey mismatch; skipping this address.")
             continue
         tmp_path = _write_temp_keypair(kp)
@@ -1285,6 +1349,8 @@ def flow_prune_reindex() -> None:
         emit("MerkleRootUpdated", epoch=_epoch(), root_hex=new_root)
     except Exception as e:
         print(f"{C.DIM}[events] MerkleRootUpdated emit failed: {e}{C.RST}")
+    # Trigger on-chain root update once per flow
+    _update_onchain_roots()
 
 
 # ===== Bootstrap blind signer =====
@@ -1334,6 +1400,8 @@ def main() -> None:
         elif choice == "9":
             n = events_replay()
             print(f"{C.OK}Replayed {n} events and rebuilt state from tx_log.{C.RST}")
+            # After replay, local roots changed → update on-chain once
+            _update_onchain_roots()
         elif choice == "q":
             print("Bye.")
             break
