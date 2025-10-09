@@ -1,7 +1,8 @@
+# services/api/schemas_api.py
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Optional, Literal, Dict, Any
 
 from pydantic import BaseModel, Field, conint, condecimal
 
@@ -59,6 +60,7 @@ class HandoffReq(_DecimalAsStr):
     recipient_pub: str
     amount_sol: condecimal(gt=0)
 
+
 class HandoffRes(Ok):
     inputs_used: List[dict]
     outputs_created: List[dict]
@@ -68,22 +70,27 @@ class HandoffRes(Ok):
 
 # ----- Withdraw -----
 class WithdrawReq(_DecimalAsStr):
+    # new primary field
+    user_keyfile: Optional[str] = Field(
+        None, description="Keyfile of the user withdrawing to their own SOL address."
+    )
+    # backward compat (accepted but ignored if user_keyfile is provided)
     recipient_keyfile: Optional[str] = Field(
-        None, description="Recipient keyfile; if omitted, provide recipient_pub."
+        None, description="Deprecated alias for user_keyfile."
     )
     recipient_pub: Optional[str] = Field(
-        None, description="Recipient pubkey (base58) when no keyfile is available."
+        None, description="Deprecated (no longer used). Withdraw always goes to the user."
     )
     amount_sol: Optional[condecimal(gt=0)] = Field(
-        None, description="Amount to withdraw (SOL); if omitted, use 'all'."
+        None, description="Amount to withdraw (SOL). If omitted, withdraw ALL available."
     )
 
 
 class WithdrawRes(Ok):
     amount_sol: str
-    wrapper_ata: str
-    recipient_ata: str
-    change: Optional[str]
+    recipient_pub: str
+    tx_signature: str
+    spent_note_indices: List[int]
     new_merkle_root: str
 
 
@@ -131,6 +138,94 @@ class SweepRes(Ok):
     txs: List[str]
 
 
+# ===== Marketplace: Buy =====
+class BuyReq(_DecimalAsStr):
+    """
+    Buy a listing using either:
+      - 'csol' (direct Token-2022 confidential transfer from buyer to seller), or
+      - 'sol' (spend buyer's notes; wrapper transfers cSOL to seller), or
+      - 'auto' (try cSOL first, fallback to SOL-backed).
+    """
+    buyer_keyfile: str = Field(..., description="Keyfile of the buyer (./keys/...json).")
+    listing_id: str = Field(..., description="Unique listing identifier.")
+    payment: Optional[Literal["auto", "csol", "sol"]] = Field(
+        "auto", description="Payment mode preference."
+    )
+    # ✅ NEW: support quantité
+    quantity: conint(ge=1) = 1
+
+
+class BuyRes(Ok):
+    listing_id: str
+    payment: str  # "csol" or "sol-backed"
+    price: str
+    buyer_pub: str
+    seller_pub: str
+    # cSOL path or wrapper payout signature (if applicable)
+    csol_tx_signature: Optional[str] = None
+    # present when SOL-backed path spent confidential notes
+    spent_note_indices: Optional[List[int]] = None
+    buyer_change: Optional[Dict[str, Any]] = None  # {"amount": "...", "commitment": "...", "index": int}
+    new_merkle_root: Optional[str] = None
+
+
+# ====== Listings (NEW) ======
+class Listing(_DecimalAsStr):
+    id: str = Field(..., description="Listing id hex (0x...).")
+    title: str
+    description: Optional[str] = None
+    unit_price_sol: str
+    quantity: conint(ge=0)
+    seller_pub: str
+    active: bool = True
+    images: Optional[List[str]] = Field(default=None, description="ipfs://... or https://...")
+
+
+class ListingsPayload(_DecimalAsStr):
+    items: List[Listing]
+
+
+class ListingCreateReq(_DecimalAsStr):
+    seller_keyfile: str = Field(..., description="Seller keyfile (keys/user*.json)")
+    title: str
+    description: Optional[str] = None
+    unit_price_sol: condecimal(gt=0)
+    quantity: conint(ge=0) = 1
+    # client peut fournir des URLs/IPFS
+    image_uris: Optional[List[str]] = None
+
+
+class ListingCreateRes(_DecimalAsStr):
+    ok: bool = True
+    listing: Listing
+
+
+class ListingUpdateReq(_DecimalAsStr):
+    seller_keyfile: str = Field(..., description="Seller keyfile (owner must match).")
+    title: Optional[str] = None
+    description: Optional[str] = None
+    unit_price_sol: Optional[condecimal(gt=0)] = None
+    # soit quantity_new (set), soit quantity_delta (+/-)
+    quantity_new: Optional[conint(ge=0)] = None
+    quantity_delta: Optional[int] = None
+    # si fourni, remplace entièrement
+    image_uris: Optional[List[str]] = None
+
+
+class ListingUpdateRes(_DecimalAsStr):
+    ok: bool = True
+    listing: Listing
+
+
+class ListingDeleteReq(_DecimalAsStr):
+    seller_keyfile: str
+
+
+class ListingDeleteRes(_DecimalAsStr):
+    ok: bool = True
+    removed: int
+
+
 __all__ = [
     # base/common
     "Ok",
@@ -154,4 +249,16 @@ __all__ = [
     # sweep
     "SweepReq",
     "SweepRes",
+    # marketplace
+    "BuyReq",
+    "BuyRes",
+    # listings
+    "Listing",
+    "ListingsPayload",
+    "ListingCreateReq",
+    "ListingCreateRes",
+    "ListingUpdateReq",
+    "ListingUpdateRes",
+    "ListingDeleteReq",
+    "ListingDeleteRes",
 ]

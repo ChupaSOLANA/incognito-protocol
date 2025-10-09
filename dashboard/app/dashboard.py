@@ -1,4 +1,3 @@
-# dashboard/app/dashboard.py
 import os
 import sys
 import json
@@ -7,15 +6,21 @@ import subprocess
 import requests
 import pathlib
 from decimal import Decimal
-import streamlit as st
 from pathlib import Path
+
+import streamlit as st
 
 # ---------------- Config ----------------
 st.set_page_config(page_title="Incognito – Demo", page_icon="🕶️", layout="wide")
+
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8001")
 
 # Threshold for showing stealth entries (hide dust)
 MIN_STEALTH_SOL = 0.01  # filter out addresses below this balance
+
+# Root sync behavior (avoid blocking UI after each tx)
+AUTO_UPDATE_ROOTS = os.getenv("AUTO_UPDATE_ROOTS", "0") == "1"  # off by default
+ROOTS_SCRIPT = ["npx", "ts-node", "scripts/compute_and_update_roots.ts"]
 
 # --- Make repo root importable so clients/cli/... works when running from dashboard/app/ ---
 REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[2])  # ../../ from this file
@@ -27,6 +32,7 @@ _total_available_for_recipient = None
 _load_wrapper_state = None
 try:
     from clients.cli import incognito_marketplace as mp  # your CLI module
+
     MINT = mp.MINT
     _total_available_for_recipient = mp.total_available_for_recipient  # (state, pubkey) -> Decimal
     _load_wrapper_state = mp._load_wrapper_state
@@ -34,15 +40,21 @@ except Exception as e:
     MINT_KEYFILE = Path("/Users/alex/Desktop/incognito-protocol-1/keys/mint.json")
 
     def _pubkey_from_keyfile(path: Path) -> str:
-        r = subprocess.run(["solana-keygen", "pubkey", str(path)], capture_output=True, text=True, check=True)
+        r = subprocess.run(
+            ["solana-keygen", "pubkey", str(path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
         return r.stdout.strip()
 
     MINT: str = os.getenv("MINT") or _pubkey_from_keyfile(MINT_KEYFILE)
     st.warning(f"[dashboard] Could not import clients.cli.incognito_marketplace: {e}")
 
 # --------------- Utils ------------------
-def short(pk: str, n=6) -> str:
+def short(pk: str, n: int = 6) -> str:
     return pk if not pk or len(pk) <= 2 * n else f"{pk[:n]}…{pk[-n:]}"
+
 
 def list_user_keyfiles(keys_dir: str = "keys"):
     if not os.path.isdir(keys_dir):
@@ -53,6 +65,7 @@ def list_user_keyfiles(keys_dir: str = "keys"):
         if f.endswith(".json") and f.lower().startswith("user")
     )
 
+
 def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -61,12 +74,14 @@ def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
     except Exception as e:
         return 1, "", str(e)
 
+
 def get_pubkey_from_keypair(path: str) -> str | None:
     rc, out, err = run_cmd(["solana-keygen", "pubkey", path])
     if rc == 0 and out:
         return out.strip()
     st.error(f"solana-keygen error: {err or out}")
     return None
+
 
 def get_sol_balance(pubkey: str) -> Decimal | None:
     rc, out, err = run_cmd(["solana", "balance", pubkey])
@@ -77,6 +92,7 @@ def get_sol_balance(pubkey: str) -> Decimal | None:
             return None
     return None
 
+
 def api_get(path: str, **params):
     try:
         r = requests.get(f"{API_URL}{path}", params=params, timeout=20)
@@ -84,30 +100,59 @@ def api_get(path: str, **params):
     except Exception as e:
         return 0, {"error": str(e)}
 
+
 def api_post(path: str, payload: dict):
     headers = {"content-type": "application/json"}
     try:
-        r = requests.post(f"{API_URL}{path}", json=payload, headers=headers, timeout=90)
+        # keep UI responsive: 30s client timeout
+        r = requests.post(f"{API_URL}{path}", json=payload, headers=headers, timeout=30)
         try:
             body = r.json()
         except Exception:
             body = {"raw": r.text}
 
-        # --- Hook: après succès, mettre à jour la root on-chain ---
-        if r.status_code == 200 and path in ("/deposit", "/withdraw", "/handoff", "/convert", "/sweep"):
+        # Optional non-blocking on-chain root sync after successful tx
+        if (
+            r.status_code == 200
+            and path
+            in ("/deposit", "/withdraw", "/handoff", "/convert", "/sweep", "/marketplace/buy")
+            and AUTO_UPDATE_ROOTS
+        ):
             try:
                 solana_dir = Path(REPO_ROOT) / "contracts" / "solana"
-                subprocess.run(
-                    ["npx", "ts-node", "scripts/compute_and_update_roots.ts"],
-                    cwd=solana_dir,
-                    check=True,
-                )
-                print(f"[sync] on-chain Merkle root updated after {path}")
-            except subprocess.CalledProcessError as e:
-                print(f"[sync] Root update failed after {path}: {e}")
+                subprocess.Popen(ROOTS_SCRIPT, cwd=solana_dir)  # fire-and-forget
+                print(f"[sync] started background Merkle root update after {path}")
+            except Exception as e:
+                print(f"[sync] failed to start root update after {path}: {e}")
 
         return r.status_code, body
+    except Exception as e:
+        return 0, {"error": str(e)}
 
+
+def api_post_files(path: str, data: dict, files: list[tuple[str, tuple]]):
+    """
+    data -> form fields; files -> list of ('images', (filename, bytes, mimetype))
+    """
+    try:
+        r = requests.post(f"{API_URL}{path}", data=data, files=files, timeout=180)
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+        return r.status_code, body
+    except Exception as e:
+        return 0, {"error": str(e)}
+
+
+def api_patch_files(path: str, data: dict, files: list[tuple[str, tuple]]):
+    try:
+        r = requests.patch(f"{API_URL}{path}", data=data, files=files, timeout=180)
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+        return r.status_code, body
     except Exception as e:
         return 0, {"error": str(e)}
 
@@ -118,15 +163,17 @@ def fmt_amt(x) -> str:
     except Exception:
         return str(x)
 
+
 def ensure_state():
     st.session_state.setdefault("active_keyfile", None)
     st.session_state.setdefault("active_pub", None)
     st.session_state.setdefault("blur_amounts", False)
-    st.session_state.setdefault("auto_refresh", False)
-    st.session_state.setdefault("auto_refresh_interval", 10)
     # sweep selection stored as list of label strings (kept in sync / sanitized)
     st.session_state.setdefault("sweep_selected", [])
+
+
 ensure_state()
+
 
 def safe_rerun():
     try:
@@ -137,7 +184,8 @@ def safe_rerun():
         except Exception:
             pass
 
-def flash(msg: str, kind: str = "info", seconds: float = 1.5):
+
+def flash(msg: str, kind: str = "info", seconds: float = 1.0):
     ph = st.empty()
     if kind == "success":
         ph.success(msg)
@@ -150,6 +198,7 @@ def flash(msg: str, kind: str = "info", seconds: float = 1.5):
     time.sleep(seconds)
     ph.empty()
 
+
 # ---- Known wallets (cache) ----
 @st.cache_data(ttl=60)
 def load_known_wallets(keys_dir: str = "keys") -> list[dict]:
@@ -159,6 +208,7 @@ def load_known_wallets(keys_dir: str = "keys") -> list[dict]:
         if rc == 0 and out.strip():
             items.append({"keyfile": path, "pubkey": out.strip()})
     return items
+
 
 def other_known_wallet_pks(active_keyfile: str | None) -> list[dict]:
     wallets = load_known_wallets()
@@ -170,18 +220,6 @@ def other_known_wallet_pks(active_keyfile: str | None) -> list[dict]:
         out.append({"label": label, "pubkey": w["pubkey"]})
     return out
 
-def recipient_selector(ui_key: str, active_keyfile: str, default_pub: str) -> str:
-    others = other_known_wallet_pks(active_keyfile)
-    if not others:
-        return st.text_input("Recipient public key (base58)", value=default_pub, key=f"{ui_key}_custom_only").strip()
-    mode = st.radio("Recipient", options=["Known wallet", "Custom"], horizontal=True, key=f"{ui_key}_mode")
-    if mode == "Known wallet":
-        options = [o["label"] for o in others]
-        sel = st.selectbox("Choose wallet", options=options, key=f"{ui_key}_known_sel")
-        idx = options.index(sel)
-        return others[idx]["pubkey"]
-    else:
-        return st.text_input("Recipient public key (base58)", value=default_pub, key=f"{ui_key}_custom").strip()
 
 # ---- Available wrapper notes (primary via CLI; fallback via JSON) ----
 def _fallback_available_from_state(pub: str) -> Decimal | None:
@@ -201,6 +239,7 @@ def _fallback_available_from_state(pub: str) -> Decimal | None:
     except Exception:
         return None
 
+
 def available_wrapper_for(pub: str) -> Decimal | None:
     if _total_available_for_recipient and _load_wrapper_state:
         try:
@@ -210,9 +249,65 @@ def available_wrapper_for(pub: str) -> Decimal | None:
             pass
     return _fallback_available_from_state(pub)
 
+
+# ------- Cached stealth fetcher (call only on relevant tabs) -------
+@st.cache_data(ttl=15)
+def get_stealth(owner_pub: str, include_balances=True, min_sol=0.01):
+    c, d = api_get(
+        f"/stealth/{owner_pub}",
+        include_balances=str(include_balances).lower(),
+        min_sol=min_sol,
+    )
+    return d if c == 200 else {"error": d}
+
+
+def _read_stealth_total(owner_pub: str) -> Decimal:
+    """Helper to parse stealth total (clears cache first if requested by caller)."""
+    data = get_stealth(owner_pub, True, MIN_STEALTH_SOL)
+    try:
+        t = data.get("total_sol", "0") if isinstance(data, dict) else "0"
+        return Decimal(str(t))
+    except Exception:
+        return Decimal("0")
+
+
+def wait_for_state_update(
+    owner_pub: str,
+    prev_sol: Decimal | None,
+    prev_stealth_total: Decimal | None,
+    timeout_s: int = 30,
+    interval_s: float = 1.0,
+):
+    """
+    Polls for changes in either the plain SOL balance or stealth total.
+    Clears cached data before each poll to force fresh fetches.
+    Returns when a change is detected or timeout reached, then triggers a rerun.
+    """
+    start = time.time()
+    while time.time() - start < timeout_s:
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+
+        new_sol = get_sol_balance(owner_pub)
+        new_stealth = _read_stealth_total(owner_pub)
+
+        changed_sol = (prev_sol is not None and new_sol is not None and new_sol != prev_sol)
+        changed_stealth = (prev_stealth_total is not None and new_stealth != prev_stealth_total)
+
+        if changed_sol or changed_stealth:
+            break
+
+        time.sleep(interval_s)
+
+    safe_rerun()
+
+
 # --------------- Sidebar: user + options ---------------
 with st.sidebar:
     st.header("User")
+
     user_files = list_user_keyfiles("keys")
     if not user_files:
         st.error("No user keypairs found in ./keys (expect userA.json, userB.json, …)")
@@ -228,7 +323,7 @@ with st.sidebar:
         if pub:
             st.session_state["active_keyfile"] = sel
             st.session_state["active_pub"] = pub
-            st.toast(f"Loaded {os.path.basename(sel)} → {short(pub)}", icon="✅")
+            st.success(f"Loaded {os.path.basename(sel)} → {short(pub)}")
             safe_rerun()
 
     st.divider()
@@ -238,20 +333,6 @@ with st.sidebar:
         value=st.session_state["blur_amounts"],
         help="Toggle masking of balances and totals.",
     )
-
-    st.divider()
-    st.subheader("Refresh")
-    st.session_state["auto_refresh"] = st.toggle(
-        "Enable auto-refresh",
-        value=st.session_state["auto_refresh"],
-        help="Periodically re-run to update balances and metrics.",
-    )
-    st.session_state["auto_refresh_interval"] = st.number_input(
-        "Interval (seconds)", min_value=3, max_value=120,
-        value=int(st.session_state["auto_refresh_interval"]), step=1,
-    )
-    if st.button("Refresh now", use_container_width=True):
-        safe_rerun()
 
 # Guard
 if not st.session_state["active_pub"]:
@@ -263,61 +344,56 @@ active_key = st.session_state["active_keyfile"]
 active_pub = st.session_state["active_pub"]
 
 # --------------- Top metric (SOL only) ---------------
-st.markdown(f"### Active user: `{os.path.basename(active_key)}` · **{active_pub}**")
+st.markdown(f"### Active user: {os.path.basename(active_key)} · **{active_pub}**")
 bal = get_sol_balance(active_pub)
 text = "•••" if st.session_state["blur_amounts"] and bal is not None else (fmt_amt(bal) if bal is not None else "n/a")
 st.metric("SOL balance", text)
 st.divider()
 
-# --------------- Shared stealth data (used by Stealth & Sweep) ---------------
-stealth_data = None
-c_stealth, d_stealth = api_get(
-    f"/stealth/{active_pub}",
-    include_balances="true",
-    min_sol=MIN_STEALTH_SOL,    # <<< filter out dust from the API side
-)
-if c_stealth == 200 and isinstance(d_stealth, dict):
-    stealth_data = d_stealth
-
-# --------------- Tabs (order like CLI) ---------------
-tab_deposit, tab_withdraw, tab_handoff, tab_convert, tab_stealth, tab_sweep, tab_overview, tab_events = st.tabs(
-    ["Deposit", "Withdraw", "Handoff", "Convert", "Stealth", "Sweep", "Overview", "Events"]
+# --------------- Tabs (Overview + Events removed; Stealth & Sweep merged) ---------------
+tab_deposit, tab_withdraw, tab_handoff, tab_convert, tab_stealthsweep, tab_listings = st.tabs(
+    ["Deposit", "Withdraw", "Handoff", "Convert", "Stealth & Sweep", "Listings"]
 )
 
 # --- Deposit ---
 with tab_deposit:
-    st.subheader("Shielded Deposit → Note to recipient + Pool/Stealth splits")
+    st.subheader("Shielded Deposit → Note to self + Pool/Stealth splits")
+    st.caption(f"Recipient is locked to active user: **{short(active_pub, 8)}**")
 
-    recip_pub = recipient_selector("deposit_recipient", active_key, active_pub)
-
-    # Fixed denominations only
     DENOMS = ["10", "25", "50", "100"]
     denom_label = st.selectbox("Select amount (SOL)", options=DENOMS, index=0)
-    amt = denom_label  # string
+    amt = denom_label
 
     if st.button("Deposit", type="primary"):
-        payload = {"depositor_keyfile": active_key, "recipient_pub": recip_pub.strip(), "amount_sol": amt}
+        # snapshot state before tx
+        prev_sol = get_sol_balance(active_pub)
+        prev_stealth = _read_stealth_total(active_pub)
+
+        payload = {
+            "depositor_keyfile": active_key,
+            "recipient_pub": active_pub,
+            "amount_sol": amt,
+        }
+
         flash("Submitting deposit…")
-        c, res = api_post("/deposit", payload)
-        if c == 200:
-            flash("Deposit sent ✅", "success")
-            st.json(res)
-            safe_rerun()
-        else:
-            flash("Deposit failed ❌", "error")
-            st.error(res)
+        with st.spinner("Sending deposit…"):
+            c, res = api_post("/deposit", payload)
+            if c == 200:
+                st.success("Deposit confirmed ✅")
+                wait_for_state_update(active_pub, prev_sol, prev_stealth)
+            else:
+                flash("Deposit failed ❌", "error")
+                st.error(res)
 
 # --- Withdraw ---
 with tab_withdraw:
-    st.subheader("Shielded Withdraw (mint cSOL → confidential transfer)")
-
-    # Show available from wrapper notes (via helpers or fallback)
+    st.subheader("Withdraw (classic SOL from Treasury → you)")
     avail = available_wrapper_for(active_pub)
     if avail is not None:
         shown = "•••" if st.session_state["blur_amounts"] else fmt_amt(avail)
-        st.info(f"Available from wrapper notes: **{shown} SOL**")
+        st.info(f"Available (unspent notes): **{shown} SOL**")
     else:
-        st.info("Available from wrapper notes: n/a")
+        st.info("Available (unspent notes): n/a")
 
     all_amt = st.checkbox("Withdraw ALL available", value=True)
     amt_input = None
@@ -325,128 +401,144 @@ with tab_withdraw:
         amt_input = st.text_input("Amount (SOL)", value="3", key="withdraw_amt")
 
     if st.button("Withdraw", type="primary"):
-        payload = {"recipient_keyfile": active_key}
-        if not all_amt and amt_input:
-            payload["amount_sol"] = amt_input.strip()
+        # snapshot state before tx
+        prev_sol = get_sol_balance(active_pub)
+        prev_stealth = _read_stealth_total(active_pub)
+
+        payload = {
+            "user_keyfile": active_key,
+            **({} if all_amt else {"amount_sol": amt_input.strip()}),
+        }
+
         flash("Submitting withdraw…")
-        c, res = api_post("/withdraw", payload)
-        if c == 200:
-            flash("Withdraw sent ✅", "success")
-            st.json(res)
-            safe_rerun()
-        else:
-            flash("Withdraw failed ❌", "error")
-            st.error(res)
+        with st.spinner("Sending withdraw…"):
+            c, res = api_post("/withdraw", payload)
+            if c == 200:
+                st.success("Withdraw confirmed ✅")
+                wait_for_state_update(active_pub, prev_sol, prev_stealth)
+            else:
+                flash("Withdraw failed ❌", "error")
+                st.error(res)
 
 # --- Handoff ---
 with tab_handoff:
     st.subheader("Off-chain Blind Handoff (notes A → B)")
-    recip_pub = recipient_selector("handoff_recipient", active_key, active_pub)
+    recip_pub = st.text_input(
+        "Recipient public key (base58)",
+        value=active_pub,
+        key="handoff_recipient",
+    ).strip()
     amt_h = st.text_input("Amount (SOL)", value="5", key="handoff_amt")
+
     if st.button("Handoff", type="primary"):
+        # snapshot (handoff may not affect SOL balance; we still monitor stealth total)
+        prev_sol = get_sol_balance(active_pub)
+        prev_stealth = _read_stealth_total(active_pub)
+
         payload = {
             "sender_keyfile": active_key,
             "recipient_pub": recip_pub.strip(),
             "amount_sol": amt_h.strip(),
         }
+
         flash("Submitting handoff…")
-        c, res = api_post("/handoff", payload)
-        if c == 200:
-            flash("Handoff done ✅", "success")
-            st.json(res)
-            safe_rerun()
-        else:
-            flash("Handoff failed ❌", "error")
-            st.error(res)
+        with st.spinner("Sending handoff…"):
+            c, res = api_post("/handoff", payload)
+            if c == 200:
+                st.success("Handoff confirmed ✅")
+                wait_for_state_update(active_pub, prev_sol, prev_stealth)
+            else:
+                flash("Handoff failed ❌", "error")
+                st.error(res)
 
 # --- Convert ---
 with tab_convert:
     st.subheader("Convert cSOL → SOL (to self stealth)")
-    amt_c = st.text_input("Amount (cSOL)", value="4", key="convert_amt")
-    nout_c = st.number_input("Number of stealth outputs", value=3, min_value=1, step=1, key="convert_n")
-    if st.button("Convert", type="primary"):
-        payload = {"sender_keyfile": active_key, "amount_sol": amt_c.strip(), "n_outputs": int(nout_c)}
-        flash("Submitting convert…")
-        c, res = api_post("/convert", payload)
-        if c == 200:
-            flash("Convert sent ✅", "success")
-            st.json(res)
-            safe_rerun()
-        else:
-            flash("Convert failed ❌", "error")
-            st.error(res)
+    st.caption("Note: burning on convert is disabled on the server.")
 
-# --- Stealth ---
-with tab_stealth:
-    st.subheader(f"Stealth addresses (≥ {MIN_STEALTH_SOL} SOL)")
-    if stealth_data:
+    amt_c = st.text_input("Amount (cSOL)", value="4", key="convert_amt")
+    nout_c = st.number_input(
+        "Number of stealth outputs",
+        value=3,
+        min_value=1,
+        step=1,
+        key="convert_n",
+    )
+
+    if st.button("Convert", type="primary"):
+        # snapshot (convert affects stealth totals)
+        prev_sol = get_sol_balance(active_pub)
+        prev_stealth = _read_stealth_total(active_pub)
+
+        payload = {"sender_keyfile": active_key, "amount_sol": amt_c.strip(), "n_outputs": int(nout_c)}
+
+        flash("Submitting convert…")
+        with st.spinner("Sending convert…"):
+            c, res = api_post("/convert", payload)
+            if c == 200:
+                st.success("Convert confirmed ✅")
+                wait_for_state_update(active_pub, prev_sol, prev_stealth)
+            else:
+                flash("Convert failed ❌", "error")
+                st.error(res)
+
+# --- Stealth & Sweep (merged) ---
+with tab_stealthsweep:
+    st.subheader(f"Stealth addresses & Sweep (≥ {MIN_STEALTH_SOL} SOL)")
+    stealth_data = get_stealth(active_pub, True, MIN_STEALTH_SOL)
+
+    if isinstance(stealth_data, dict) and "items" in stealth_data:
         items = stealth_data.get("items", [])
         total = stealth_data.get("total_sol", "0")
 
-        # Render as table (address + balance)
-        st.markdown("#### Addresses")
-        rows = []
-        for it in items:
-            pk = it.get("stealth_pubkey")
-            bal = it.get("balance_sol") or "0"
-            shown_bal = "•••" if st.session_state["blur_amounts"] else fmt_amt(bal)
-            rows.append({"Stealth address": short(pk, 8), "Balance (SOL)": shown_bal})
-        st.table(rows)
+        st.markdown("#### Stealth addresses")
+        if items:
+            rows = []
+            for it in items:
+                pk = it.get("stealth_pubkey")
+                bal = it.get("balance_sol") or "0"
+                shown_bal = "•••" if st.session_state["blur_amounts"] else fmt_amt(bal)
+                rows.append({"Stealth address": short(pk, 8), "Balance (SOL)": shown_bal})
+            st.table(rows)
+        else:
+            st.info("No stealth addresses above the threshold yet.")
 
-        # Total
         shown_total = "•••" if st.session_state["blur_amounts"] else total
         st.success(f"**Total across listed:** {shown_total} SOL")
-    else:
-        st.error(d_stealth)
 
-# --- Sweep ---
-with tab_sweep:
-    st.subheader("Sweep funds from stealth → destination pubkey")
+        st.divider()
+        st.subheader("Sweep funds from stealth → destination pubkey")
 
-    if stealth_data:
-        items = stealth_data.get("items", [])
-        total = stealth_data.get("total_sol", "0")
-
-        shown_total = "•••" if st.session_state["blur_amounts"] else total
-        st.info(f"Sweepable total (≥ {MIN_STEALTH_SOL} SOL per address): **{shown_total} SOL**")
-
-        # Build options list and lookup maps
         options: list[str] = []
         opt_to_pub: dict[str, str] = {}
         pub_to_bal: dict[str, str] = {}
         for it in items:
             pk = it.get("stealth_pubkey")
             bal = str(it.get("balance_sol") or "0")
-            label = f"{short(pk, 8)}  —  {fmt_amt(bal)} SOL"
+            label = f"{short(pk, 8)} — {fmt_amt(bal)} SOL"
             options.append(label)
             opt_to_pub[label] = pk
             pub_to_bal[pk] = bal
 
         if not options:
-            st.warning("No stealth addresses above the threshold.")
+            st.warning("No stealth addresses above the threshold to sweep.")
         else:
-            # Keep selection in session state so Select all works; sanitize it below
             st.session_state.setdefault("sweep_selected", [])
+            c1, _ = st.columns([1, 3])
+            with c1:
+                if st.button("Select all"):
+                    st.session_state["sweep_selected"] = options[:]
+                    safe_rerun()
 
-            # Select all button only
-            if st.button("Select all"):
-                st.session_state["sweep_selected"] = options[:]  # all labels
-                safe_rerun()
-
-            # --- SANITIZE saved selection so Streamlit never receives defaults that aren't in options ---
-            # This prevents the StreamlitAPIException you saw when the options list changed.
             prev_selected = st.session_state.get("sweep_selected", [])
             if prev_selected:
                 sanitized = [x for x in prev_selected if x in options]
                 if len(sanitized) != len(prev_selected):
-                    # Some previous defaults were no longer valid; update session to the sanitized set.
                     st.session_state["sweep_selected"] = sanitized
-                # ensure we use the sanitized value for default below
                 default_for_widget = st.session_state["sweep_selected"]
             else:
                 default_for_widget = []
 
-            # Multiselect widget bound to session state
             selected_labels = st.multiselect(
                 "Stealth addresses",
                 options=options,
@@ -454,22 +546,21 @@ with tab_sweep:
                 help="Pick one or many. Use Select all to include every listed address.",
                 key="sweep_multisel",
             )
-            # Keep session state in sync with widget (this will be a subset of options by construction)
             st.session_state["sweep_selected"] = selected_labels
-
-            # Convert to pubkeys and compute selected total
             selected_pubkeys = [opt_to_pub[l] for l in selected_labels if l in opt_to_pub]
-            from decimal import Decimal
+
+            from decimal import Decimal as _D
+
             selected_total_dec = (
-                sum(Decimal(str(pub_to_bal[pk])) for pk in selected_pubkeys) if selected_pubkeys else Decimal("0")
+                sum(_D(str(pub_to_bal[pk])) for pk in selected_pubkeys) if selected_pubkeys else _D("0")
             )
             selected_total_str = fmt_amt(selected_total_dec)
             shown_selected_total = "•••" if st.session_state["blur_amounts"] else selected_total_str
+            st.success(
+                f"Selected: **{len(selected_pubkeys)} / {len(options)}** addresses · "
+                f"Total: **{shown_selected_total} SOL**"
+            )
 
-            st.success(f"Selected: **{len(selected_pubkeys)} / {len(options)}** addresses · Total: **{shown_selected_total} SOL**")
-
-            # Destination + amount UI
-            others = other_known_wallet_pks(active_key)
             dest_pub = st.text_input(
                 "Destination pubkey",
                 value="",
@@ -483,13 +574,16 @@ with tab_sweep:
             )
             amt_sw = None
             if not all_amt_sw:
-                # Prefill with selected total
                 amt_sw = st.text_input("Amount (SOL)", value=selected_total_str, key="sweep_amt").strip()
 
             if st.button("Sweep", type="primary"):
                 if not dest_pub:
                     st.error("Destination pubkey required.")
                 else:
+                    # snapshot before sweep
+                    prev_sol = get_sol_balance(active_pub)
+                    prev_stealth = _read_stealth_total(active_pub)
+
                     payload = {
                         "owner_pub": active_pub,
                         "secret_keyfile": active_key,
@@ -501,36 +595,209 @@ with tab_sweep:
                         payload["amount_sol"] = amt_sw
 
                     flash("Submitting sweep…")
-                    c, res = api_post("/sweep", payload)
-                    if c == 200:
-                        flash("Sweep sent ✅", "success")
-                        st.json(res)
-                        # clear selection to avoid stale defaults after a sweep changed balances
-                        st.session_state["sweep_selected"] = []
-                        safe_rerun()
-                    else:
-                        flash("Sweep failed ❌", "error")
-                        st.error(res)
+                    with st.spinner("Sending sweep…"):
+                        c, res = api_post("/sweep", payload)
+                        if c == 200:
+                            st.success("Sweep confirmed ✅")
+                            st.session_state["sweep_selected"] = []
+                            wait_for_state_update(active_pub, prev_sol, prev_stealth)
+                        else:
+                            flash("Sweep failed ❌", "error")
+                            st.error(res)
     else:
         st.warning("Stealth info not available from API.")
 
-# --- Overview ---
-with tab_overview:
-    st.subheader("Merkle status")
-    code_status, status = api_get("/merkle/status")
-    st.json(status if code_status == 200 else {"error": status})
+# --- Listings (Marketplace) ---
+with tab_listings:
+    st.subheader("Marketplace Listings")
 
-# --- Events ---
-with tab_events:
-    st.subheader("Metrics")
-    code_m, metrics = api_get("/metrics")
-    st.json(metrics if code_m == 200 else {"error": metrics})
+    # -------- Create listing ----------
+    with st.expander("Create a new listing", expanded=True):
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            title_new = st.text_input("Title", value="My awesome item")
+            desc_new = st.text_area("Description", value="", height=100)
+        with c2:
+            qty_new = st.number_input("Quantity", min_value=0, value=1, step=1)
+            price_new = st.text_input("Unit price (SOL)", value="0.50")
 
-# --------------- Auto-refresh loop ---------------
-if st.session_state["auto_refresh"]:
-    interval = int(st.session_state["auto_refresh_interval"])
-    placeholder = st.empty()
-    with placeholder.container():
-        st.caption(f"Auto-refresh in {interval}s…")
-    time.sleep(interval)
-    safe_rerun()
+        imgs = st.file_uploader("Images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+        urls_text = st.text_area("Or paste image URIs (ipfs://… or https://…) one per line", value="")
+
+        if st.button("Create listing", type="primary"):
+            if not title_new.strip():
+                st.error("Title is required.")
+            else:
+                files = []
+                for f in imgs or []:
+                    try:
+                        content = f.getvalue()
+                        mime = "image/png" if f.name.lower().endswith(".png") else "image/jpeg"
+                        files.append(("images", (f.name, content, mime)))
+                    except Exception:
+                        pass
+
+                extra_uris = [u.strip() for u in urls_text.splitlines() if u.strip()]
+                form = {
+                    "seller_keyfile": active_key,
+                    "title": title_new.strip(),
+                    "description": desc_new.strip(),
+                    "unit_price_sol": price_new.strip(),
+                    "quantity": str(int(qty_new)),
+                    "image_uris": json.dumps(extra_uris) if extra_uris else "",
+                }
+
+                flash("Submitting create…")
+                with st.spinner("Creating listing…"):
+                    code_c, res_c = api_post_files("/listings", form, files)
+                    if code_c == 200:
+                        st.success("Listing created ✅")
+                        safe_rerun()
+                    else:
+                        flash("Create failed ❌", "error")
+                        st.error(res_c)
+
+    st.divider()
+
+    # -------- My listings ----------
+    st.markdown("### My listings")
+    code_mine, data_mine = api_get("/listings", seller_pub=active_pub, mine="true")
+    if code_mine != 200:
+        st.error(data_mine)
+    else:
+        mine = data_mine.get("items", [])
+        if not mine:
+            st.info("You have no listings yet.")
+        else:
+            for it in mine:
+                with st.container(border=True):
+                    cols = st.columns([4, 2, 2, 2, 2])
+                    with cols[0]:
+                        st.markdown(f"**{it.get('title')}**")
+                        st.caption(f"ID: {it.get('id')}")
+                        st.caption(it.get("description") or "")
+                    with cols[1]:
+                        st.write("Price (SOL)")
+                        price_edit = st.text_input(
+                            " ",
+                            value=fmt_amt(it.get("unit_price_sol", "0")),
+                            key=f"lp_{it['id']}",
+                        )
+                    with cols[2]:
+                        st.write("Quantity")
+                        qty_edit = st.number_input(
+                            " ",
+                            min_value=0,
+                            value=int(it.get("quantity", 0)),
+                            step=1,
+                            key=f"lq_{it['id']}",
+                        )
+                    with cols[3]:
+                        if st.button("Save", key=f"save_{it['id']}"):
+                            form = {
+                                "seller_keyfile": active_key,
+                                "unit_price_sol": str(price_edit).strip(),
+                                "quantity_new": str(int(qty_edit)),
+                            }
+                            flash("Updating listing…")
+                            with st.spinner("Updating…"):
+                                code_u, res_u = api_patch_files(f"/listings/{it['id']}", form, [])
+                                if code_u == 200:
+                                    st.success("Listing updated ✅")
+                                    safe_rerun()
+                                else:
+                                    flash("Update failed ❌", "error")
+                                    st.error(res_u)
+                    with cols[4]:
+                        if st.button("Delete", key=f"del_{it['id']}"):
+                            flash("Deleting…")
+                            try:
+                                r = requests.delete(
+                                    f"{API_URL}/listings/{it['id']}",
+                                    params={"seller_keyfile": active_key},
+                                    timeout=30,
+                                )
+                                code_d, res_d = r.status_code, (
+                                    r.json()
+                                    if r.headers.get("content-type", "").startswith("application/json")
+                                    else {"raw": r.text}
+                                )
+                            except Exception as e:
+                                code_d, res_d = 0, {"error": str(e)}
+                            if code_d == 200:
+                                st.success("Listing deleted ✅")
+                                safe_rerun()
+                            else:
+                                flash("Delete failed ❌", "error")
+                                st.error(res_d)
+
+                    # Images preview (best-effort via IPFS gateway)
+                    imgs = it.get("images") or []
+                    if imgs:
+                        try:
+                            gw = "https://ipfs.io/ipfs/"
+                            thumbs = []
+                            for u in imgs[:3]:
+                                if str(u).startswith("ipfs://"):
+                                    cid = str(u).split("://", 1)[1]
+                                    thumbs.append(gw + cid)
+                                else:
+                                    thumbs.append(str(u))
+                            st.image(thumbs, caption=[""] * len(thumbs), width=120)
+                        except Exception:
+                            pass
+
+    st.divider()
+
+    # -------- Active listings / Buy (buyer view) ----------
+    st.markdown("### Active listings")
+    code_l, data_l = api_get("/listings")
+    if code_l != 200:
+        st.error(data_l)
+    else:
+        items = data_l.get("items", []) if isinstance(data_l, dict) else []
+        if not items:
+            st.info("No listings available.")
+        else:
+            for it in items:
+                with st.container(border=True):
+                    cols = st.columns([4, 2, 3, 2, 2])
+                    with cols[0]:
+                        st.markdown(f"**{it.get('title') or it.get('id')}**")
+                        st.caption(f"ID: {it.get('id')}")
+                        st.caption(it.get("description") or "")
+                    with cols[1]:
+                        st.metric("Unit price (SOL)", fmt_amt(it.get("unit_price_sol", "0")))
+                    with cols[2]:
+                        st.caption("Seller")
+                        st.code(short(it.get("seller_pub", ""), 8))
+                    with cols[3]:
+                        qty_to_buy = st.number_input(
+                            "Qty",
+                            min_value=1,
+                            value=1,
+                            step=1,
+                            key=f"qtybuy_{it['id']}",
+                        )
+                    with cols[4]:
+                        if st.button("Buy", key=f"buy_{it.get('id')}"):
+                            # snapshot before buy
+                            prev_sol = get_sol_balance(active_pub)
+                            prev_stealth = _read_stealth_total(active_pub)
+
+                            payload = {
+                                "buyer_keyfile": active_key,
+                                "listing_id": str(it.get("id")),
+                                # payment omitted: backend decides
+                                "quantity": int(qty_to_buy),
+                            }
+
+                            flash("Submitting buy…")
+                            with st.spinner("Placing order…"):
+                                c, res = api_post("/marketplace/buy", payload)
+                                if c == 200:
+                                    st.success("Purchase confirmed ✅")
+                                    wait_for_state_update(active_pub, prev_sol, prev_stealth)
+                                else:
+                                    flash("Purchase failed ❌", "error")
+                                    st.error(res)

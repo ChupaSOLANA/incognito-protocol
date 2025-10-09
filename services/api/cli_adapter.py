@@ -11,9 +11,13 @@ import logging
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
+import re
 
-# Reuse the CLI module API (same backend as your CLI)
 from clients.cli import incognito_marketplace as mp
+try:
+    from clients.cli import listings as li  # Merkle-backed listings backend
+except Exception:
+    li = None
 
 LOG = logging.getLogger("cli_adapter")
 LOG.addHandler(logging.NullHandler())
@@ -25,11 +29,23 @@ def _pubkey_from_keyfile(path: Path) -> str:
     r = subprocess.run(["solana-keygen", "pubkey", str(path)], capture_output=True, text=True, check=True)
     return r.stdout.strip()
 
+# cSOL mint (Token-2022 w/ confidential transfer extension)
 MINT: str = os.getenv("MINT") or _pubkey_from_keyfile(MINT_KEYFILE)
+
+# Wrapper = program-owned authority for mint/reserve movements
 WRAPPER_KEYPAIR: str = os.getenv("WRAPPER_KEYPAIR", "keys/wrapper.json")
+# Treasury = SOL pool
 TREASURY_KEYPAIR: str = os.getenv("TREASURY_KEYPAIR", "keys/pool.json")
+
+# Public key of the wrapper (reserve owner). Can be overridden via env.
+WRAPPER_RESERVE_PUB: str = os.getenv("WRAPPER_RESERVE_PUB", "")
+
 STEALTH_FEE_SOL: Decimal = Decimal(os.getenv("STEALTH_FEE_SOL", "0.05"))
 VERBOSE: bool = bool(int(os.getenv("VERBOSE", "0")))
+
+# Minimum SOL we require on a fee-payer for typical flows
+FEE_MIN_1TX: Decimal = Decimal(os.getenv("FEE_MIN_1TX", "0.01"))  # ~1 tx buffer
+FEE_MIN_2TX: Decimal = Decimal(os.getenv("FEE_MIN_2TX", "0.02"))  # ~2 tx buffer
 
 # ===== Exceptions =====
 class CLIAdapterError(RuntimeError):
@@ -69,6 +85,15 @@ def _pubkey_from_keypair(path: str) -> str:
 def get_pubkey_from_keypair(path: str) -> str:
     return _pubkey_from_keypair(path)
 
+def _ensure_wrapper_pub_cached() -> str:
+    global WRAPPER_RESERVE_PUB
+    if not WRAPPER_RESERVE_PUB:
+        try:
+            WRAPPER_RESERVE_PUB = _pubkey_from_keyfile(WRAPPER_KEYPAIR)
+        except Exception:
+            WRAPPER_RESERVE_PUB = ""
+    return WRAPPER_RESERVE_PUB
+
 def _sol_balance(pubkey: str) -> Decimal:
     out = _run(["solana", "balance", pubkey])
     tok = (out.split() + ["0"])[0]
@@ -88,6 +113,72 @@ def _lamports(amount_sol: str | float | Decimal) -> int:
 # ===== Formatting =====
 def fmt_amt(x: Decimal | float | str) -> str:
     return str(Decimal(str(x)).quantize(Decimal("0.000000001")))
+
+# ===== cSOL helpers =====
+
+def _parse_first_decimal(s: str) -> str:
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", s.replace(",", ""))
+    return m.group(1) if m else "0"
+
+def csol_total_supply() -> str:
+    """
+    Return total supply of the Token-2022 mint (string).
+    """
+    out = _run(["spl-token", "supply", MINT])
+    return _parse_first_decimal(out)
+
+def csol_balance(owner_pub_or_keyfile: str) -> str:
+    """
+    Best-effort read of confidential balance for an owner.
+    Tries CT-specific command first; falls back to balance if exposed.
+    Also tries to apply pending balance if we can get a funded fee-payer.
+    """
+    ata = get_ata_for_owner(MINT, owner_pub_or_keyfile)
+
+    # Try to apply pending so "available" reflects up-to-date
+    try:
+        fee_tmp, _info = pick_treasury_fee_payer_tmpfile()
+        if fee_tmp:
+            try:
+                spl_apply(owner_pub_or_keyfile, fee_tmp)
+            finally:
+                _safe_unlink(fee_tmp)
+    except Exception:
+        pass
+
+    variants = [
+        ["spl-token", "confidential-transfer-get-balance", "--address", ata, "--owner", owner_pub_or_keyfile],
+        ["spl-token", "confidential-transfer-get-balance", MINT, "--address", ata, "--owner", owner_pub_or_keyfile],
+        ["spl-token", "balance", ata],  # sometimes returns 0 for CT accounts
+        ["spl-token", "balance", MINT, "--owner", owner_pub_or_keyfile],
+    ]
+    for cmd in variants:
+        rc, out, err = _run_rc(cmd)
+        txt = (out or "") + "\n" + (err or "")
+        if rc == 0 and (out or err):
+            val = _parse_first_decimal(txt)
+            return val
+    return "0"
+
+def csol_transfer_from_reserve(dst_pub: str, amount_str: str) -> str:
+    """
+    Wrapper reserve → dst (seller) confidential transfer.
+    Requires a funded fee-payer (treasury stealth preferred).
+    """
+    ensure_csol_ata(dst_pub)
+    tmp_fee, _info = pick_treasury_fee_payer_tmpfile(FEE_MIN_1TX)
+    if not tmp_fee:
+        raise CLIAdapterError(f"Insufficient fee balance for transfer (need ≥ {FEE_MIN_1TX} SOL)")
+    try:
+        sig = spl_transfer_from_wrapper(amount_str, dst_pub, tmp_fee)
+        # best-effort: apply pending to dst
+        try:
+            spl_apply(dst_pub if os.path.exists(dst_pub) else WRAPPER_KEYPAIR, tmp_fee)
+        except Exception:
+            pass
+        return sig
+    finally:
+        _safe_unlink(tmp_fee)
 
 # ===== SPL helpers (ATA) =====
 def _parse_ata_from_verbose(out: str) -> str:
@@ -114,6 +205,7 @@ def stderr_to_summary(stderr: str) -> str:
 def _try_address_variants(mint: str, owner: str) -> Tuple[bool, str, str]:
     """
     Try several spl-token address invocations. Returns (success, stdout, stderr).
+    Accepts either an owner pubkey or a keypair path.
     """
     variants = [
         ["spl-token", "address", "--owner", owner, "--token", mint, "--verbose"],
@@ -135,7 +227,7 @@ def _try_address_variants(mint: str, owner: str) -> Tuple[bool, str, str]:
 def _create_ata(mint: str, owner: str) -> Tuple[bool, str, str]:
     """
     Try to create ATA. Returns (success, stdout, stderr).
-    Will tolerate the 'already exists' style errors and return False only on hard failures.
+    Tolerates 'already exists' messages.
     """
     cmd = ["spl-token", "create-account", mint, "--owner", owner]
     rc, out, err = _run_rc(cmd)
@@ -151,6 +243,7 @@ def get_wrapper_ata() -> str:
 def get_ata_for_owner(mint: str, owner: str) -> str:
     """
     Retrieve the ATA associated with (mint, owner). If not present, attempt creation and retry.
+    `owner` may be a pubkey or a keypair path.
     """
     # 1) Try address variants first
     success, out, err = _try_address_variants(mint, owner)
@@ -158,21 +251,18 @@ def get_ata_for_owner(mint: str, owner: str) -> str:
         try:
             return _parse_ata_from_verbose(out)
         except CLIAdapterError:
-            # if parsing fails but output exists, return the first non-empty line as fallback
             lines = [l.strip() for l in out.splitlines() if l.strip()]
             if lines:
                 return lines[0]
 
     # 2) If output or error indicates no account found, attempt to create the ATA
     combined = " ".join([out or "", err or ""]).lower()
-    if "not found" in combined or "no associated token account" in combined or "token account" in combined and "not found" in combined:
-        # Attempt create with small retry loop
+    if "not found" in combined or "no associated token account" in combined or ("token account" in combined and "not found" in combined):
         LOG.info("ATA not found for mint=%s owner=%s: attempting to create", mint, owner)
         attempts = 3
         for attempt in range(1, attempts + 1):
             ok, ocreate, ecreate = _create_ata(mint, owner)
             if ok:
-                # success, now query address
                 time.sleep(0.25)
                 success2, out2, err2 = _try_address_variants(mint, owner)
                 if success2 and out2:
@@ -182,11 +272,8 @@ def get_ata_for_owner(mint: str, owner: str) -> str:
                         lines = [l.strip() for l in out2.splitlines() if l.strip()]
                         if lines:
                             return lines[0]
-                # if we didn't parse yet, fallthrough to next attempt
             else:
-                # create failed — perhaps race or already exists; try to query address again
                 LOG.debug("create-account attempt %d failed: stdout=%r stderr=%r", attempt, ocreate, ecreate)
-                # if error contains 'already exists' or similar, attempt to read again
                 if "already exists" in (ocreate + ecreate).lower() or "account already exists" in (ocreate + ecreate).lower():
                     success2, out2, err2 = _try_address_variants(mint, owner)
                     if success2 and out2:
@@ -196,10 +283,8 @@ def get_ata_for_owner(mint: str, owner: str) -> str:
                             lines = [l.strip() for l in out2.splitlines() if l.strip()]
                             if lines:
                                 return lines[0]
-            # small backoff
             time.sleep(0.25 * attempt)
 
-        # final attempt to query address before giving up
         success3, out3, err3 = _try_address_variants(mint, owner)
         if success3 and out3:
             try:
@@ -208,14 +293,12 @@ def get_ata_for_owner(mint: str, owner: str) -> str:
                 lines = [l.strip() for l in out3.splitlines() if l.strip()]
                 if lines:
                     return lines[0]
-        # raise error with helpful message
         raise CLIAdapterError(
             "Failed to ensure ATA for mint=%s owner=%s. Last attempt stdout=%r stderr=%r"
             % (mint, owner, out3, err3)
         )
 
-    # 3) If we get here, address attempts didn't return a success code and error didn't match "not found"
-    # Try one last time with the most explicit invocation and either return or fail.
+    # 3) One last query attempt
     success4, out4, err4 = _try_address_variants(mint, owner)
     if success4 and out4:
         try:
@@ -226,7 +309,7 @@ def get_ata_for_owner(mint: str, owner: str) -> str:
                 return lines[0]
     raise CLIAdapterError(f"Unable to determine ATA for mint={mint} owner={owner}. stdout={out4!r} stderr={err4!r}")
 
-# ===== SPL ops (Wrapper) =====
+# ===== SPL ops (Wrapper reserve) =====
 def spl_mint_to_wrapper(amount_str: str, fee_payer: Optional[str] = None) -> str:
     ata = get_wrapper_ata()
     cmd = ["spl-token", "mint", MINT, amount_str, ata, "--mint-authority", WRAPPER_KEYPAIR]
@@ -256,6 +339,12 @@ def spl_burn_from_wrapper(amount_str: str, fee_payer: Optional[str] = None) -> s
     return _run(cmd)
 
 def spl_transfer_from_wrapper(amount: str, recipient_owner: str, fee_payer: str) -> str:
+    # >>> NEW: ensure wrapper’s pending → available before transfer <<<
+    try:
+        spl_apply(WRAPPER_KEYPAIR, fee_payer)  # spl-token apply-pending-balance <MINT> --owner <wrapper>
+    except Exception:
+        pass
+
     return _run(
         [
             "spl-token",
@@ -270,6 +359,7 @@ def spl_transfer_from_wrapper(amount: str, recipient_owner: str, fee_payer: str)
             fee_payer,
         ]
     )
+
 
 def spl_apply(owner_keyfile: str, fee_payer: str) -> str:
     rc, out, err = _run_rc(["spl-token", "apply-pending-balance", MINT, "--owner", owner_keyfile, "--fee-payer", fee_payer])
@@ -320,7 +410,7 @@ def _richest_treasury_stealth_record(min_balance: Decimal = Decimal("0.001")) ->
             best, best_bal = r, bal
     return best
 
-# ---- NEW helper: serialize solders.Keypair into a temp keypair file (64-byte array JSON)
+# ---- serialize solders.Keypair into a temp keypair file (64-byte array JSON)
 def _write_temp_keypair_from_solders(kp) -> str:
     """
     Write a solders.Keypair to a temporary JSON file as a 64-byte array
@@ -337,30 +427,61 @@ def _write_temp_keypair_from_solders(kp) -> str:
         json.dump(arr, f)
     return path
 
-def pick_treasury_fee_payer_tmpfile() -> Tuple[Optional[str], dict]:
-    rec = _richest_treasury_stealth_record()
-    if rec:
-        pool_secret = _read_secret_64_from_keyfile(TREASURY_KEYPAIR)
-        eph_b58 = rec["eph_pub_b58"]
-        counter = int(rec.get("counter", 0))
-        kp = derive_stealth_from_recipient_secret(pool_secret, eph_b58, counter)
-        # FIX: use to_bytes() via helper instead of kp.secret_key
-        tmp = _write_temp_keypair_from_solders(kp)
-        return tmp, {
-            "source": "treasury_stealth",
-            "stealth_pubkey": rec["stealth_pubkey"],
-            "eph_pub_b58": eph_b58,
-            "counter": counter,
-        }
+def pick_treasury_fee_payer_tmpfile(min_required: Decimal | str | None = None) -> Tuple[Optional[str], dict]:
+    """
+    Choose a fee-payer keyfile (temp on disk):
+      1) richest funded treasury stealth (>= min_required)
+      2) else pool owner (>= min_required)
+      3) else return (None, {...}) so the caller can fail cleanly
+    """
+    req = Decimal(str(min_required)) if min_required is not None else FEE_MIN_1TX
 
-    # Fallback: use the pool owner keypair directly
-    with open(TREASURY_KEYPAIR, "r") as f:
-        arr = json.load(f)
-    fd, tmp = tempfile.mkstemp(prefix="treasury_pool_fee_", suffix=".json")
-    os.close(fd)
-    with open(tmp, "w") as f:
-        json.dump(arr, f)
-    return tmp, {"source": "pool_owner", "pool_pub": _pool_pub()}
+    # 1) try stealth, but only if funded
+    rec = _richest_treasury_stealth_record(req)
+    if rec:
+        bal = _sol_balance(rec["stealth_pubkey"])
+        if bal >= req:
+            pool_secret = _read_secret_64_from_keyfile(TREASURY_KEYPAIR)
+            eph_b58 = rec["eph_pub_b58"]
+            counter = int(rec.get("counter", 0))
+            # imported later below; looked up at call time
+            kp = derive_stealth_from_recipient_secret(pool_secret, eph_b58, counter)
+            tmp = _write_temp_keypair_from_solders(kp)
+            LOG.info("[fee] using treasury stealth %s (bal=%.9f >= %.9f)", rec["stealth_pubkey"], bal, req)
+            return tmp, {
+                "source": "treasury_stealth",
+                "stealth_pubkey": rec["stealth_pubkey"],
+                "eph_pub_b58": eph_b58,
+                "counter": counter,
+                "min_required": str(req),
+                "balance": str(bal),
+            }
+        LOG.info("[fee] treasury stealth underfunded: %s (bal=%.9f < %.9f)", rec["stealth_pubkey"], bal, req)
+
+    # 2) fallback: pool owner, but only if funded
+    pool_pub = _pool_pub()
+    pool_bal = _sol_balance(pool_pub)
+    if pool_bal >= req:
+        with open(TREASURY_KEYPAIR, "r") as f:
+            arr = json.load(f)
+        fd, tmp = tempfile.mkstemp(prefix="treasury_pool_fee_", suffix=".json")
+        os.close(fd)
+        with open(tmp, "w") as f:
+            json.dump(arr, f)
+        LOG.info("[fee] using pool owner %s (bal=%.9f >= %.9f)", pool_pub, pool_bal, req)
+        return tmp, {"source": "pool_owner", "pool_pub": pool_pub, "min_required": str(req), "balance": str(pool_bal)}
+
+    # 3) none is funded enough
+    LOG.error("[fee] no funded fee-payer available (need >= %.9f SOL). pool=%s bal=%.9f", req, pool_pub, pool_bal)
+    return None, {"source": "none", "needed_sol": str(req), "pool_pub": pool_pub, "pool_balance": str(pool_bal)}
+
+def _safe_unlink(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except Exception:
+        pass
 
 # ===== Misc utilities =====
 def solana_transfer(fee_payer_keyfile: str, dest_pub: str, amount_sol_str: str) -> str:
@@ -378,6 +499,101 @@ def solana_transfer(fee_payer_keyfile: str, dest_pub: str, amount_sol_str: str) 
             "--no-wait",
         ]
     )
+
+# ===== cSOL utilities (Token-2022 Confidential) =====
+def ensure_csol_ata(owner_pub_or_kf: str) -> str:
+    """
+    Ensure an ATA exists for the cSOL mint for the given owner (pubkey or keypair path).
+    """
+    return get_ata_for_owner(MINT, owner_pub_or_kf)
+
+def csol_confidential_transfer(buyer_kf: str, buyer_pub: str, seller_pub: str, amount_str: str) -> str:
+    """
+    Confidential transfer from buyer → seller (Token-2022).
+    Uses a stealth treasury fee-payer if available (to mask fee source); falls back to buyer as fee-payer,
+    but only if the buyer has enough SOL to cover at least one transaction fee.
+    """
+    ensure_csol_ata(buyer_pub)
+    ensure_csol_ata(seller_pub)
+
+    tmp_fee, _info = pick_treasury_fee_payer_tmpfile(FEE_MIN_1TX)
+    fee_payer = tmp_fee or buyer_kf
+
+    # If we fell back to the buyer as fee-payer, check the buyer has enough SOL too.
+    if not tmp_fee:
+        buyer_sol = _sol_balance(buyer_pub if buyer_pub else _pubkey_from_keyfile(buyer_kf))
+        if buyer_sol < FEE_MIN_1TX:
+            raise CLIAdapterError(
+                f"Buyer fee-payer underfunded: need ≥ {FEE_MIN_1TX} SOL for fees, have {buyer_sol} SOL"
+            )
+
+    try:
+        # >>> NEW: always make buyer's pending → available before spending <<<
+        try:
+            spl_apply(buyer_kf, fee_payer)  # this runs: spl-token apply-pending-balance <MINT> --owner <buyer_kf>
+        except Exception:
+            pass
+
+        sig = _run(
+            [
+                "spl-token",
+                "transfer",
+                MINT,
+                amount_str,
+                get_ata_for_owner(MINT, seller_pub),
+                "--owner",
+                buyer_kf,
+                "--confidential",
+                "--fee-payer",
+                fee_payer,
+            ]
+        )
+
+        # best-effort for the receiver (we don't own seller's key, so just skip if not a keyfile path)
+        try:
+            if os.path.exists(seller_pub):
+                spl_apply(seller_pub, fee_payer)
+        except Exception:
+            pass
+
+        return sig
+    finally:
+        if tmp_fee:
+            _safe_unlink(tmp_fee)
+
+
+def csol_mint_to_reserve(amount_str: str) -> str:
+    tmp_fee, _info = pick_treasury_fee_payer_tmpfile(FEE_MIN_2TX)
+    if not tmp_fee:
+        raise CLIAdapterError(f"Insufficient fee balance for mint/deposit (need ≥ {FEE_MIN_2TX} SOL)")
+    try:
+        sig1 = spl_mint_to_wrapper(amount_str, fee_payer=tmp_fee)
+        sig2 = spl_deposit_to_wrapper(amount_str, fee_payer=tmp_fee)
+        # >>> NEW: apply on wrapper so reserve is immediately spendable <<<
+        try:
+            spl_apply(WRAPPER_KEYPAIR, tmp_fee)
+        except Exception:
+            pass
+        return f"{sig1}\n{sig2}".strip()
+    finally:
+        _safe_unlink(tmp_fee)
+
+def csol_burn_from_reserve(amount_str: str) -> str:
+    tmp_fee, _info = pick_treasury_fee_payer_tmpfile(FEE_MIN_2TX)
+    if not tmp_fee:
+        raise CLIAdapterError(f"Insufficient fee balance for withdraw/burn (need ≥ {FEE_MIN_2TX} SOL)")
+    try:
+        sig1 = spl_withdraw_from_wrapper(amount_str, fee_payer=tmp_fee)
+        # >>> NEW: apply so the withdrawn tokens are actually available to burn <<<
+        try:
+            spl_apply(WRAPPER_KEYPAIR, tmp_fee)
+        except Exception:
+            pass
+        sig2 = spl_burn_from_wrapper(amount_str, fee_payer=tmp_fee)
+        return f"{sig1}\n{sig2}".strip()
+    finally:
+        _safe_unlink(tmp_fee)
+
 
 # ===== Re-exports: crypto_core =====
 from services.crypto_core.commitments import make_commitment as make_commitment  # noqa: E402
@@ -466,11 +682,125 @@ def emit(kind: str, **payload) -> None:
     except Exception:
         pass
 
+# ====== Listings wrappers ======
+def _li_func(*candidates: str):
+    if li:
+        for name in candidates:
+            fn = getattr(li, name, None)
+            if callable(fn):
+                return fn
+    raise CLIAdapterError(f"No listings backend available for {candidates}")
+
+def listing_create(owner_pubkey: str, title: str, description: str | None,
+                   unit_price_sol: str, quantity: int,
+                   image_uris: list[str] | None = None) -> dict:
+    fn = _li_func("create_listing", "listing_create")
+    return fn(
+        owner_pubkey=owner_pubkey,
+        name=title,
+        title=title,
+        description=description,
+        price_sol=str(unit_price_sol),
+        quantity=int(quantity),
+        image_uris=image_uris or [],
+    )
+
+def listings_active() -> list[dict]:
+    fn = _li_func("list_active_listings", "list_listings", "all_listings")
+    out = fn()
+    return list(out) if isinstance(out, (list, tuple)) else []
+
+def listings_by_owner(owner_pubkey: str) -> list[dict]:
+    fn = _li_func("list_my_listings", "list_by_owner", "get_listings_by_owner")
+    out = fn(owner_pubkey=owner_pubkey)
+    return list(out) if isinstance(out, (list, tuple)) else []
+
+def listing_get(listing_id_hex: str) -> dict | None:
+    # Prefer the Merkle-backed backend first
+    fn = getattr(li, "get_listing", None) or getattr(mp, "_load_listing", None)
+    if callable(fn):
+        try:
+            return fn(listing_id_hex)
+        except Exception:
+            return None
+    return None
+
+def listing_update_price(owner_pubkey: str, listing_id_hex: str, new_price_sol: str) -> dict:
+    fn = _li_func("update_listing_price", "listing_update_price")
+    return fn(owner_pubkey=owner_pubkey, listing_id_hex=listing_id_hex, new_price_sol=str(new_price_sol))
+
+def listing_update_quantity(owner_pubkey: str, listing_id_hex: str,
+                            quantity_new: int | None = None, quantity_delta: int | None = None) -> dict:
+    for name in ("update_listing_quantity", "listing_update_quantity", "set_listing_quantity"):
+        fn = getattr(li, name, None)
+        if callable(fn):
+            return fn(owner_pubkey=owner_pubkey, listing_id_hex=listing_id_hex,
+                      quantity_new=quantity_new, quantity_delta=quantity_delta)
+    fn2 = getattr(li, "update_listing", None)
+    if callable(fn2):
+        return fn2(owner_pubkey=owner_pubkey, listing_id_hex=listing_id_hex,
+                   quantity_new=quantity_new, quantity_delta=quantity_delta)
+    raise CLIAdapterError("No quantity update support in listings backend")
+
+def listing_replace_images(owner_pubkey: str, listing_id_hex: str, image_uris: list[str]) -> dict:
+    for name in ("update_listing_images", "listing_update_images", "update_listing"):
+        fn = getattr(li, name, None)
+        if callable(fn):
+            return fn(owner_pubkey=owner_pubkey, listing_id_hex=listing_id_hex, image_uris=image_uris)
+    rec = listing_get(listing_id_hex) or {}
+    rec["images"] = image_uris
+    return rec
+
+def listing_update_meta(owner_pubkey: str, listing_id_hex: str,
+                        title: str | None = None,
+                        description: str | None = None) -> dict:
+    for name in ("update_listing_meta", "listing_update_meta", "update_listing"):
+        fn = getattr(li, name, None)
+        if callable(fn):
+            return fn(owner_pubkey=owner_pubkey, listing_id_hex=listing_id_hex,
+                      title=title, description=description)
+    rec = listing_get(listing_id_hex) or {}
+    if title is not None:
+        rec["title"] = title
+    if description is not None:
+        rec["description"] = description
+    return rec
+
+def listing_delete(owner_pubkey: str, listing_id_hex: str) -> int:
+    for name in ("remove_listing", "delete_listing", "listing_delete"):
+        fn = getattr(li, name, None)
+        if callable(fn):
+            return int(fn(owner_pubkey=owner_pubkey, listing_id_hex=listing_id_hex))
+    raise CLIAdapterError("No delete support in listings backend")
+
+# services/api/cli_adapter.py
+def listings_reset_all() -> int:
+    # Try explicit backend methods first
+    if li:
+        for name in ("reset_all", "clear_all", "wipe_all", "remove_all", "delete_all"):
+            fn = getattr(li, name, None)
+            if callable(fn):
+                try:
+                    return int(fn())
+                except Exception:
+                    pass
+    # Fallback: remove a known state file if your listings backend uses one
+    path = os.getenv("LISTINGS_STATE_FILE")
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+            return 1
+        except Exception:
+            pass
+    return 0
+
+
 __all__ = [
     # config
     "MINT",
     "WRAPPER_KEYPAIR",
     "TREASURY_KEYPAIR",
+    "WRAPPER_RESERVE_PUB",
     "STEALTH_FEE_SOL",
     "VERBOSE",
     # shell
@@ -491,6 +821,14 @@ __all__ = [
     "pick_treasury_fee_payer_tmpfile",
     # utils
     "solana_transfer",
+    # cSOL utilities
+    "ensure_csol_ata",
+    "csol_total_supply",
+    "csol_balance",
+    "csol_confidential_transfer",
+    "csol_transfer_from_reserve",
+    "csol_mint_to_reserve",
+    "csol_burn_from_reserve",
     # re-exports crypto_core
     "make_commitment",
     "issue_blind_sig_for_commitment_hex",
@@ -514,4 +852,15 @@ __all__ = [
     # merkle/events
     "build_merkle",
     "emit",
+    # listings
+    "listing_create",
+    "listings_active",
+    "listings_by_owner",
+    "listing_get",
+    "listing_update_price",
+    "listing_update_quantity",
+    "listing_replace_images",
+    "listing_update_meta",
+    "listing_delete",
+    "listings_reset_all",
 ]

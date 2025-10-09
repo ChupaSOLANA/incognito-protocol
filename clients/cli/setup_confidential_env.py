@@ -264,6 +264,53 @@ def configure_ct_account(address: str, owner_keyfile: pathlib.Path, fee_payer_ke
         args += ["--fee-payer", str(fee_payer_keyfile)]
     spl_token(args)
 
+# ---------- NEW: seed wrapper reserve with confidential tokens (fee-payer = pool) ----------
+def seed_wrapper_confidential(mint: str,
+                              amount: float | str,
+                              wrapper_keyfile: pathlib.Path,
+                              pool_keyfile: pathlib.Path,
+                              wrapper_ata: str):
+    """
+    1) Mint `amount` tokens sur l'ATA du wrapper (mint authority = wrapper)
+    2) Déposer `amount` en solde confidentiel (owner = wrapper)
+    3) Tenter un 'apply' pour rendre le solde dispo immédiatement
+    Fee-payer = pool à chaque étape.
+    """
+    # On force le fee-payer sur la pool (changera la conf 'solana config get' pour le process)
+    set_config_keypair(pool_keyfile)
+
+    # 1) Mint visible vers l'ATA du wrapper (authority = WRAPPER, fee-payer = POOL)
+    spl_token([
+        "mint", mint, str(amount), wrapper_ata,
+        "--mint-authority", str(wrapper_keyfile),
+        "--fee-payer", str(pool_keyfile),
+    ])
+
+    # 2) Dépôt en confidentiel (owner = WRAPPER, fee-payer = POOL)
+    spl_token([
+        "deposit-confidential-tokens", mint, str(amount),
+        "--address", wrapper_ata,
+        "--owner", str(wrapper_keyfile),
+        "--fee-payer", str(pool_keyfile),
+    ])
+
+    # 3) Best-effort : appliquer les soldes en attente (certains CLI requièrent 'apply' générique)
+    try:
+        spl_token([
+            "apply-pending-balance", mint,
+            "--owner", str(wrapper_keyfile),
+            "--fee-payer", str(pool_keyfile),
+        ])
+    except Exception:
+        try:
+            spl_token([
+                "apply",
+                "--owner", str(wrapper_keyfile),
+                "--fee-payer", str(pool_keyfile),
+            ])
+        except Exception:
+            pass
+
 def set_mint_authority(mint: str, current_authority_keyfile: pathlib.Path, new_authority_pub: str):
     set_config_keypair(current_authority_keyfile)
     spl_token(["authorize", mint, "mint", new_authority_pub])
@@ -300,7 +347,7 @@ def setup_token_flow(keys_dir: pathlib.Path, users: List[str], airdrop_sol: floa
 
     # Création des ATAs pour chaque user
     users_atas = []
-    for up in users_pubs:
+    for up, ukey in zip(users_pubs, users_keys):
         try:
             ata_addr = create_ata(token_mint, up, pool_key)
         except Exception as e:
@@ -318,6 +365,16 @@ def setup_token_flow(keys_dir: pathlib.Path, users: List[str], airdrop_sol: floa
                 configure_ct_account(ata, ukey, fee_payer_keyfile=pool_key)
             except Exception as e:
                 print(f"!! WARN: configure_ct_account failed for {ata}: {e}")
+
+    # 🔥 Seed du wrapper en cSOL confidentiels (fee-payer = pool)
+    print("== Seeding wrapper reserve with 100 confidential tokens (fee-payer = pool) ==")
+    seed_wrapper_confidential(
+        mint=token_mint,
+        amount=100,
+        wrapper_keyfile=wrapper_key,
+        pool_keyfile=pool_key,
+        wrapper_ata=wrapper_ata,
+    )
 
     # ---------- Résumé robuste ----------
     print("== Summary ==")
