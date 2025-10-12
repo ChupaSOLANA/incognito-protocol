@@ -355,6 +355,7 @@ def spl_transfer_from_wrapper(amount: str, recipient_owner: str, fee_payer: str)
             "--owner",
             WRAPPER_KEYPAIR,
             "--confidential",
+            "--allow-unfunded-recipient",
             "--fee-payer",
             fee_payer,
         ]
@@ -544,6 +545,7 @@ def csol_confidential_transfer(buyer_kf: str, buyer_pub: str, seller_pub: str, a
                 "--owner",
                 buyer_kf,
                 "--confidential",
+                "--allow-unfunded-recipient", 
                 "--fee-payer",
                 fee_payer,
             ]

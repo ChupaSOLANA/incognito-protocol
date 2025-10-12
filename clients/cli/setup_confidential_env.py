@@ -5,6 +5,7 @@
 Setup complet pour localnet/devnet :
 
 - Détection du workspace Anchor (Anchor.toml) ou via --workspace-root
+- (Optionnel) purge du dossier data à la racine du repo
 - (Optionnel) clean (cargo clean + .anchor/)
 - anchor build
 - Déploiement MANUEL : `solana program deploy` (sans --program-id) -> NOUVEL ID à chaque run
@@ -36,7 +37,7 @@ TOKEN_2022_PROGRAM_ID = os.environ.get(
     "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  # SPL Token-2022 officiel
 )
 DEFAULT_USERS = [u.strip() for u in os.environ.get("USERS_CSV", "A,B,C").split(",") if u.strip()]
-DEFAULT_AIRDROP_SOL = float(os.environ.get("AIRDROP_SOL", "100"))
+DEFAULT_AIRDROP_SOL = float(os.environ.get("AIRDROP_SOL", "50"))
 DEFAULT_PROGRAM_NAME = os.environ.get("PROGRAM_NAME", "merkle_registry")
 
 # ✅ Chemin par défaut pour sauvegarder les keypairs en JSON
@@ -64,6 +65,30 @@ def run(cmd, env=None, capture=True, cwd=None):
             f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
         )
     return res.stdout.strip() if capture else ""
+
+# ---------- Purge data (repo_root/data) ----------
+def purge_data_dir():
+    """
+    Supprime tout le contenu de <repo_root>/data où:
+    repo_root = Path(__file__).parent.parent  (…/incognito-protocol-1)
+    """
+    script_dir = pathlib.Path(__file__).resolve().parent          # …/clients/cli
+    repo_root = script_dir.parent.parent                          # …/incognito-protocol-1
+    data_dir = (repo_root / "data").resolve()                     # …/incognito-protocol-1/data
+
+    if data_dir.exists() and data_dir.is_dir():
+        print(f"== Purging data dir == {data_dir}")
+        for item in data_dir.iterdir():
+            try:
+                if item.is_file() or item.is_symlink():
+                    item.unlink()
+                elif item.is_dir():
+                    shutil.rmtree(item)
+            except Exception as e:
+                print(f"!! WARN: could not remove {item}: {e}")
+    else:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        print(f"== Created empty data dir == {data_dir}")
 
 # ---------- Solana helpers ----------
 def get_current_keypair_path() -> Optional[str]:
@@ -93,7 +118,6 @@ def airdrop(pubkey: str, amount: float):
     try:
         run(f"solana airdrop {amount} {pubkey}")
     except Exception as e:
-        # Tolérance sur devnet (faucet rate-limit ou indispo)
         if not get_current_rpc_url().endswith("devnet.solana.com"):
             raise e
 
@@ -167,12 +191,10 @@ def ensure_deployer_funded(workspace_root: pathlib.Path, amount_sol: float):
 _BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,}"
 
 def parse_program_id_from_deploy_stdout(stdout: str) -> Optional[str]:
-    # Cherche la ligne "Program Id: <PUBKEY>"
     for line in stdout.splitlines():
         m = re.search(r"Program Id:\s+(" + _BASE58 + r")", line)
         if m:
             return m.group(1)
-    # fallback : 1ère base58 trouvée (prudence)
     m2 = re.search(_BASE58, stdout)
     return m2.group(0) if m2 else None
 
@@ -180,9 +202,8 @@ def manual_deploy_and_get_pid(workspace_root: pathlib.Path, program_name: str) -
     so = workspace_root / "target" / "deploy" / f"{program_name}.so"
     if not so.exists():
         raise FileNotFoundError(f"Binaire manquant: {so}")
-    # capture=True pour récupérer l'ID programme
     out = run(f"solana program deploy {so}", capture=True, cwd=workspace_root)
-    print(out)  # affiche aussi la sortie pour debug
+    print(out)
     pid = parse_program_id_from_deploy_stdout(out)
     if not pid:
         raise RuntimeError("Impossible d'extraire le Program Id depuis la sortie de `solana program deploy`.")
@@ -204,7 +225,6 @@ def init_or_upgrade_idl(workspace_root: pathlib.Path, program_name: str, program
     if not idl_json.exists():
         print("!! WARN: IDL JSON introuvable, skip IDL step.")
         return
-    # Essaye init, puis upgrade en fallback
     try:
         print("== IDL init ==")
         run(f"anchor idl init -f {idl_json} {program_id}", capture=False, cwd=workspace_root)
@@ -218,10 +238,7 @@ def init_or_upgrade_idl(workspace_root: pathlib.Path, program_name: str, program
 
 # ---------- Token-2022 ----------
 def keygen(outfile: pathlib.Path) -> str:
-    """
-    Crée une nouvelle keypair Solana au format JSON (tableau de 64 octets) dans outfile.
-    """
-    outfile = outfile.with_suffix(".json")  # force l'extension .json
+    outfile = outfile.with_suffix(".json")
     outfile.parent.mkdir(parents=True, exist_ok=True)
     run(f"solana-keygen new --outfile {outfile} --no-bip39-passphrase --force --silent")
     pub = run(f"solana-keygen pubkey {outfile}")
@@ -264,37 +281,24 @@ def configure_ct_account(address: str, owner_keyfile: pathlib.Path, fee_payer_ke
         args += ["--fee-payer", str(fee_payer_keyfile)]
     spl_token(args)
 
-# ---------- NEW: seed wrapper reserve with confidential tokens (fee-payer = pool) ----------
+# ---------- Seed wrapper reserve with confidential tokens ----------
 def seed_wrapper_confidential(mint: str,
                               amount: float | str,
                               wrapper_keyfile: pathlib.Path,
                               pool_keyfile: pathlib.Path,
                               wrapper_ata: str):
-    """
-    1) Mint `amount` tokens sur l'ATA du wrapper (mint authority = wrapper)
-    2) Déposer `amount` en solde confidentiel (owner = wrapper)
-    3) Tenter un 'apply' pour rendre le solde dispo immédiatement
-    Fee-payer = pool à chaque étape.
-    """
-    # On force le fee-payer sur la pool (changera la conf 'solana config get' pour le process)
     set_config_keypair(pool_keyfile)
-
-    # 1) Mint visible vers l'ATA du wrapper (authority = WRAPPER, fee-payer = POOL)
     spl_token([
         "mint", mint, str(amount), wrapper_ata,
         "--mint-authority", str(wrapper_keyfile),
         "--fee-payer", str(pool_keyfile),
     ])
-
-    # 2) Dépôt en confidentiel (owner = WRAPPER, fee-payer = POOL)
     spl_token([
         "deposit-confidential-tokens", mint, str(amount),
         "--address", wrapper_ata,
         "--owner", str(wrapper_keyfile),
         "--fee-payer", str(pool_keyfile),
     ])
-
-    # 3) Best-effort : appliquer les soldes en attente (certains CLI requièrent 'apply' générique)
     try:
         spl_token([
             "apply-pending-balance", mint,
@@ -345,13 +349,11 @@ def setup_token_flow(keys_dir: pathlib.Path, users: List[str], airdrop_sol: floa
     pool_ata = create_ata(token_mint, pool_pub, pool_key)
     wrapper_ata = create_ata(token_mint, wrapper_pub, pool_key)
 
-    # Création des ATAs pour chaque user
     users_atas = []
     for up, ukey in zip(users_pubs, users_keys):
         try:
             ata_addr = create_ata(token_mint, up, pool_key)
         except Exception as e:
-            # On continue, mais on garde une place vide pour aligner les index
             print(f"!! WARN: create_ata failed for user pub {up}: {e}")
             ata_addr = ""
         users_atas.append(ata_addr)
@@ -366,7 +368,6 @@ def setup_token_flow(keys_dir: pathlib.Path, users: List[str], airdrop_sol: floa
             except Exception as e:
                 print(f"!! WARN: configure_ct_account failed for {ata}: {e}")
 
-    # 🔥 Seed du wrapper en cSOL confidentiels (fee-payer = pool)
     print("== Seeding wrapper reserve with 100 confidential tokens (fee-payer = pool) ==")
     seed_wrapper_confidential(
         mint=token_mint,
@@ -376,10 +377,7 @@ def setup_token_flow(keys_dir: pathlib.Path, users: List[str], airdrop_sol: floa
         wrapper_ata=wrapper_ata,
     )
 
-    # ---------- Résumé robuste ----------
     print("== Summary ==")
-
-    # Vérifie la cohérence des longueurs
     n_users      = len(users)
     n_users_pubs = len(users_pubs)
     n_users_keys = len(users_keys)
@@ -427,10 +425,8 @@ def setup_token_flow(keys_dir: pathlib.Path, users: List[str], airdrop_sol: floa
         indent=2,
     ))
 
-    # Restaure le keypair de config s'il existait
     if prev_keypair and pathlib.Path(prev_keypair).exists():
         set_config_keypair(pathlib.Path(prev_keypair))
-
 
 # ---------- Exports / persist helpers ----------
 def write_deploy_config(workspace_root: pathlib.Path, program_id: str, tree_seed_hex: str, authority_keypair_path: pathlib.Path) -> pathlib.Path:
@@ -485,6 +481,12 @@ def main():
     parser.add_argument("--no-fund", action="store_true", help="Ne pas airdrop le wallet déployeur")
     parser.add_argument("--program-name", default=DEFAULT_PROGRAM_NAME, help="Nom du programme (ex: merkle_registry)")
     parser.add_argument(
+        "--purge-data",
+        dest="purge_data",
+        action="store_true",
+        help="Purger <repo_root>/data avant le build/deploy"
+    )
+    parser.add_argument(
         "--onchain-idl",
         dest="onchain_idl",
         action="store_true",
@@ -498,7 +500,6 @@ def main():
     )
     args = parser.parse_args()
 
-    # 0) Validations & context
     try:
         tree_seed_hex = validate_tree_seed_hex(args.tree_seed_hex)
     except Exception as e:
@@ -522,6 +523,10 @@ def main():
     keys_dir = pathlib.Path(args.keys_dir).expanduser().resolve() if args.keys_dir else DEFAULT_KEYS_DIR
     keys_dir.mkdir(parents=True, exist_ok=True)
     print(f"== Keys dir == {keys_dir}")
+
+    # 2.5) Purge optionnelle du dossier data (à la racine du repo)
+    if args.purge_data:
+        purge_data_dir()
 
     # 3) Clean + Build
     if not args.no_clean:
@@ -569,7 +574,6 @@ def main():
     print(f"- JSON : {cfg_path}")
     print(f"- Env  : {env_path}\n")
 
-    # 9) Affiche aussi les exports (utile pour eval dans le shell)
     print("You can now load these in your shell:")
     print(f'  source "{env_path}"')
     print("\nOr export inline:")

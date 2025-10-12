@@ -145,14 +145,27 @@ class BuyReq(_DecimalAsStr):
       - 'csol' (direct Token-2022 confidential transfer from buyer to seller), or
       - 'sol' (spend buyer's notes; wrapper transfers cSOL to seller), or
       - 'auto' (try cSOL first, fallback to SOL-backed).
+
+    Optionally include `encrypted_shipping` — an object containing:
+      - ephemeral_pub_b58: str
+      - nonce_hex: str
+      - ciphertext_b64: str
+      - thread_id_b64: str (optional but recommended)
+      - algo: str (e.g., "xchacha20poly1305+hkdf-sha256")
+    This blob is committed to an append-only Merkle log; only the seller can decrypt.
     """
     buyer_keyfile: str = Field(..., description="Keyfile of the buyer (./keys/...json).")
     listing_id: str = Field(..., description="Unique listing identifier.")
     payment: Optional[Literal["auto", "csol", "sol"]] = Field(
         "auto", description="Payment mode preference."
     )
-    # ✅ NEW: support quantité
+    # ✅ support quantity
     quantity: conint(ge=1) = 1
+    # ✅ NEW: optional encrypted shipping payload (stored & merklized; server never decrypts)
+    encrypted_shipping: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional encrypted shipping payload for the seller (ephemeral_pub_b58, nonce_hex, ciphertext_b64, thread_id_b64, algo).",
+    )
 
 
 class BuyRes(Ok):

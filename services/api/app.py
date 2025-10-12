@@ -11,8 +11,9 @@ import pathlib
 import subprocess
 import requests
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi import Body  # NEW
-from datetime import datetime  # NEW
+from fastapi import Body
+from datetime import datetime
+import hashlib
 
 from services.crypto_core.merkle import MerkleTree, verify_merkle
 from services.crypto_core.blind_api import load_pub as bs_load_pub, verify as bs_verify
@@ -20,7 +21,6 @@ from services.crypto_core.blind_api import load_pub as bs_load_pub, verify as bs
 # Assure la présence des clés de blind-signature (sinon les notes émises au handoff sont invalides)
 try:
     from services.crypto_core.blind_api import ensure_signer_keypair as _ensure_blind_keys
-
     _ensure_blind_keys()
 except Exception:
     pass
@@ -56,8 +56,7 @@ from .schemas_api import (
 app = FastAPI(title="Incognito Protocol API", version="0.1.0")
 
 # =========================
-# Cluster fingerprint & auto-wipe listings on validator reset
-# + App-level cSOL ledger (no confidential balance probing)
+# Paths & config
 # =========================
 
 REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[2])
@@ -68,126 +67,321 @@ os.makedirs(DATA_DIR, exist_ok=True)
 CLUSTER_FP_PATH = os.path.join(DATA_DIR, "cluster_fingerprint.json")
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "http://127.0.0.1:8899")
 
-# --- Messaging program (Anchor) ---
-MESSAGES_PID = os.getenv("MESSAGES_PROGRAM_ID", "Msg11111111111111111111111111111111111111111")
-SOLANA_DIR = pathlib.Path(REPO_ROOT) / "contracts" / "solana"
-
-# App-level cSOL ledger path
+# App-level ledgers / logs (no DB)
 CSOL_LEDGER_PATH = os.path.join(DATA_DIR, "csol_ledger.json")
-# Ensure ledger file exists
-if not os.path.exists(CSOL_LEDGER_PATH):
-    try:
-        pathlib.Path(CSOL_LEDGER_PATH).write_text(json.dumps({}))
-    except Exception:
-        pass
+CSOL_SUPPLY_FILE = os.path.join(DATA_DIR, "csol_supply.json")  # miroir off-chain de la total supply
+SHIPPING_EVENTS_PATH = os.path.join(DATA_DIR, "shipping_events.jsonl")
+SHIPPING_MERKLE_PATH = os.path.join(DATA_DIR, "shipping_merkle.json")
 
+IPFS_GATEWAY = os.getenv("IPFS_GATEWAY", "http://127.0.0.1:8080/ipfs/")
 
-def _get_genesis_hash() -> str | None:
-    # 1) Prefer JSON-RPC getGenesisHash
+# Override explicite demandé pour la lecture du solde trésor/pool
+TREASURY_KEYFILE = os.getenv(
+    "TREASURY_KEYFILE",
+    "/Users/alex/Desktop/incognito-protocol-1/keys/pool.json",
+)
+
+# Ensure base files exist (lazy best-effort)
+for p, default in [
+    (CSOL_LEDGER_PATH, "{}"),
+    (CSOL_SUPPLY_FILE, '{"total":"0"}'),
+    (SHIPPING_EVENTS_PATH, ""),
+    (SHIPPING_MERKLE_PATH, json.dumps({"leaves": [], "root": None, "version": 1})),
+]:
+    if not os.path.exists(p):
+        try:
+            pathlib.Path(p).write_text(default if isinstance(default, str) else json.dumps(default))
+        except Exception:
+            pass
+
+# =========================
+# Cluster fingerprint & auto-wipe listings on validator reset
+# =========================
+
+AUTO_WIPE = os.getenv("AUTO_WIPE_ON_CLUSTER_CHANGE", "1") == "1"
+
+def _rpc(method: str, params=None) -> dict:
     try:
         r = requests.post(
             SOLANA_RPC_URL,
-            json={"jsonrpc": "2.0", "id": 1, "method": "getGenesisHash"},
-            timeout=3,
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []},
+            timeout=5,
         )
-        j = r.json()
-        gh = j.get("result")
-        if isinstance(gh, str) and len(gh) > 0:
-            return gh
-    except Exception:
-        pass
-    # 2) Fallback to CLI
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+def _get_genesis_hash() -> str | None:
+    j = _rpc("getGenesisHash")
+    return j.get("result") if isinstance(j, dict) else None
+
+def _get_identity_pub() -> str | None:
+    j = _rpc("getIdentity")
     try:
-        out = subprocess.run(
-            ["solana", "-u", SOLANA_RPC_URL, "genesis-hash"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        if out:
-            return out
+        return (j or {}).get("result", {}).get("identity")
     except Exception:
-        pass
-    return None
+        return None
 
-
-def _read_saved_fp() -> dict:
+def _load_fp() -> dict:
     try:
         return json.loads(pathlib.Path(CLUSTER_FP_PATH).read_text())
     except Exception:
         return {}
 
-
-def _write_saved_fp(fp: dict) -> None:
+def _save_fp(fp: dict) -> None:
     try:
         pathlib.Path(CLUSTER_FP_PATH).write_text(json.dumps(fp))
     except Exception:
         pass
 
+def _unlink(path: str | None):
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except Exception:
+        pass
 
-def _wipe_listings_via_ca_reset_all() -> int:
-    """
-    Try ca.listings_reset_all() if present. Returns count removed (best-effort).
-    """
-    fn = getattr(ca, "listings_reset_all", None)
-    if callable(fn):
+def _autowipe_on_cluster_change():
+    if not AUTO_WIPE:
+        return
+    cur_genesis = _get_genesis_hash()
+    cur_ident   = _get_identity_pub()  # include validator identity
+    if not cur_genesis:
+        return
+    cur_fp = {"rpc": SOLANA_RPC_URL, "genesis": cur_genesis, "identity": cur_ident}
+    prev = _load_fp()
+    if prev == cur_fp:
+        return
+
+    try:
         try:
-            return int(fn())
+            ca.listings_reset_all()
         except Exception:
-            return 0
-    return 0
+            pass
+        _unlink(CSOL_LEDGER_PATH)
+        _unlink(CSOL_SUPPLY_FILE)
+        _unlink(SHIPPING_EVENTS_PATH)
+        _unlink(SHIPPING_MERKLE_PATH)
+        lst_path = os.getenv("LISTINGS_STATE_FILE")
+        _unlink(lst_path)
 
+        pathlib.Path(CSOL_LEDGER_PATH).write_text(json.dumps({}))
+        pathlib.Path(CSOL_SUPPLY_FILE).write_text(json.dumps({"total": "0"}))
+        pathlib.Path(SHIPPING_EVENTS_PATH).write_text("")
+        pathlib.Path(SHIPPING_MERKLE_PATH).write_text(json.dumps({"leaves": [], "root": None, "version": 1}))
+    finally:
+        _save_fp(cur_fp)
 
-def _wipe_listings_by_iteration() -> int:
-    """
-    Fallback: iterate all active listings and delete them by seller.
-    """
-    removed = 0
+def _account_exists(pub: str) -> bool:
+    j = _rpc("getAccountInfo", [pub, {"encoding": "base64"}])
+    try:
+        return bool(((j or {}).get("result") or {}).get("value"))
+    except Exception:
+        return False
+
+def _reconcile_listings():
     try:
         items = ca.listings_active()
     except Exception:
-        items = []
+        return
     for it in items or []:
-        listing_id = it.get("id") or it.get("listing_id") or it.get("pk")
-        seller_pub = it.get("seller_pub") or it.get("owner_pub") or it.get("seller")
-        if not listing_id or not seller_pub:
+        lid = str(it.get("id") or it.get("listing_id") or "")
+        spk = str(it.get("seller_pub") or "")
+        if not lid or not spk:
+            continue
+        if not _account_exists(spk):
+            try: ca.listing_delete(owner_pubkey=spk, listing_id_hex=lid)
+            except Exception: pass
             continue
         try:
-            removed += int(ca.listing_delete(seller_pub, str(listing_id)))
+            rc, out, err = ca._run_rc(["spl-token", "address", ca.MINT, "--owner", spk, "--verbose"])
+            ok = (rc == 0) and ("associated token address:" in (out or "").lower())
+            if not ok:
+                try: ca.listing_delete(owner_pubkey=spk, listing_id_hex=lid)
+                except Exception: pass
         except Exception:
-            # ignore single failures; continue wiping others
+            try: ca.listing_delete(owner_pubkey=spk, listing_id_hex=lid)
+            except Exception: pass
+
+_autowipe_on_cluster_change()
+_reconcile_listings()
+
+# --- Messaging program (Anchor) ---
+MESSAGES_PID = os.getenv("MESSAGES_PROGRAM_ID", "Msg11111111111111111111111111111111111111111")
+SOLANA_DIR = pathlib.Path(REPO_ROOT) / "contracts" / "solana"
+
+# =========================
+# Shipping (Encrypted) — Append-only log + Merkle state (NO DB)
+# =========================
+
+def _shipping__ensure_files():
+    if not os.path.exists(SHIPPING_EVENTS_PATH):
+        try:
+            pathlib.Path(SHIPPING_EVENTS_PATH).write_text("")
+        except Exception:
             pass
-    return removed
+    if not os.path.exists(SHIPPING_MERKLE_PATH):
+        try:
+            pathlib.Path(SHIPPING_MERKLE_PATH).write_text(json.dumps({"leaves": [], "root": None, "version": 1}))
+        except Exception:
+            pass
 
+def _shipping_events_append(row: dict) -> None:
+    try:
+        with open(SHIPPING_EVENTS_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
 
-# ---- cSOL app-ledger helpers ----
+def _shipping_events_read_all() -> list[dict]:
+    out = []
+    try:
+        with open(SHIPPING_EVENTS_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+    return out
+
+def _shipping_load_state() -> Dict[str, Any]:
+    _shipping__ensure_files()
+    try:
+        return json.loads(pathlib.Path(SHIPPING_MERKLE_PATH).read_text())
+    except Exception:
+        return {"leaves": [], "root": None, "version": 1}
+
+def _shipping_save_state(st: Dict[str, Any]) -> None:
+    try:
+        pathlib.Path(SHIPPING_MERKLE_PATH).write_text(json.dumps(st))
+    except Exception:
+        pass
+
+def _shipping_canon_bytes(blob: Dict[str, Any]) -> bytes:
+    return json.dumps(blob, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+def _shipping_leaf_hex(blob: Dict[str, Any]) -> str:
+    h = hashlib.sha256()
+    h.update(b"ship|")
+    h.update(_shipping_canon_bytes(blob))
+    return h.hexdigest()
+
+def _shipping_build_tree(leaves_hex: List[str]) -> MerkleTree:
+    mt = MerkleTree(leaves_hex if isinstance(leaves_hex, list) else [])
+    if not getattr(mt, "layers", None) and getattr(mt, "leaf_bytes", None):
+        mt.build_tree()
+    return mt
+
+def _shipping_append_event(order_id: str, listing_id: str, buyer_pub: str, seller_pub: str, encrypted_blob: Dict[str, Any]) -> Dict[str, Any]:
+    _shipping__ensure_files()
+    leaf_hex = _shipping_leaf_hex(encrypted_blob)
+
+    row = {
+        "type": "shipping_blob",
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "order_id": order_id,
+        "listing_id": listing_id,
+        "buyer_pub": buyer_pub,
+        "seller_pub": seller_pub,
+        "leaf": leaf_hex,
+        "blob": encrypted_blob,
+    }
+    try:
+        with open(SHIPPING_EVENTS_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write shipping event: {e}")
+
+    st = _shipping_load_state()
+    st["leaves"].append(leaf_hex)
+    mt = _shipping_build_tree(st["leaves"])
+    root_hex = mt.root().hex()
+    st["root"] = root_hex
+    _shipping_save_state(st)
+
+    idx = len(st["leaves"]) - 1
+    proof = mt.get_proof(idx)
+
+    return {"leaf": leaf_hex, "root": root_hex, "index": idx, "proof": proof, "order_id": order_id}
+
+def _shipping_find_by_order(order_id: str) -> Optional[Dict[str, Any]]:
+    _shipping__ensure_files()
+    target_row = None
+    try:
+        with open(SHIPPING_EVENTS_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("type") == "shipping_blob" and row.get("order_id") == order_id:
+                    target_row = row
+    except FileNotFoundError:
+        pass
+
+    if not target_row:
+        return None
+
+    st = _shipping_load_state()
+    leaves = st.get("leaves", [])
+    if not isinstance(leaves, list):
+        leaves = []
+    try:
+        idx = leaves.index(target_row["leaf"])
+    except ValueError:
+        idx = None
+
+    mt = _shipping_build_tree(leaves)
+    root_hex = mt.root().hex()
+    proof = mt.get_proof(idx) if idx is not None else []
+
+    return {
+        "order_id": order_id,
+        "listing_id": target_row.get("listing_id"),
+        "buyer_pub": target_row.get("buyer_pub"),
+        "seller_pub": target_row.get("seller_pub"),
+        "encrypted_shipping": target_row.get("blob"),
+        "leaf": target_row.get("leaf"),
+        "root": root_hex,
+        "index": idx if idx is not None else -1,
+        "proof": proof,
+    }
+
+# =========================
+# Helpers
+# =========================
+
 CSOL_DEC = Decimal("0.000000001")
+CHUNK = Decimal("100")  # tranche fixe pour mint/burn
 
+def _fmt(x: Decimal | float | str) -> str:
+    return str(Decimal(str(x)).quantize(CSOL_DEC))
 
 def _q(x: Decimal | str | float) -> Decimal:
     return Decimal(str(x)).quantize(CSOL_DEC)
 
-
-def _ledger_load() -> Dict[str, str]:
+def _ledger_load() -> dict:
     try:
         return json.loads(pathlib.Path(CSOL_LEDGER_PATH).read_text())
     except Exception:
         return {}
 
-
-def _ledger_save(d: Dict[str, str]) -> None:
+def _ledger_save(d: dict) -> None:
     try:
         pathlib.Path(CSOL_LEDGER_PATH).write_text(json.dumps(d))
     except Exception:
         pass
-
 
 def _csol_get(pub: str) -> Decimal:
     try:
         return _q(_ledger_load().get(pub, "0"))
     except Exception:
         return Decimal("0")
-
 
 def _csol_add(pub: str, amt: Decimal | str | float) -> None:
     d = _ledger_load()
@@ -196,74 +390,55 @@ def _csol_add(pub: str, amt: Decimal | str | float) -> None:
     d[pub] = str(newv)
     _ledger_save(d)
 
-
 def _csol_sub(pub: str, amt: Decimal | str | float) -> None:
     d = _ledger_load()
     cur = _q(d.get(pub, "0"))
     newv = _q(cur - _q(amt))
     if newv <= 0:
-        d.pop(pub, None)  # tidy
+        d.pop(pub, None)
     else:
         d[pub] = str(newv)
     _ledger_save(d)
 
+# --- Off-chain mirror of on-chain total supply ---
+def _supply_load() -> Decimal:
+    try:
+        d = json.loads(pathlib.Path(CSOL_SUPPLY_FILE).read_text())
+        return _q(d.get("total", "0"))
+    except Exception:
+        return _q("0")
 
-@app.get("/csol/balance/{owner_pub}")
-def csol_balance(owner_pub: str):
-    """
-    App-level cSOL 'balance'—credits minus debits observed by this backend.
-    Not an on-chain confidential read.
-    """
-    return {"owner_pub": owner_pub, "csol": str(_csol_get(owner_pub))}
+def _supply_save_exact(x: Decimal | str | float) -> None:
+    x = _q(x)
+    try:
+        pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+        pathlib.Path(CSOL_SUPPLY_FILE).write_text(json.dumps({"total": str(x)}))
+    except Exception:
+        pass
 
+# --- Pending burn (100-lot debt) ---
+PENDING_BURN_FILE = os.path.join(DATA_DIR, "csol_pending_burn.json")
 
-@app.on_event("startup")
-def _wipe_listings_if_new_validator():
-    current = _get_genesis_hash()
-    if not current:
-        # Can't fingerprint cluster — do nothing
-        return
-    saved = _read_saved_fp()
-    prev = saved.get("genesis_hash")
-    if prev != current:
-        # New / reset validator detected → wipe listings and update roots
-        removed = _wipe_listings_via_ca_reset_all()
-        if removed == 0:
-            removed = _wipe_listings_by_iteration()
-        try:
-            # Also clear the app-level cSOL ledger
-            pathlib.Path(CSOL_LEDGER_PATH).write_text(json.dumps({}))
-        except Exception:
-            pass
-        try:
-            # Optional: recompute + publish empty on-chain roots for consistency
-            solana_dir = pathlib.Path(REPO_ROOT) / "contracts" / "solana"
-            subprocess.run(
-                ["npx", "ts-node", "scripts/compute_and_update_roots.ts"],
-                cwd=solana_dir,
-                check=True,
-            )
-        except Exception:
-            pass
-        _write_saved_fp({"genesis_hash": current, "removed": int(removed)})
+def _pending_burn_load() -> Decimal:
+    try:
+        j = json.loads(pathlib.Path(PENDING_BURN_FILE).read_text())
+        return _q(j.get("amount", "0"))
+    except Exception:
+        return Decimal("0")
 
+def _pending_burn_save(x: Decimal | str | float) -> None:
+    try:
+        pathlib.Path(PENDING_BURN_FILE).write_text(json.dumps({"amount": str(_q(x))}))
+    except Exception:
+        pass
 
-# =========================
-# Helpers
-# =========================
-
-def _fmt(x: Decimal | float | str) -> str:
-    return str(Decimal(str(x)).quantize(Decimal("0.000000001")))
-
+def _pending_burn_add(x: Decimal | str | float) -> None:
+    _pending_burn_save(_pending_burn_load() + _q(x))
 
 # --- Helper: serialize solders.Keypair to a temp JSON keyfile (64-byte array) ---
 def _write_temp_keypair_from_solders(kp) -> str:
-    """
-    Serialize a solders.Keypair to a temp JSON file as a 64-byte array (secret||pub),
-    compatible with solana CLI / spl-token.
-    """
     try:
-        sk_bytes = kp.to_bytes()  # solders API
+        sk_bytes = kp.to_bytes()
     except Exception as e:
         raise RuntimeError(f"Cannot serialize Keypair: {e}")
     arr = list(sk_bytes)
@@ -273,134 +448,261 @@ def _write_temp_keypair_from_solders(kp) -> str:
         json.dump(arr, f)
     return tmp_path
 
+# =========================
+# On-chain token introspection via spl-token
+# =========================
+
+def _spl_out(args: list[str]) -> str:
+    p = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.strip() or "spl-token failed")
+    return p.stdout.strip()
+
+def _csol_supply_onchain() -> Decimal:
+    # "spl-token supply <MINT>"
+    out = _spl_out(["spl-token", "supply", ca.MINT])
+    return _q(out.split()[0])
+
+def _wrapper_ata() -> str:
+    return ca.get_wrapper_ata()
+
+def _wrapper_reserve_onchain() -> Decimal:
+    # "spl-token balance <ATA>" -> "123.000000000"
+    try:
+        out = _spl_out(["spl-token", "balance", _wrapper_ata()])
+        return _q(out.split()[0])
+    except Exception:
+        return Decimal("0")
 
 # =========================
-# cSOL supply / reserve utils
+# Treasury / supply utils
 # =========================
-
-SUPPLY_BAND = Decimal(os.getenv("SUPPLY_BAND", "100"))
-
 
 def ceil_to_100(x: Decimal) -> Decimal:
-    """
-    Ceiling to the next hundred.
-    1342 -> 1400; 1300 -> 1300 (already multiple of 100).
-    """
     x = Decimal(str(x))
     return ((x + Decimal("99")) // Decimal("100")) * Decimal("100")
 
+def _resolve_treasury_keyfile() -> str:
+    kf = TREASURY_KEYFILE or getattr(ca, "TREASURY_KEYPAIR", None)
+    if not kf:
+        raise HTTPException(status_code=500, detail="No treasury keyfile configured")
+    return kf
+
+def _resolve_treasury_pub_for_balance() -> str:
+    return ca.get_pubkey_from_keypair(_resolve_treasury_keyfile())
 
 def get_treasury_sol_balance() -> Decimal:
-    pool_pub = ca.get_pubkey_from_keypair(ca.TREASURY_KEYPAIR)
+    pool_pub = _resolve_treasury_pub_for_balance()
     bal = ca.get_sol_balance(pool_pub)
     return Decimal(str(bal or "0")).quantize(CSOL_DEC)
 
-
 def _csol_total_supply_dec() -> Decimal:
-    return Decimal(str(ca.csol_total_supply() or "0")).quantize(CSOL_DEC)
-
+    # vérité = on-chain; le fichier est un miroir
+    try:
+        s = _csol_supply_onchain()
+        _supply_save_exact(s)  # keep mirror fresh
+        return s
+    except Exception:
+        # fallback: miroir local si CLI indisponible
+        return _supply_load()
 
 def _csol_reserve_balance_dec() -> Decimal:
+    # vérité = solde ATA du wrapper
+    return _wrapper_reserve_onchain()
+
+# =========================
+# Confidential/public burn helpers
+# =========================
+
+def _apply_pending_balance(mint: str, ata: str, owner_kf: str, fee_payer_kf: str) -> None:
+    # Idempotent
+    _spl_out([
+        "spl-token", "apply-pending-balance", mint,
+        "--address", ata,
+        "--owner", owner_kf,
+        "--fee-payer", fee_payer_kf,
+    ])
+
+def _withdraw_confidential_tokens(mint: str, ata: str, owner_kf: str, fee_payer_kf: str, amount: Decimal) -> None:
+    _spl_out([
+        "spl-token", "withdraw-confidential-tokens",
+        mint, _fmt(amount),
+        "--address", ata,
+        "--owner", owner_kf,
+        "--fee-payer", fee_payer_kf,
+    ])
+
+def _burn_public_tokens_simple(ata: str, owner_kf: str, fee_payer_kf: str, amount: Decimal) -> None:
+    # Exact CLI that worked manually
+    _spl_out([
+        "spl-token", "burn",
+        ata, _fmt(amount),
+        "--owner", owner_kf,
+        "--fee-payer", fee_payer_kf,
+    ])
+
+def _burn_chunk(amount: Decimal) -> bool:
     """
-    Wrapper reserve balance (confidential), read via wrapper owner.
-    We pass the keypair path to reuse our robust ATA detection.
+    Try a simple public burn first.
+    If that fails (likely all balance is confidential), then:
+      apply-pending-balance -> withdraw-confidential-tokens -> burn.
+    Uses a pool stealth fee payer (temp keyfile).
     """
+    mint = ca.MINT
+    ata = _wrapper_ata()
+    owner_kf = ca.WRAPPER_KEYPAIR
+
+    fee_tmp, _ = ca.pick_treasury_fee_payer_tmpfile()
+    if not fee_tmp:
+        return False
+
     try:
-        bal = ca.csol_balance(ca.WRAPPER_KEYPAIR)
+        # 1) Fast path: public burn
+        try:
+            _burn_public_tokens_simple(ata, owner_kf, fee_tmp, amount)
+            return True
+        except Exception:
+            # 2) Confidential path
+            try:
+                _apply_pending_balance(mint, ata, owner_kf, fee_tmp)
+            except Exception:
+                # ok if nothing to apply
+                pass
+            _withdraw_confidential_tokens(mint, ata, owner_kf, fee_tmp, amount)
+            _burn_public_tokens_simple(ata, owner_kf, fee_tmp, amount)
+            return True
     except Exception:
-        bal = "0"
-    return Decimal(str(bal or "0")).quantize(CSOL_DEC)
+        return False
+    finally:
+        try:
+            os.remove(fee_tmp)
+        except Exception:
+            pass
 
+# =========================
+# Pending-burn settlement (on-chain aware)
+# =========================
 
-def reconcile_csol_supply() -> Dict[str, Any]:
+def _try_settle_pending_burn() -> None:
+    pb = _pending_burn_load()
+    if pb <= 0:
+        return
+    chunks = int(pb // CHUNK)
+    if chunks <= 0:
+        return
+    settled = Decimal("0")
+    for _ in range(chunks):
+        ok = _burn_chunk(CHUNK)
+        if not ok:
+            break
+        settled += CHUNK
+    if settled > 0:
+        _supply_save_exact(_csol_supply_onchain())
+        _pending_burn_save(pb - settled)
+        print(f"[PENDING_BURN] settled {settled}; remaining {pb - settled}")
+
+# =========================
+# Reconciliation (drive supply to target exactly)
+# =========================
+
+def reconcile_csol_supply(assume_delta: Decimal = Decimal("0")) -> Dict[str, Any]:
     """
-    Keep |total cSOL supply − Treasury SOL| ≤ SUPPLY_BAND.
-    We adjust supply ONLY via the wrapper reserve (mint/burn).
+    Objectif: après l'opération, la supply on-chain == target.
+    - target = ceil_100(TreasurySOL + assume_delta), min 100
+    - Mint/Burn par tranches fixes de 100
     """
-    T = get_treasury_sol_balance()
-    S = _csol_total_supply_dec()
+    T = (get_treasury_sol_balance() + _q(assume_delta)).quantize(CSOL_DEC)
+    target = max(Decimal("100"), ceil_to_100(T)).quantize(CSOL_DEC)
 
-    lower = max(Decimal("0"), (T - SUPPLY_BAND).quantize(CSOL_DEC))
-    upper = (T + SUPPLY_BAND).quantize(CSOL_DEC)
+    S_on = _csol_total_supply_dec()
+    gap = (S_on - target).quantize(CSOL_DEC)
 
-    info: Dict[str, Any] = {
-        "treasury_sol": str(T),
-        "supply_csol": str(S),
-        "band": str(SUPPLY_BAND),
-        "lower": str(lower),
-        "upper": str(upper),
-        "action": "noop",
-    }
+    print(f"[RECONCILE] treasury={T} supply_onchain={S_on} target={target}")
 
-    if S < lower:
-        need = (lower - S).quantize(CSOL_DEC)
-        if need > 0:
-            sigs = ca.csol_mint_to_reserve(str(need))
-            info.update({"action": "mint", "amount": str(need), "sigs": sigs})
-        return info
+    if gap == 0:
+        _supply_save_exact(S_on)
+        return {"action": "noop", "treasury": str(T), "target": str(target)}
 
-    if S > upper:
-        need = (S - upper).quantize(CSOL_DEC)
-        reserve = _csol_reserve_balance_dec()
-        burn_amt = min(need, reserve)
-        if burn_amt > 0:
-            sigs = ca.csol_burn_from_reserve(str(burn_amt))
-            info.update({"action": "burn", "amount": str(burn_amt), "sigs": sigs})
-        else:
-            info.update({"action": "burn_skipped", "reason": "no_reserve_liquidity"})
-        return info
+    if gap > 0:
+        # Need to reduce supply by 'gap' -> number of 100-lots:
+        chunks_needed = int(gap // CHUNK)
+        burned = Decimal("0")
+        for _ in range(chunks_needed):
+            ok = _burn_chunk(CHUNK)
+            if not ok:
+                break
+            burned += CHUNK
+        if burned > 0:
+            _supply_save_exact(_csol_supply_onchain())
+        remaining = (Decimal(chunks_needed) * CHUNK) - burned
+        if remaining > 0:
+            _pending_burn_add(remaining)
+            print(f"[RECONCILE] partial burn burned={burned} pending_burn+={remaining}")
+            return {"action": "partial_burn", "amount": str(burned), "pending": str(remaining), "treasury": str(T), "target": str(target)}
+        print(f"[RECONCILE] BURN {burned} (100-lots)")
+        return {"action": "burn", "amount": str(burned), "treasury": str(T), "target": str(target)}
 
-    return info
+    # gap < 0 -> need to mint -gap:
+    chunks_to_mint = int((-gap) // CHUNK)
+    amt = _q(chunks_to_mint) * CHUNK
+    print(f"[RECONCILE] MINT {amt} to wrapper reserve")
+    ca.csol_mint_to_reserve(str(amt))
+    _supply_save_exact(_csol_supply_onchain())
+    # Do not settle pending burns here; we want supply to remain at target.
+    return {"action": "mint", "amount": str(amt), "treasury": str(T), "target": str(target)}
 
+# =========================
+# Reserve management
+# =========================
 
 def _ensure_reserve_has(amount: Decimal) -> None:
     """
-    Ensure reserve has `amount` cSOL available.
-    If short, mint up to headroom so that |S - T| ≤ SUPPLY_BAND remains true.
+    Garantir que la réserve possède `amount` cSOL.
+    Mint par tranches de 100 jusqu'à couvrir le besoin.
     """
-    amount = Decimal(str(amount)).quantize(CSOL_DEC)
+    amount = _q(amount)
     if amount <= 0:
         return
-
     reserve = _csol_reserve_balance_dec()
+    print(f"[ENSURE_RESERVE] need={amount} reserve={reserve}")
     if reserve >= amount:
+        print("[ENSURE_RESERVE] enough reserve, no mint")
         return
-
     missing = (amount - reserve).quantize(CSOL_DEC)
+    chunks = int((missing + (CHUNK - Decimal("0.000000000"))) // CHUNK)  # ceil to chunk
+    if chunks <= 0:
+        return
+    to_mint = _q(chunks) * CHUNK
+    print(f"[ENSURE_RESERVE] minting {to_mint}")
+    ca.csol_mint_to_reserve(str(to_mint))
+    _supply_save_exact(_csol_supply_onchain())
+    # Note: pas de _try_settle_pending_burn() ici
 
-    T = get_treasury_sol_balance()
-    S = _csol_total_supply_dec()
-    headroom = (T + SUPPLY_BAND - S).quantize(CSOL_DEC)
+# =========================
+# Startup normalization (mirror only)
+# =========================
 
-    if headroom <= 0 or missing > headroom:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Insufficient cSOL reserve liquidity under band policy. "
-                f"Missing {missing} cSOL, allowed to mint {max(headroom, Decimal('0'))} "
-                f"with T={T}, S={S}, band={SUPPLY_BAND}."
-            ),
-        )
+def _normalize_supply_on_startup():
+    try:
+        s = _csol_supply_onchain()
+        _supply_save_exact(s)
+        print(f"[STARTUP] mirrored on-chain supply: {s}")
+    except Exception:
+        # keep existing mirror
+        pass
 
-    # safe to mint without breaking the band
-    ca.csol_mint_to_reserve(str(missing))
-
+_normalize_supply_on_startup()
 
 # =========================
 # Listing helpers (dynamic)
 # =========================
 
 def _load_listing(listing_id: str) -> Dict[str, Any]:
-    """
-    Try multiple backends & names to load a listing dict.
-    Expected keys: id, price (SOL), seller_pub, active:bool
-    """
     candidates = []
     try:
         from clients.cli import incognito_marketplace as mp  # optional at runtime
     except Exception:
         mp = None  # type: ignore
-
     try:
         from services.api import listings as srv_listings  # optional at runtime
     except Exception:
@@ -426,15 +728,14 @@ def _load_listing(listing_id: str) -> Dict[str, Any]:
                 continue
     raise HTTPException(status_code=400, detail="Listing not found")
 
-
 def _deactivate_listing(listing_id: str) -> None:
     candidates = []
     try:
-        from services.api import listings as srv_listings  # optional at runtime
+        from services.api import listings as srv_listings
     except Exception:
         srv_listings = None  # type: ignore
     try:
-        from clients.cli import incognito_marketplace as mp  # optional at runtime
+        from clients.cli import incognito_marketplace as mp
     except Exception:
         mp = None  # type: ignore
 
@@ -455,16 +756,25 @@ def _deactivate_listing(listing_id: str) -> None:
                 return
             except Exception:
                 continue
-    # If no backend handled it, make it non-fatal for now
     return
 
+# ---------- Admin endpoints (diagnostic) ----------
+@app.get("/admin/treasury")
+def admin_treasury(keyfile: Optional[str] = None):
+    kf = keyfile or _resolve_treasury_keyfile()
+    pub = ca.get_pubkey_from_keypair(kf)
+    bal = ca.get_sol_balance(pub)
+    return {"keyfile": kf, "pub": pub, "balance_sol": str(Decimal(str(bal or 0)).quantize(CSOL_DEC))}
+
+@app.post("/admin/reconcile")
+def admin_reconcile():
+    return reconcile_csol_supply()
 
 # ---------- Metrics ----------
 @app.get("/metrics", response_model=List[MetricRow])
 def metrics():
     rows = ev.metrics_all()
     return [MetricRow(epoch=r[0], issued_count=r[1], spent_count=r[2], updated_at=r[3]) for r in rows]
-
 
 # ---------- Merkle Status ----------
 @app.get("/merkle/status", response_model=MerkleStatus)
@@ -496,26 +806,15 @@ def merkle_status():
         pool_root_hex=pmt.root().hex(),
     )
 
-
 # ---------- Deposit ----------
 @app.post("/deposit", response_model=DepositRes)
 def deposit(req: DepositReq):
-    """
-    Deposit flow (to self):
-    - Force the note owner to be the depositor (no arbitrary recipient).
-    - Split amount into main_part (goes to pool) + stealth fee (goes to pool's stealth addr).
-    - Create a private note owned by depositor_pub with amount = main_part.
-    - Update and return new Merkle root.
-    """
-    # Resolve pool authority and its stealth address for fee routing
-    pool_pub = ca.get_pubkey_from_keypair(ca.TREASURY_KEYPAIR)
+    pool_pub = _resolve_treasury_pub_for_balance()
     eph_b58, stealth_pool_addr = ca.generate_stealth_for_recipient(pool_pub)
     ca.add_pool_stealth_record(pool_pub, stealth_pool_addr, eph_b58, 0)
 
-    # Force owner = depositor (ignore any recipient fields from request)
     depositor_pub = ca.get_pubkey_from_keypair(req.depositor_keyfile)
 
-    # Validate and split amount
     fee_dec = ca.STEALTH_FEE_SOL
     try:
         main_part = (req.amount_sol - fee_dec).quantize(Decimal("0.000000001"), rounding=ROUND_DOWN)
@@ -525,33 +824,28 @@ def deposit(req: DepositReq):
     if main_part <= 0:
         raise HTTPException(status_code=400, detail="Amount must be greater than stealth fee")
 
-    # On-chain transfers:
     ca.solana_transfer(req.depositor_keyfile, pool_pub, str(main_part))
     ca.solana_transfer(req.depositor_keyfile, stealth_pool_addr, str(fee_dec))
 
-    # Create and record the private note owned by the depositor
     st = ca.load_wrapper_state()
     note = secrets.token_bytes(32).hex()
     nonce = secrets.token_bytes(16).hex()
     rec = ca.add_note(st, depositor_pub, str(main_part), note, nonce)
 
-    # annotate fee routing details (useful for UI/debug)
     rec["fee_eph_pub_b58"] = eph_b58
     rec["fee_counter"] = 0
     rec["fee_stealth_pubkey"] = stealth_pool_addr
 
     ca.save_wrapper_state(st)
 
-    # Recompute and emit Merkle root
     root_hex = ca.build_merkle(ca.load_wrapper_state()).root().hex()
     try:
         ca.emit("MerkleRootUpdated", root_hex=root_hex)
     except Exception:
         pass
 
-    # Keep cSOL supply in sync with treasury changes
     try:
-        reconcile_csol_supply()
+        reconcile_csol_supply(assume_delta=main_part)
     except Exception:
         pass
 
@@ -565,7 +859,6 @@ def deposit(req: DepositReq):
         leaf_index=int(rec["index"]),
         merkle_root=root_hex,
     )
-
 
 # ---------- Handoff ----------
 @app.post("/handoff", response_model=HandoffRes)
@@ -582,7 +875,7 @@ def handoff(req: HandoffReq):
 
     mt = ca.build_merkle(st)
     root_hex = mt.root().hex()
-    pub = ca.bs_load_pub()
+    pub = bs_load_pub()
 
     inputs_used = []
     for n in chosen:
@@ -611,8 +904,7 @@ def handoff(req: HandoffReq):
 
         inputs_used.append({"index": idx, "commitment": n["commitment"]})
 
-    # output to recipient
-    from services.crypto_core.splits import split_bounded  # (kept even if single output for parity)
+    from services.crypto_core.splits import split_bounded
 
     outputs = []
     tag_hex = ca.recipient_tag(req.recipient_pub).hex()
@@ -644,7 +936,6 @@ def handoff(req: HandoffReq):
 
     return HandoffRes(inputs_used=inputs_used, outputs_created=outputs, change_back_to_sender=chg_amt, new_merkle_root=new_root)
 
-
 # ---------- Withdraw (classic SOL) ----------
 @app.post("/withdraw", response_model=WithdrawRes)
 def withdraw(req: WithdrawReq):
@@ -654,26 +945,22 @@ def withdraw(req: WithdrawReq):
 
     user_pub = ca.get_pubkey_from_keypair(user_kf)
 
-    # 1) Load state & compute available
     st = ca.load_wrapper_state()
     available = Decimal(str(ca.total_available_for_recipient(st, user_pub)))
     if available <= 0:
         raise HTTPException(status_code=400, detail="No unspent notes available for this user.")
 
-    # 2) Amount: ALL if omitted
     req_amt = available if req.amount_sol is None else Decimal(str(req.amount_sol))
     if req_amt <= 0:
         raise HTTPException(status_code=400, detail="Withdraw amount must be > 0.")
     if req_amt > available:
         raise HTTPException(status_code=400, detail="Requested amount exceeds available balance.")
 
-    # 3) Coin select notes covering req_amt
     notes = ca.list_unspent_notes_for_recipient(st, user_pub)
-    chosen, total_selected = ca.greedy_coin_select(notes, req_amt)  # -> (list, Decimal)
+    chosen, total_selected = ca.greedy_coin_select(notes, req_amt)
     if not chosen:
         raise HTTPException(status_code=400, detail="Coin selection failed.")
 
-    # 4) Verify Merkle inclusion, mark spent (nullifiers)
     mt = ca.build_merkle(st)
     root_hex = mt.root().hex()
     spent_indices: list[int] = []
@@ -696,7 +983,6 @@ def withdraw(req: WithdrawReq):
         except Exception:
             pass
 
-    # 5) CHANGE NOTE if partial withdraw
     change = (Decimal(str(total_selected)) - Decimal(str(req_amt))).quantize(
         Decimal("0.000000001"), rounding=ROUND_DOWN
     )
@@ -705,25 +991,22 @@ def withdraw(req: WithdrawReq):
         nonce = secrets.token_bytes(16).hex()
         ca.add_note(st, user_pub, str(change), note, nonce)
 
-    # 6) Persist & rebuild Merkle (includes change note)
     ca.save_wrapper_state(st)
     new_root = ca.build_merkle(st).root().hex()
 
-    # 7) Plain SOL transfer from Treasury → user
+    treasury_kf = _resolve_treasury_keyfile()
     try:
-        sig = ca.solana_transfer(ca.TREASURY_KEYPAIR, user_pub, str(req_amt))
+        sig = ca.solana_transfer(treasury_kf, user_pub, str(req_amt))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"SOL transfer failed: {e}")
 
-    # 8) Emit Merkle update (no epoch)
     try:
         ca.emit("MerkleRootUpdated", root_hex=new_root)
     except Exception:
         pass
 
-    # Keep cSOL supply in sync with treasury changes
     try:
-        reconcile_csol_supply()
+        reconcile_csol_supply(assume_delta=-req_amt)
     except Exception:
         pass
 
@@ -736,19 +1019,16 @@ def withdraw(req: WithdrawReq):
         new_merkle_root=new_root,
     )
 
-
 # ---------- Convert (cSOL → SOL) ----------
 @app.post("/convert", response_model=ConvertRes)
 def convert(req: ConvertReq):
     sender_pub = ca.get_pubkey_from_keypair(req.sender_keyfile)
     sender_ata = ca.get_ata_for_owner(ca.MINT, req.sender_keyfile)
 
-    # Use treasury stealth (or pool) as fee-payer if available
     fee_tmp, _ = ca.pick_treasury_fee_payer_tmpfile()
     if not fee_tmp:
         raise HTTPException(status_code=400, detail="No funded treasury stealth key available as fee-payer.")
     try:
-        # 1) Make user's cSOL confidential (if not already) so we can CT-transfer it
         ca._run_rc(
             [
                 "spl-token",
@@ -765,7 +1045,6 @@ def convert(req: ConvertReq):
         )
         ca.spl_apply(req.sender_keyfile, fee_tmp)
 
-        # 2) Confidential transfer user's cSOL → wrapper's confidential reserve
         ca._run(
             [
                 "spl-token",
@@ -788,36 +1067,35 @@ def convert(req: ConvertReq):
         except Exception:
             pass
 
-    # App-level cSOL ledger: user's cSOL decreased by the converted amount
     try:
         _csol_sub(sender_pub, Decimal(str(req.amount_sol)))
     except Exception:
         pass
 
-    # 3) Pay out plain SOL to user's stealth outputs from Treasury
     from services.crypto_core.splits import split_bounded
 
+    treasury_kf = _resolve_treasury_keyfile()
     parts = split_bounded(Decimal(req.amount_sol), max(1, int(req.n_outputs)), low=0.5, high=1.5)
     outputs = []
+    total_out = Decimal("0")
     for p in parts:
         eph, stealth_addr = ca.generate_stealth_for_recipient(sender_pub)
         ca.add_pool_stealth_record(sender_pub, stealth_addr, eph, 0)
         outputs.append({"amount": ca.fmt_amt(p), "stealth": stealth_addr, "eph_pub_b58": eph})
-        ca.solana_transfer(ca.TREASURY_KEYPAIR, stealth_addr, ca.fmt_amt(p))
+        ca.solana_transfer(treasury_kf, stealth_addr, ca.fmt_amt(p))
+        total_out += p
 
-    # Event for observability
     try:
         ca.emit("CSOLConverted", amount=ca._lamports(_fmt(req.amount_sol)), direction="from_csol")
     except Exception:
         pass
 
     try:
-        reconcile_csol_supply()
+        reconcile_csol_supply(assume_delta=-total_out)
     except Exception:
         pass
 
     return ConvertRes(outputs=outputs)
-
 
 # ---------- Stealth List ----------
 @app.get("/stealth/{owner_pub}", response_model=StealthList)
@@ -849,12 +1127,10 @@ def list_stealth(owner_pub: str, include_balances: bool = True, min_sol: float =
 
     return StealthList(owner_pub=owner_pub, items=items, total_sol=(ca.fmt_amt(total) if include_balances else None))
 
-
 # ---------- Sweep ----------
 @app.post("/sweep", response_model=SweepRes)
 def sweep(req: SweepReq):
     pst = ca.load_pool_state()
-    # Select records that match owner_pub
     recs = [r for r in pst.get("records", []) if r.get("owner_pubkey") == req.owner_pub]
     if not recs:
         raise HTTPException(status_code=400, detail="No stealth records for owner")
@@ -863,14 +1139,12 @@ def sweep(req: SweepReq):
     candidates = []
     total_balance = Decimal("0")
 
-    # If user provided explicit stealth_pubkeys, filter to those exact addresses.
     if req.stealth_pubkeys:
         allowed = set(req.stealth_pubkeys)
         recs = [r for r in recs if r.get("stealth_pubkey") in allowed]
         if not recs:
             raise HTTPException(status_code=400, detail="None of the requested stealth addresses are owned by this owner")
 
-    # Gather balances for chosen recs
     for r in recs:
         try:
             b = Decimal(str(ca.get_sol_balance(r["stealth_pubkey"], quiet=True)))
@@ -898,7 +1172,6 @@ def sweep(req: SweepReq):
             plan.append((r["stealth_pubkey"], r["eph_pub_b58"], amt, r.get("counter", 0)))
             remain = (remain - amt).quantize(Decimal("0.000000001"), rounding=ROUND_DOWN)
 
-    # secret key handling
     with open(req.secret_keyfile, "r") as f:
         raw_secret = json.load(f)
     rec_sk64 = ca.read_secret_64_from_json_value(raw_secret)
@@ -906,7 +1179,6 @@ def sweep(req: SweepReq):
     sent_total, txs = Decimal("0"), []
 
     for stealth_addr, eph, amt, counter in plan:
-        # derive stealth keypair and write a temp keyfile compatible with solana CLI
         kp = ca.derive_stealth_from_recipient_secret(rec_sk64, eph, counter)
         tmp_path = _write_temp_keypair_from_solders(kp)
         try:
@@ -926,21 +1198,18 @@ def sweep(req: SweepReq):
 
     return SweepRes(requested=ca.fmt_amt(req_amt), sent_total=ca.fmt_amt(sent_total), txs=txs)
 
-
 # ---------- Marketplace: Buy ----------
 @app.post("/marketplace/buy", response_model=BuyRes)
 def marketplace_buy(req: BuyReq):
     """
-    Preferred: use buyer cSOL (Token-2022 confidential transfer) **if our app-ledger says buyer has enough**.
-    Fallback: spend buyer notes (confidential) and have the wrapper transfer cSOL to the seller.
-    In both cases, the seller ends up with cSOL; SOL in treasury only moves on convert.
+    Préférence: cSOL direct via app-ledger si suffisant.
+    Sinon: dépenser les notes (confidential) et payer le vendeur en cSOL depuis la réserve.
     """
     buyer_pub = ca.get_pubkey_from_keypair(req.buyer_keyfile)
     listing = ca.listing_get(req.listing_id)
     if not listing:
         raise HTTPException(400, "Listing not found")
 
-    # --- Normalisation: prix unitaire + quantité ---
     unit_price = Decimal(
         str(
             listing.get("unit_price_sol")
@@ -963,7 +1232,11 @@ def marketplace_buy(req: BuyReq):
         raise HTTPException(400, "Cannot buy your own listing")
     payment_pref = (req.payment or "auto").lower()
 
-    # --- cSOL direct via app-ledger (no confidential probing) ---
+    encrypted_shipping_blob: Optional[Dict[str, Any]] = getattr(req, "encrypted_shipping", None)
+    order_id: Optional[str] = None
+    if isinstance(encrypted_shipping_blob, dict):
+        order_id = secrets.token_hex(16)
+
     if payment_pref in ("auto", "csol"):
         buyer_credits = _csol_get(buyer_pub)
         if buyer_credits >= total_price:
@@ -972,17 +1245,27 @@ def marketplace_buy(req: BuyReq):
             except Exception as e:
                 if payment_pref == "csol":
                     raise HTTPException(400, f"cSOL transfer failed (ledger had {buyer_credits}): {e}")
-                # auto-mode: fall through to SOL-backed path
             else:
-                # success: update listing + events
                 try:
                     ca.listing_update_quantity(seller_pub, req.listing_id, quantity_delta=-qty)
                 except Exception:
                     _deactivate_listing(req.listing_id)
-
-                # Ledger: debit buyer, credit seller
                 _csol_sub(buyer_pub, total_price)
                 _csol_add(seller_pub, total_price)
+
+                shipping_commitment = None
+                if isinstance(encrypted_shipping_blob, dict):
+                    try:
+                        proof = _shipping_append_event(
+                            order_id=order_id or secrets.token_hex(16),
+                            listing_id=req.listing_id,
+                            buyer_pub=buyer_pub,
+                            seller_pub=seller_pub,
+                            encrypted_blob=encrypted_shipping_blob,
+                        )
+                        shipping_commitment = proof
+                    except Exception:
+                        shipping_commitment = None
 
                 try:
                     ca.emit(
@@ -995,6 +1278,11 @@ def marketplace_buy(req: BuyReq):
                         buyer=buyer_pub,
                         seller=seller_pub,
                         csol_sig=sig,
+                        order_id=(shipping_commitment or {}).get("order_id") if shipping_commitment else None,
+                        shipping_leaf=(shipping_commitment or {}).get("leaf") if shipping_commitment else None,
+                        shipping_root=(shipping_commitment or {}).get("root") if shipping_commitment else None,
+                        shipping_index=(shipping_commitment or {}).get("index") if shipping_commitment else None,
+                        shipping_proof=(shipping_commitment or {}).get("proof") if shipping_commitment else None,
                     )
                 except Exception:
                     pass
@@ -1010,7 +1298,7 @@ def marketplace_buy(req: BuyReq):
         elif payment_pref == "csol":
             raise HTTPException(400, f"Insufficient cSOL credits (have {buyer_credits}, need {total_price}).")
 
-    # --- Fallback: SOL-backed (notes -> wrapper pays seller in cSOL) ---
+    # --- Fallback: SOL-backed ---
     st = ca.load_wrapper_state()
     avail = Decimal(str(ca.total_available_for_recipient(st, buyer_pub))).quantize(CSOL_DEC)
     if avail < total_price:
@@ -1021,7 +1309,6 @@ def marketplace_buy(req: BuyReq):
     if not chosen:
         raise HTTPException(400, "Coin selection failed; consolidate notes")
 
-    # verify & nullify
     mt = ca.build_merkle(st)
     root_hex = mt.root().hex()
     spent_indices: List[int] = []
@@ -1040,7 +1327,6 @@ def marketplace_buy(req: BuyReq):
         except Exception:
             pass
 
-    # change note si partiel
     change = (Decimal(str(total_selected)) - total_price).quantize(CSOL_DEC, rounding=ROUND_DOWN)
     buyer_change: Optional[Dict[str, Any]] = None
     if change > 0:
@@ -1056,18 +1342,34 @@ def marketplace_buy(req: BuyReq):
     except Exception:
         pass
 
-    # payer le vendeur en cSOL (depuis la réserve)
     _ensure_reserve_has(total_price)
     csol_sig = ca.csol_transfer_from_reserve(seller_pub, str(total_price))
 
-    # Ledger: credit seller because they just received cSOL from the wrapper
     _csol_add(seller_pub, total_price)
 
-    # ✅ décrémenter la quantité côté listings (Merklisé)
     try:
         ca.listing_update_quantity(seller_pub, req.listing_id, quantity_delta=-qty)
     except Exception:
         _deactivate_listing(req.listing_id)
+
+    shipping_commitment = None
+    if isinstance(encrypted_shipping_blob, dict):
+        try:
+            proof = _shipping_append_event(
+                order_id=order_id or secrets.token_hex(16),
+                listing_id=req.listing_id,
+                buyer_pub=buyer_pub,
+                seller_pub=seller_pub,
+                encrypted_blob=encrypted_shipping_blob,
+            )
+            shipping_commitment = proof
+        except Exception:
+            shipping_commitment = None
+
+    try:
+        reconcile_csol_supply()
+    except Exception:
+        pass
 
     try:
         ca.emit(
@@ -1082,6 +1384,11 @@ def marketplace_buy(req: BuyReq):
             spent_note_indices=spent_indices,
             buyer_change=buyer_change,
             csol_sig=csol_sig,
+            order_id=(shipping_commitment or {}).get("order_id") if shipping_commitment else None,
+            shipping_leaf=(shipping_commitment or {}).get("leaf") if shipping_commitment else None,
+            shipping_root=(shipping_commitment or {}).get("root") if shipping_commitment else None,
+            shipping_index=(shipping_commitment or {}).get("index") if shipping_commitment else None,
+            shipping_proof=(shipping_commitment or {}).get("proof") if shipping_commitment else None,
         )
     except Exception:
         pass
@@ -1099,15 +1406,37 @@ def marketplace_buy(req: BuyReq):
         new_merkle_root=new_root,
     )
 
+# ------------- Shipping Endpoints (no DB) -------------
+@app.post("/shipping/put")
+def put_encrypted_shipping(
+    order_id: str = Body(..., embed=True),
+    listing_id: str = Body(..., embed=True),
+    buyer_pub: str = Body(..., embed=True),
+    seller_pub: str = Body(..., embed=True),
+    encrypted_shipping: Dict[str, Any] = Body(..., embed=True),
+):
+    if not isinstance(encrypted_shipping, dict):
+        raise HTTPException(status_code=400, detail="encrypted_shipping must be an object")
+    proof = _shipping_append_event(order_id, listing_id, buyer_pub, seller_pub, encrypted_shipping)
+    return {
+        "ok": True,
+        "order_id": proof["order_id"],
+        "leaf": proof["leaf"],
+        "root": proof["root"],
+        "index": proof["index"],
+        "proof": proof["proof"],
+    }
+
+@app.get("/shipping/{order_id}")
+def get_encrypted_shipping(order_id: str):
+    res = _shipping_find_by_order(order_id)
+    if not res:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return res
 
 # ============== Listings API ==============
 
 def _ipfs_add_bytes(data: bytes, suffix: str = ".bin") -> str:
-    """Ajoute des bytes via `ipfs add -Q` et retourne ipfs://cid"""
-    import subprocess
-    import tempfile
-    import os
-
     with tempfile.NamedTemporaryFile("wb", delete=False, suffix=suffix) as f:
         f.write(data)
         tmp = f.name
@@ -1120,10 +1449,28 @@ def _ipfs_add_bytes(data: bytes, suffix: str = ".bin") -> str:
         except Exception:
             pass
 
+def _as_http_image(uri: str) -> str:
+    """Return a browser-viewable URL from ipfs:// or http(s):// using the configured gateway."""
+    s = str(uri or "").strip()
+    if not s:
+        return s
+    if s.startswith("ipfs://"):
+        tail = s.split("://", 1)[1].lstrip("/")
+        if tail.startswith("ipfs/"):
+            tail = tail[5:]
+        return f"{IPFS_GATEWAY.rstrip('/')}/{tail}"
+    if s.startswith("/ipfs/"):
+        return f"{IPFS_GATEWAY.rstrip('/')}/{s.split('/ipfs/', 1)[1]}"
+    return s
 
 def _normalize_listing(rec: dict) -> dict:
     if not isinstance(rec, dict):
         return {}
+    imgs = rec.get("images") or rec.get("image_uris") or rec.get("imageUris") or []
+    if isinstance(imgs, str):
+        imgs = [x.strip() for x in imgs.split(",") if x.strip()]
+    imgs_http = [_as_http_image(u) for u in imgs]
+
     return {
         "id": rec.get("id") or rec.get("listing_id") or rec.get("slug") or rec.get("pk"),
         "title": rec.get("title") or rec.get("name") or f"Listing {rec.get('id')}",
@@ -1132,9 +1479,8 @@ def _normalize_listing(rec: dict) -> dict:
         "quantity": int(rec.get("quantity", 0)),
         "seller_pub": rec.get("seller_pub") or rec.get("owner_pub") or rec.get("seller") or "",
         "active": bool(rec.get("active", True)) and int(rec.get("quantity", 0)) > 0,
-        "images": rec.get("images") or rec.get("image_uris") or [],
+        "images": imgs_http,
     }
-
 
 @app.get("/listings", response_model=ListingsPayload)
 def list_listings(seller_pub: Optional[str] = None, mine: bool = False):
@@ -1143,10 +1489,8 @@ def list_listings(seller_pub: Optional[str] = None, mine: bool = False):
     except Exception:
         items = []
     norm = [_normalize_listing(x) for x in items]
-    # filtre auto-disparition quantité 0
     norm = [x for x in norm if x.get("active", True) and int(x.get("quantity", 0)) > 0]
     return {"items": norm}
-
 
 @app.get("/listings/{listing_id}", response_model=Listing)
 def get_listing(listing_id: str):
@@ -1155,7 +1499,6 @@ def get_listing(listing_id: str):
         raise HTTPException(status_code=404, detail="Listing not found")
     return _normalize_listing(rec)
 
-
 @app.post("/listings", response_model=ListingCreateRes)
 async def create_listing(
     seller_keyfile: str = Form(...),
@@ -1163,25 +1506,19 @@ async def create_listing(
     description: Optional[str] = Form(None),
     unit_price_sol: str = Form(...),
     quantity: int = Form(1),
-    # fichiers optionnels (images)
-    images: List[UploadFile] = File(default_factory=list),
-    # ou bien une liste d'URI déjà prêtes
-    image_uris: Optional[str] = Form(None),  # JSON-encoded list[str]
+    images: Optional[List[UploadFile]] = File(None),
+    image_uris: Optional[str] = Form(None),
 ):
     seller_pub = ca.get_pubkey_from_keypair(seller_keyfile)
-    # prépare les URIs
     uris: list[str] = []
-    # fichiers uploadés → IPFS
     for f in images or []:
         try:
             data = await f.read()
-            # tentative rapide de suffix
             name = (f.filename or "").lower()
             suf = ".png" if name.endswith(".png") else ".jpg" if name.endswith(".jpg") or name.endswith(".jpeg") else ".bin"
             uris.append(_ipfs_add_bytes(data, suffix=suf))
         except Exception:
             continue
-    # merge avec image_uris JSON
     if image_uris:
         try:
             extra = json.loads(image_uris)
@@ -1204,7 +1541,6 @@ async def create_listing(
 
     return {"ok": True, "listing": _normalize_listing(created)}
 
-
 @app.patch("/listings/{listing_id}", response_model=ListingUpdateRes)
 async def update_listing(
     listing_id: str,
@@ -1214,31 +1550,27 @@ async def update_listing(
     unit_price_sol: Optional[str] = Form(None),
     quantity_new: Optional[int] = Form(None),
     quantity_delta: Optional[int] = Form(None),
-    images: List[UploadFile] = File(default_factory=list),
+    images: Optional[List[UploadFile]] = File(None),
     image_uris: Optional[str] = Form(None),
 ):
     seller_pub = ca.get_pubkey_from_keypair(seller_keyfile)
 
-    # mise à jour prix / meta / quantité
     rec = ca.listing_get(listing_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Listing not found")
 
-    # titre/desc
     if title is not None or description is not None:
         try:
             rec = ca.listing_update_meta(seller_pub, listing_id, title=title, description=description)
         except Exception:
             pass
 
-    # prix
     if unit_price_sol is not None:
         try:
             rec = ca.listing_update_price(seller_pub, listing_id, unit_price_sol)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Update price failed: {e}")
 
-    # quantité (set/delta)
     if quantity_new is not None or quantity_delta is not None:
         try:
             rec = ca.listing_update_quantity(
@@ -1247,7 +1579,6 @@ async def update_listing(
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Update quantity failed: {e}")
 
-    # images (remplacement complet si fourni)
     new_uris: list[str] = []
     for f in images or []:
         try:
@@ -1270,10 +1601,8 @@ async def update_listing(
         except Exception:
             pass
 
-    # auto-désactivation si quantité == 0
     norm = _normalize_listing(rec)
     return {"ok": True, "listing": norm}
-
 
 @app.delete("/listings/{listing_id}", response_model=ListingDeleteRes)
 def delete_listing(listing_id: str, seller_keyfile: str):
@@ -1283,3 +1612,26 @@ def delete_listing(listing_id: str, seller_keyfile: str):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Delete failed: {e}")
     return {"ok": True, "removed": int(removed)}
+
+# --- Shipping inbox for seller (uses append-only JSONL helpers) ---
+@app.get("/shipping/inbox/{seller_pub}")
+def shipping_inbox(seller_pub: str):
+    rows = _shipping_events_read_all()
+    orders = []
+    for r in rows:
+        if r.get("type") != "shipping_blob":
+            continue
+        if r.get("seller_pub") != seller_pub:
+            continue
+        orders.append({
+            "order_id": r.get("order_id"),
+            "ts": r.get("ts"),
+            "listing_id": r.get("listing_id"),
+            "buyer_pub": r.get("buyer_pub"),
+            "payment": r.get("payment"),
+            "unit_price": r.get("unit_price"),
+            "quantity": r.get("quantity"),
+            "total_price": r.get("total_price")
+        })
+    orders.sort(key=lambda x: x.get("ts") or "", reverse=True)
+    return {"orders": orders}

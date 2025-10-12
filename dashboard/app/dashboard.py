@@ -15,6 +15,9 @@ st.set_page_config(page_title="Incognito – Demo", page_icon="🕶️", layout=
 
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8001")
 
+# Use local IPFS daemon gateway by default
+IPFS_GATEWAY = os.getenv("IPFS_GATEWAY", "http://127.0.0.1:8080/ipfs/")
+
 # Threshold for showing stealth entries (hide dust)
 MIN_STEALTH_SOL = 0.01  # filter out addresses below this balance
 
@@ -26,6 +29,26 @@ ROOTS_SCRIPT = ["npx", "ts-node", "scripts/compute_and_update_roots.ts"]
 REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[2])  # ../../ from this file
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
+
+# ===== New imports for encrypted shipping =====
+import secrets
+import base64
+import base58
+try:
+    from nacl.signing import SigningKey
+except Exception as _e:
+    SigningKey = None  # If PyNaCl isn't present, we'll guard usage
+
+# Crypto helpers from repo
+try:
+    from services.crypto_core import messages  # shared_secret_from_ed25519, derive_thread_key, xchacha_encrypt/decrypt
+    from services.crypto_core.merkle import verify_merkle
+    from services.api import cli_adapter as ca  # read_secret_64_from_json_value
+except Exception as e:
+    messages = None
+    verify_merkle = None
+    ca = None
+    st.warning(f"[dashboard] Crypto helpers not fully available: {e}")
 
 # Import from CLI (MINT + wrapper helpers)
 _total_available_for_recipient = None
@@ -55,6 +78,20 @@ except Exception as e:
 def short(pk: str, n: int = 6) -> str:
     return pk if not pk or len(pk) <= 2 * n else f"{pk[:n]}…{pk[-n:]}"
 
+def ipfs_to_http(u: str) -> str:
+    """Map ipfs:// (or /ipfs/…) to the configured HTTP gateway (local daemon by default)."""
+    s = str(u or "").strip()
+    if not s:
+        return s
+    g = IPFS_GATEWAY.rstrip("/")
+    if s.startswith("ipfs://"):
+        tail = s.split("://", 1)[1].lstrip("/")
+        if tail.startswith("ipfs/"):
+            tail = tail[5:]
+        return f"{g}/{tail}"
+    if s.startswith("/ipfs/"):
+        return f"{g}/{s.split('/ipfs/', 1)[1]}"
+    return s
 
 def list_user_keyfiles(keys_dir: str = "keys"):
     if not os.path.isdir(keys_dir):
@@ -65,7 +102,6 @@ def list_user_keyfiles(keys_dir: str = "keys"):
         if f.endswith(".json") and f.lower().startswith("user")
     )
 
-
 def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -74,14 +110,12 @@ def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
     except Exception as e:
         return 1, "", str(e)
 
-
 def get_pubkey_from_keypair(path: str) -> str | None:
     rc, out, err = run_cmd(["solana-keygen", "pubkey", path])
     if rc == 0 and out:
         return out.strip()
     st.error(f"solana-keygen error: {err or out}")
     return None
-
 
 def get_sol_balance(pubkey: str) -> Decimal | None:
     rc, out, err = run_cmd(["solana", "balance", pubkey])
@@ -92,14 +126,12 @@ def get_sol_balance(pubkey: str) -> Decimal | None:
             return None
     return None
 
-
 def api_get(path: str, **params):
     try:
         r = requests.get(f"{API_URL}{path}", params=params, timeout=20)
         return r.status_code, r.json()
     except Exception as e:
         return 0, {"error": str(e)}
-
 
 def api_post(path: str, payload: dict):
     headers = {"content-type": "application/json"}
@@ -129,7 +161,6 @@ def api_post(path: str, payload: dict):
     except Exception as e:
         return 0, {"error": str(e)}
 
-
 def api_post_files(path: str, data: dict, files: list[tuple[str, tuple]]):
     """
     data -> form fields; files -> list of ('images', (filename, bytes, mimetype))
@@ -144,7 +175,6 @@ def api_post_files(path: str, data: dict, files: list[tuple[str, tuple]]):
     except Exception as e:
         return 0, {"error": str(e)}
 
-
 def api_patch_files(path: str, data: dict, files: list[tuple[str, tuple]]):
     try:
         r = requests.patch(f"{API_URL}{path}", data=data, files=files, timeout=180)
@@ -156,13 +186,11 @@ def api_patch_files(path: str, data: dict, files: list[tuple[str, tuple]]):
     except Exception as e:
         return 0, {"error": str(e)}
 
-
 def fmt_amt(x) -> str:
     try:
         return str(Decimal(str(x)).quantize(Decimal("0.000000001")))
     except Exception:
         return str(x)
-
 
 def ensure_state():
     st.session_state.setdefault("active_keyfile", None)
@@ -170,10 +198,11 @@ def ensure_state():
     st.session_state.setdefault("blur_amounts", False)
     # sweep selection stored as list of label strings (kept in sync / sanitized)
     st.session_state.setdefault("sweep_selected", [])
-
+    # new: seller reveal store
+    st.session_state.setdefault("last_revealed_order", None)
+    st.session_state.setdefault("last_revealed_plaintext", None)
 
 ensure_state()
-
 
 def safe_rerun():
     try:
@@ -183,7 +212,6 @@ def safe_rerun():
             st.experimental_rerun()
         except Exception:
             pass
-
 
 def flash(msg: str, kind: str = "info", seconds: float = 1.0):
     ph = st.empty()
@@ -198,7 +226,6 @@ def flash(msg: str, kind: str = "info", seconds: float = 1.0):
     time.sleep(seconds)
     ph.empty()
 
-
 # ---- Known wallets (cache) ----
 @st.cache_data(ttl=60)
 def load_known_wallets(keys_dir: str = "keys") -> list[dict]:
@@ -209,7 +236,6 @@ def load_known_wallets(keys_dir: str = "keys") -> list[dict]:
             items.append({"keyfile": path, "pubkey": out.strip()})
     return items
 
-
 def other_known_wallet_pks(active_keyfile: str | None) -> list[dict]:
     wallets = load_known_wallets()
     out = []
@@ -219,7 +245,6 @@ def other_known_wallet_pks(active_keyfile: str | None) -> list[dict]:
         label = f"{os.path.basename(w['keyfile'])} – {short(w['pubkey'])}"
         out.append({"label": label, "pubkey": w["pubkey"]})
     return out
-
 
 # ---- Available wrapper notes (primary via CLI; fallback via JSON) ----
 def _fallback_available_from_state(pub: str) -> Decimal | None:
@@ -239,7 +264,6 @@ def _fallback_available_from_state(pub: str) -> Decimal | None:
     except Exception:
         return None
 
-
 def available_wrapper_for(pub: str) -> Decimal | None:
     if _total_available_for_recipient and _load_wrapper_state:
         try:
@@ -248,7 +272,6 @@ def available_wrapper_for(pub: str) -> Decimal | None:
         except Exception:
             pass
     return _fallback_available_from_state(pub)
-
 
 # ------- Cached stealth fetcher (call only on relevant tabs) -------
 @st.cache_data(ttl=15)
@@ -260,7 +283,6 @@ def get_stealth(owner_pub: str, include_balances=True, min_sol=0.01):
     )
     return d if c == 200 else {"error": d}
 
-
 def _read_stealth_total(owner_pub: str) -> Decimal:
     """Helper to parse stealth total (clears cache first if requested by caller)."""
     data = get_stealth(owner_pub, True, MIN_STEALTH_SOL)
@@ -269,7 +291,6 @@ def _read_stealth_total(owner_pub: str) -> Decimal:
         return Decimal(str(t))
     except Exception:
         return Decimal("0")
-
 
 def wait_for_state_update(
     owner_pub: str,
@@ -303,6 +324,58 @@ def wait_for_state_update(
 
     safe_rerun()
 
+# ===== Encrypted shipping helpers =====
+def _mk_ephemeral_sk64() -> bytes:
+    if SigningKey is None:
+        raise RuntimeError("PyNaCl is required to generate ephemeral keys (pip install pynacl).")
+    seed32 = secrets.token_bytes(32)
+    sk = SigningKey(seed32)
+    seed32 = sk.encode()                 # 32B Ed25519 seed
+    pub32  = sk.verify_key.encode()      # 32B Ed25519 public key
+    return seed32 + pub32                # 64B secret||pub
+
+def make_encrypted_shipping(seller_pub_b58: str, shipping_dict: dict, thread_id: bytes) -> dict:
+    if messages is None:
+        raise RuntimeError("messages crypto helpers unavailable.")
+    eph_sk64 = _mk_ephemeral_sk64()
+    eph_pub32 = eph_sk64[32:]
+    shared = messages.shared_secret_from_ed25519(eph_sk64, base58.b58decode(seller_pub_b58))
+    key32 = messages.derive_thread_key(shared, thread_id)
+    nonce24, ct = messages.xchacha_encrypt(
+        key32, json.dumps(shipping_dict, separators=(",", ":")).encode("utf-8")
+    )
+    return {
+        "ephemeral_pub_b58": base58.b58encode(eph_pub32).decode(),
+        "nonce_hex": nonce24.hex(),
+        "ciphertext_b64": base64.b64encode(ct).decode(),
+        "thread_id_b64": base64.b64encode(thread_id).decode(),
+        "algo": "xchacha20poly1305+hkdf-sha256",
+    }
+
+def seller_reveal_shipping(order_id: str, seller_keyfile_path: str) -> dict:
+    """
+    Fetch encrypted blob from /shipping/{order_id} and decrypt with the seller's 64B key.
+    """
+    if messages is None or ca is None:
+        raise RuntimeError("Missing crypto helpers to reveal shipping.")
+    c, res = api_get(f"/shipping/{order_id}")
+    if c != 200:
+        raise RuntimeError(res)
+
+    # load seller 64B Ed25519 secret||pub
+    with open(seller_keyfile_path, "r") as f:
+        raw = json.load(f)
+    sk64 = ca.read_secret_64_from_json_value(raw)
+
+    blob = res["encrypted_shipping"]
+    eph_pub32 = base58.b58decode(blob["ephemeral_pub_b58"])
+    shared = messages.shared_secret_from_ed25519(sk64, eph_pub32)
+    tid = base64.b64decode(blob.get("thread_id_b64") or b"")
+    key32 = messages.derive_thread_key(shared, tid or b"default-thread")
+    nonce = bytes.fromhex(blob["nonce_hex"])
+    ct = base64.b64decode(blob["ciphertext_b64"])
+    plain = messages.xchacha_decrypt(key32, nonce, ct)
+    return json.loads(plain.decode("utf-8"))
 
 # --------------- Sidebar: user + options ---------------
 with st.sidebar:
@@ -350,9 +423,8 @@ text = "•••" if st.session_state["blur_amounts"] and bal is not None else 
 st.metric("SOL balance", text)
 st.divider()
 
-# --------------- Tabs (Overview + Events removed; Stealth & Sweep merged) ---------------
-tab_deposit, tab_withdraw, tab_handoff, tab_convert, tab_stealthsweep, tab_listings = st.tabs(
-    ["Deposit", "Withdraw", "Handoff", "Convert", "Stealth & Sweep", "Listings"]
+tab_deposit, tab_withdraw, tab_handoff, tab_convert, tab_stealthsweep, tab_listings, tab_orders = st.tabs(
+    ["Deposit", "Withdraw", "Handoff", "Convert", "Stealth & Sweep", "Listings", "Orders / Shipping"]
 )
 
 # --- Deposit ---
@@ -676,6 +748,11 @@ with tab_listings:
                         st.markdown(f"**{it.get('title')}**")
                         st.caption(f"ID: {it.get('id')}")
                         st.caption(it.get("description") or "")
+                        # Images preview (via local IPFS gateway)
+                        imgs = it.get("images") or []
+                        thumbs = [ipfs_to_http(u) for u in imgs[:3]]
+                        if thumbs:
+                            st.image(thumbs, caption=[""] * len(thumbs), width=120)
                     with cols[1]:
                         st.write("Price (SOL)")
                         price_edit = st.text_input(
@@ -731,22 +808,6 @@ with tab_listings:
                                 flash("Delete failed ❌", "error")
                                 st.error(res_d)
 
-                    # Images preview (best-effort via IPFS gateway)
-                    imgs = it.get("images") or []
-                    if imgs:
-                        try:
-                            gw = "https://ipfs.io/ipfs/"
-                            thumbs = []
-                            for u in imgs[:3]:
-                                if str(u).startswith("ipfs://"):
-                                    cid = str(u).split("://", 1)[1]
-                                    thumbs.append(gw + cid)
-                                else:
-                                    thumbs.append(str(u))
-                            st.image(thumbs, caption=[""] * len(thumbs), width=120)
-                        except Exception:
-                            pass
-
     st.divider()
 
     # -------- Active listings / Buy (buyer view) ----------
@@ -766,6 +827,11 @@ with tab_listings:
                         st.markdown(f"**{it.get('title') or it.get('id')}**")
                         st.caption(f"ID: {it.get('id')}")
                         st.caption(it.get("description") or "")
+                        # Images preview (via local IPFS gateway)
+                        imgs = it.get("images") or []
+                        thumbs = [ipfs_to_http(u) for u in imgs[:3]]
+                        if thumbs:
+                            st.image(thumbs, caption=[""] * len(thumbs), width=120)
                     with cols[1]:
                         st.metric("Unit price (SOL)", fmt_amt(it.get("unit_price_sol", "0")))
                     with cols[2]:
@@ -779,6 +845,22 @@ with tab_listings:
                             step=1,
                             key=f"qtybuy_{it['id']}",
                         )
+
+                        # Encrypted shipping UI (buyer)
+                        st.caption("Shipping (optional)")
+                        use_encrypted = st.checkbox(
+                            "Encrypt shipping for seller only",
+                            value=True,
+                            key=f"encship_{it['id']}",
+                            help="Encrypts your shipping info using the seller's pubkey. Only the seller can decrypt.",
+                        )
+                        name_v = st.text_input("Name", key=f"ship_name_{it['id']}", value="Alice")
+                        addr_v = st.text_input("Address", key=f"ship_addr_{it['id']}", value="1 Privacy St")
+                        city_v = st.text_input("City", key=f"ship_city_{it['id']}", value="Paris")
+                        zip_v = st.text_input("ZIP/Postal", key=f"ship_zip_{it['id']}", value="75001")
+                        country_v = st.text_input("Country", key=f"ship_country_{it['id']}", value="FR")
+                        phone_v = st.text_input("Phone", key=f"ship_phone_{it['id']}", value="+33 1 23 45 67 89")
+
                     with cols[4]:
                         if st.button("Buy", key=f"buy_{it.get('id')}"):
                             # snapshot before buy
@@ -792,6 +874,26 @@ with tab_listings:
                                 "quantity": int(qty_to_buy),
                             }
 
+                            # If user opted-in to encrypted shipping, attach the blob
+                            if use_encrypted:
+                                try:
+                                    seller_pub_b58 = str(it.get("seller_pub") or "")
+                                    shipping = {
+                                        "name": name_v.strip(),
+                                        "addr": addr_v.strip(),
+                                        "city": city_v.strip(),
+                                        "zip": zip_v.strip(),
+                                        "country": country_v.strip(),
+                                        "phone": phone_v.strip(),
+                                    }
+                                    # Include listing id + buyer alias tag in thread binding
+                                    thread_id = f"listing:{it['id']}|buyer:{short(active_pub,8)}|ts:{secrets.token_hex(6)}".encode()
+                                    blob = make_encrypted_shipping(seller_pub_b58, shipping, thread_id)
+                                    payload["encrypted_shipping"] = blob
+                                except Exception as e:
+                                    st.error(f"Failed to generate encrypted shipping: {e}")
+                                    # proceed without shipping blob
+
                             flash("Submitting buy…")
                             with st.spinner("Placing order…"):
                                 c, res = api_post("/marketplace/buy", payload)
@@ -801,3 +903,41 @@ with tab_listings:
                                 else:
                                     flash("Purchase failed ❌", "error")
                                     st.error(res)
+
+# --- Orders / Shipping tab (seller inbox) ---
+with tab_orders:
+    st.subheader("My Orders / Shipping Info")
+    st.caption("Encrypted shipping details sent by buyers for your sold listings.")
+
+    code_inbox, inbox = api_get(f"/shipping/inbox/{active_pub}")
+    if code_inbox != 200:
+        st.error(inbox)
+    else:
+        orders = inbox.get("orders", [])
+        if not orders:
+            st.info("No orders yet.")
+        else:
+            for o in orders:
+                with st.container(border=True):
+                    c1, c2, c3, c4, c5 = st.columns([3, 2, 3, 2, 2])
+                    with c1:
+                        st.markdown(f"**Order:** {o.get('order_id')}")
+                        st.caption(o.get("ts") or "")
+                        st.caption(f"Listing: {o.get('listing_id')}")
+                    with c2:
+                        st.caption("Buyer")
+                        st.code(short(o.get("buyer_pub", ""), 8))
+                    with c3:
+                        st.caption("Amount")
+                        st.write(f"{o.get('quantity')} × {fmt_amt(o.get('unit_price'))} = {fmt_amt(o.get('total_price'))} cSOL")
+                    with c4:
+                        st.caption("Payment")
+                        st.write(o.get("payment"))
+                    with c5:
+                        if st.button("Reveal", key=f"rev_{o.get('order_id')}"):
+                            try:
+                                data = seller_reveal_shipping(o["order_id"], active_key)
+                                st.success("Decrypted ✅")
+                                st.json(data)
+                            except Exception as e:
+                                st.error(f"Reveal failed: {e}")
