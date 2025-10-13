@@ -74,6 +74,50 @@ except Exception as e:
     MINT: str = os.getenv("MINT") or _pubkey_from_keyfile(MINT_KEYFILE)
     st.warning(f"[dashboard] Could not import clients.cli.incognito_marketplace: {e}")
 
+
+@st.cache_data(ttl=60)
+def resolve_username_for(pub: str) -> str | None:
+    if not pub:
+        return None
+    code, data = api_get(f"/profiles/resolve_pub/{pub}")
+    if code == 200 and isinstance(data, dict) and data.get("ok") and data.get("username"):
+        return str(data["username"])
+    return None
+
+# ===== Profile helpers =====
+def _sign_with_user(sk64: bytes, msg: bytes) -> str:
+    """
+    Ed25519-sign `msg` with the first 32B seed from a 64B key (secret||pub).
+    Returns hex signature.
+    """
+    if SigningKey is None:
+        raise RuntimeError("PyNaCl is required for signing (pip install pynacl).")
+    sig = SigningKey(sk64[:32]).sign(msg).signature
+    return sig.hex()
+
+def profiles_reveal(username: str, pubs: list[str], meta: dict | None, user_keyfile: str):
+    """
+    Build a ProfileBlob, canonicalize (without sig), sign with user's keyfile, then POST /profiles/reveal.
+    If a profile already exists with the same exact blob, server simply proves it; if it differs, it appends.
+    """
+    # version is handled server-side as content-addressed; start with 1 for new reveals
+    blob = {"username": username.strip(), "pubs": pubs, "version": 1, "meta": meta, "sig": ""}
+
+    # Canonical bytes MUST be computed WITHOUT 'sig'
+    msg = ca.profile_canonical_json_bytes(blob)
+
+    # Load 64-byte secret||pub from Solana keyfile and sign
+    with open(user_keyfile, "r") as f:
+        raw = json.load(f)
+    sk64 = ca.read_secret_64_from_json_value(raw)
+    blob["sig"] = _sign_with_user(sk64, msg)
+
+    # POST
+    return api_post("/profiles/reveal", {"blob": blob})
+
+def profiles_resolve(username: str):
+    return api_get(f"/profiles/resolve/{username.strip()}")
+
 # --------------- Utils ------------------
 def short(pk: str, n: int = 6) -> str:
     return pk if not pk or len(pk) <= 2 * n else f"{pk[:n]}…{pk[-n:]}"
@@ -423,8 +467,8 @@ text = "•••" if st.session_state["blur_amounts"] and bal is not None else 
 st.metric("SOL balance", text)
 st.divider()
 
-tab_deposit, tab_withdraw, tab_handoff, tab_convert, tab_stealthsweep, tab_listings, tab_orders = st.tabs(
-    ["Deposit", "Withdraw", "Handoff", "Convert", "Stealth & Sweep", "Listings", "Orders / Shipping"]
+tab_deposit, tab_withdraw, tab_handoff, tab_convert, tab_stealthsweep, tab_listings, tab_orders, tab_profile, tab_profiles_lookup = st.tabs(
+    ["Deposit", "Withdraw", "Handoff", "Convert", "Stealth & Sweep", "Listings", "Orders / Shipping", "My Profile", "Lookup Profiles"]
 )
 
 # --- Deposit ---
@@ -495,23 +539,56 @@ with tab_withdraw:
 # --- Handoff ---
 with tab_handoff:
     st.subheader("Off-chain Blind Handoff (notes A → B)")
-    recip_pub = st.text_input(
-        "Recipient public key (base58)",
-        value=active_pub,
-        key="handoff_recipient",
-    ).strip()
-    amt_h = st.text_input("Amount (SOL)", value="5", key="handoff_amt")
 
-    if st.button("Handoff", type="primary"):
-        # snapshot (handoff may not affect SOL balance; we still monitor stealth total)
+    # Heuristics + normalization
+    def _looks_like_pubkey(s: str) -> bool:
+        s = (s or "").strip()
+        b58chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+        return 30 <= len(s) <= 55 and all(c in b58chars for c in s)
+
+    def _normalize_username(alias: str) -> str:
+        s = (alias or "").strip()
+        if s.startswith("@"):
+            s = s[1:]
+        if s.endswith(".incognito"):
+            s = s[: -len(".incognito")]
+        return s
+
+    recip_field = st.text_input(
+        "Recipient (pubkey or @username / username.incognito)",
+        value=active_pub,  # keep convenience default
+        key="handoff_recipient_field",
+    ).strip()
+
+    amt_h = st.text_input("Amount (SOL)", value="5", key="handoff_amount_field").strip()
+
+    # Optional: preview resolution when a username is typed
+    if recip_field and not _looks_like_pubkey(recip_field):
+        uname = _normalize_username(recip_field)
+        code_r, data_r = api_get(f"/profiles/resolve/{uname}")
+        if code_r == 200 and isinstance(data_r, dict):
+            if data_r.get("ok"):
+                try:
+                    first_pub = (data_r.get("blob") or {}).get("pubs", [None])[0] or ""
+                    st.caption(f"Resolved @{uname} → {short(first_pub, 8)}")
+                except Exception:
+                    pass
+            else:
+                st.warning(f"No profile found for @{uname}")
+
+    if st.button("Handoff", type="primary", key="handoff_btn"):
+        # snapshot (handoff may not affect SOL balance; still monitor stealth total)
         prev_sol = get_sol_balance(active_pub)
         prev_stealth = _read_stealth_total(active_pub)
 
         payload = {
             "sender_keyfile": active_key,
-            "recipient_pub": recip_pub.strip(),
-            "amount_sol": amt_h.strip(),
+            "amount_sol": amt_h,
         }
+        if _looks_like_pubkey(recip_field):
+            payload["recipient_pub"] = recip_field
+        else:
+            payload["recipient_username"] = _normalize_username(recip_field)
 
         flash("Submitting handoff…")
         with st.spinner("Sending handoff…"):
@@ -522,6 +599,7 @@ with tab_handoff:
             else:
                 flash("Handoff failed ❌", "error")
                 st.error(res)
+
 
 # --- Convert ---
 with tab_convert:
@@ -748,6 +826,12 @@ with tab_listings:
                         st.markdown(f"**{it.get('title')}**")
                         st.caption(f"ID: {it.get('id')}")
                         st.caption(it.get("description") or "")
+
+                        # show @username for the seller (you)
+                        _seller_pub = it.get("seller_pub", "")
+                        _seller_name = resolve_username_for(_seller_pub)
+                        st.caption(f"Seller: @{_seller_name}" if _seller_name else f"Seller: {short(_seller_pub, 8)}")
+
                         # Images preview (via local IPFS gateway)
                         imgs = it.get("images") or []
                         thumbs = [ipfs_to_http(u) for u in imgs[:3]]
@@ -827,6 +911,7 @@ with tab_listings:
                         st.markdown(f"**{it.get('title') or it.get('id')}**")
                         st.caption(f"ID: {it.get('id')}")
                         st.caption(it.get("description") or "")
+
                         # Images preview (via local IPFS gateway)
                         imgs = it.get("images") or []
                         thumbs = [ipfs_to_http(u) for u in imgs[:3]]
@@ -836,7 +921,9 @@ with tab_listings:
                         st.metric("Unit price (SOL)", fmt_amt(it.get("unit_price_sol", "0")))
                     with cols[2]:
                         st.caption("Seller")
-                        st.code(short(it.get("seller_pub", ""), 8))
+                        _seller_pub = it.get("seller_pub", "")
+                        _seller_name = resolve_username_for(_seller_pub)
+                        st.write(f"@{_seller_name}" if _seller_name else short(_seller_pub, 8))
                     with cols[3]:
                         qty_to_buy = st.number_input(
                             "Qty",
@@ -941,3 +1028,102 @@ with tab_orders:
                                 st.json(data)
                             except Exception as e:
                                 st.error(f"Reveal failed: {e}")
+
+# --- My Profile (create/update) ---
+with tab_profile:
+    st.subheader("Create or Update My Profile")
+
+    st.caption("Your profile is a signed, Merkle-anchored document. You can publish a username and optional metadata.")
+    username = st.text_input("Username (unique)", value="alice").strip()
+
+    default_meta = {
+        "display_name": "Alice",
+        "bio": "privacy enjoyer",
+        "links": {"site": "https://example.com"}
+    }
+    meta_text = st.text_area(
+        "Metadata (JSON, optional)",
+        value=json.dumps(default_meta, indent=2),
+        height=140,
+        help="You can put whatever you want here (public)."
+    )
+
+    # Owner keys that control this profile (default: the active user)
+    st.caption("Owner keys (base58) — default to your active pubkey")
+    owner_pubs_default = [active_pub]
+    owner_pubs_text = st.text_area(
+        "Owner public keys (one per line, base58)",
+        value="\n".join(owner_pubs_default),
+        height=80
+    )
+    pubs = [p.strip() for p in owner_pubs_text.splitlines() if p.strip()]
+
+    if st.button("Publish / Update Profile", type="primary"):
+        # Validate meta JSON
+        meta = None
+        if meta_text.strip():
+            try:
+                meta = json.loads(meta_text)
+            except Exception as e:
+                st.error(f"Metadata must be valid JSON: {e}")
+                st.stop()
+
+        if not username:
+            st.error("Username is required.")
+        elif not pubs:
+            st.error("At least one owner pubkey is required.")
+        else:
+            with st.spinner("Signing and publishing profile…"):
+                code, res = profiles_reveal(username, pubs, meta, active_key)
+                if code == 200:
+                    st.success("Profile published ✅")
+                    st.json(res)
+                else:
+                    st.error(res)
+
+# --- Lookup Profiles (view others) ---
+with tab_profiles_lookup:
+    st.subheader("Lookup Profile by Username")
+    q = st.text_input("Username to resolve", value="alice").strip()
+
+    if st.button("Resolve"):
+        with st.spinner("Resolving…"):
+            code, res = profiles_resolve(q)
+            if code != 200:
+                st.error(res)
+            else:
+                if not res.get("ok"):
+                    st.warning(f"No profile found for '{q}'.")
+                else:
+                    st.success("Profile found ✅")
+
+                    # Show the blob (what the owner signed)
+                    st.markdown("**Profile Blob**")
+                    st.json(res.get("blob"))
+
+                    # Show Merkle facts
+                    st.markdown("**Merkle Proof**")
+                    st.write({
+                        "leaf": res.get("leaf"),
+                        "index": res.get("index"),
+                        "root": res.get("root"),
+                        "proof_len": len(res.get("proof") or [])
+                    })
+
+                    # Optional: verify proof client-side (if crypto helpers are available)
+                    verified = None
+                    try:
+                        if verify_merkle:
+                            leaf = res.get("leaf")
+                            proof = res.get("proof") or []
+                            root = res.get("root")
+                            verified = verify_merkle(leaf, proof, root)
+                    except Exception:
+                        verified = None
+
+                    if verified is True:
+                        st.success("Client-side Merkle verification: ✅ valid inclusion")
+                    elif verified is False:
+                        st.error("Client-side Merkle verification: ❌ INVALID")
+                    else:
+                        st.info("Client-side Merkle verification not available.")

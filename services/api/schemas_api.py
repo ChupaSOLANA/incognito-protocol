@@ -4,7 +4,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import List, Optional, Literal, Dict, Any
 
-from pydantic import BaseModel, Field, conint, condecimal
+from pydantic import BaseModel, Field, conint, condecimal, root_validator
 
 
 # ----- Base -----
@@ -55,11 +55,17 @@ class DepositRes(Ok):
 
 
 # ----- Handoff -----
-class HandoffReq(_DecimalAsStr):
+class HandoffReq(BaseModel):
     sender_keyfile: str
-    recipient_pub: str
-    amount_sol: condecimal(gt=0)
+    amount_sol: Decimal
+    recipient_pub: Optional[str] = None
+    recipient_username: Optional[str] = None  # NEW
 
+    @root_validator
+    def _one_recipient(cls, values):
+        if not values.get("recipient_pub") and not values.get("recipient_username"):
+            raise ValueError("Provide either recipient_pub or recipient_username")
+        return values
 
 class HandoffRes(Ok):
     inputs_used: List[dict]
@@ -238,6 +244,56 @@ class ListingDeleteRes(_DecimalAsStr):
     ok: bool = True
     removed: int
 
+class ProfileBlob(_DecimalAsStr):
+    username: str
+    pubs: List[str] = Field(..., description="Owner ed25519 pubkeys (base58). First is the primary.")
+    version: conint(ge=1) = 1
+    meta: Optional[Dict[str, Any]] = None
+    sig: str = Field(..., description="Owner signature (hex) over canonical blob (without 'sig').")
+
+class ProfileRevealReq(_DecimalAsStr):
+    blob: ProfileBlob
+
+class ProfileRevealRes(_DecimalAsStr):
+    ok: bool = True
+    leaf: str
+    index: int
+    root: str
+    blob: ProfileBlob
+
+class ProfileResolveRes(_DecimalAsStr):
+    ok: bool = True
+    username: str
+    leaf: Optional[str] = None
+    blob: Optional[ProfileBlob] = None
+    index: Optional[int] = None
+    proof: List[str] = []
+    root: Optional[str] = None
+
+class ProfileRotateReq(_DecimalAsStr):
+    username: str
+    new_pubs: List[str]
+    meta: Optional[Dict[str, Any]] = None
+    # signed by ANY existing pub from the latest registered profile
+    sig: str = Field(..., description="Signature (hex) over canonical {'username','new_pubs','meta'} payload.")
+
+# --- Profiles: resolve by pub ---
+class ProfileResolveByPubRes(BaseModel):
+    ok: bool
+    pub: str
+    username: Optional[str] = None
+    leaf: Optional[str] = None
+    index: Optional[int] = None
+    root: Optional[str] = None
+    proof: Optional[List[str]] = None
+
+class MarkStealthUsedReq(_DecimalAsStr):
+    stealth_pub: str = Field(..., description="One-time stealth address to mark as used (block reuse).")
+    reason: Optional[str] = None
+
+class MarkStealthUsedRes(_DecimalAsStr):
+    ok: bool = True
+    stealth_pub: str
 
 __all__ = [
     # base/common
@@ -274,4 +330,14 @@ __all__ = [
     "ListingUpdateRes",
     "ListingDeleteReq",
     "ListingDeleteRes",
+    # profile
+    "ProfileBlob",
+    "ProfileRevealReq",
+    "ProfileRevealRes",
+    "ProfileResolveRes",
+    "ProfileResolveByPubRes",
+    "ProfileRotateReq",
+    # mark-stealth-used
+    "MarkStealthUsedReq",
+    "MarkStealthUsedRes",
 ]

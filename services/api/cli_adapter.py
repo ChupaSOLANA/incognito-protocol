@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 import re
 
+from services.crypto_core.profile import (  # noqa: E402
+    canonical_json_bytes as profile_canonical_json_bytes,
+    hash_profile_leaf as profile_hash_profile_leaf,
+    verify_owner_sig as profile_verify_owner_sig,
+)
+
 from clients.cli import incognito_marketplace as mp
 try:
     from clients.cli import listings as li  # Merkle-backed listings backend
@@ -865,4 +871,8 @@ __all__ = [
     "listing_update_meta",
     "listing_delete",
     "listings_reset_all",
+
+    "profile_canonical_json_bytes",
+    "profile_hash_profile_leaf",
+    "profile_verify_owner_sig",
 ]

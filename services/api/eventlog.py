@@ -154,6 +154,7 @@ def _touch_metrics(cx: sqlite3.Connection, epoch: int) -> None:
 
 
 def apply_event_row(cx: sqlite3.Connection, kind: str, payload: Dict[str, Any]) -> None:
+    # --- Notes lifecycle (existing) ---
     if kind == "NoteIssued":
         cx.execute(
             "INSERT OR REPLACE INTO notes(commitment,amount,recipient_tag_hex,blind_sig_hex,spent,inserted_at) "
@@ -183,9 +184,19 @@ def apply_event_row(cx: sqlite3.Connection, kind: str, payload: Dict[str, Any]) 
         cx.execute("UPDATE metrics SET spent_count = spent_count + 1 WHERE epoch=?", (epoch,))
         return
 
+    # --- Known informational/no-op events (existing) ---
     if kind in ("PoolStealthAdded", "CSOLConverted", "SweepDone", "MerkleRootUpdated"):
         return
 
+    # --- New profile/stealth events (no-op persistence; recorded in tx_log for replay/observability) ---
+    # Payloads expected (by convention from API layer):
+    # - ProfileRegistered: { leaf, index, root, blob, ts, ... }
+    # - ProfilesMerkleRootUpdated: { root_hex, ts, ... }
+    # - StealthMarkedUsed: { stealth_pub, reason, ts, ... }
+    if kind in ("ProfileRegistered", "ProfilesMerkleRootUpdated", "StealthMarkedUsed"):
+        return
+
+    # Unknown event safety
     raise ValueError(f"Unknown event kind: {kind}")
 
 
@@ -227,6 +238,43 @@ def metrics_all() -> List[Tuple[int, int, int, str]]:
         ).fetchall()
 
 
+# ---------- Optional typed emit helpers for new events ----------
+def emit_profile_registered(
+    *, leaf: str, index: int, root: str, blob: Dict[str, Any], ts: str | None = None, event_id: str | None = None
+) -> str:
+    """
+    Convenience wrapper; purely records the event (no DB side-effects).
+    """
+    payload: Dict[str, Any] = {"leaf": leaf, "index": index, "root": root, "blob": blob}
+    if ts:
+        payload["ts"] = ts
+    if event_id:
+        payload["event_id"] = event_id
+    return append_event("ProfileRegistered", **payload)
+
+
+def emit_profiles_merkle_root_updated(
+    *, root_hex: str, ts: str | None = None, event_id: str | None = None
+) -> str:
+    payload: Dict[str, Any] = {"root_hex": root_hex}
+    if ts:
+        payload["ts"] = ts
+    if event_id:
+        payload["event_id"] = event_id
+    return append_event("ProfilesMerkleRootUpdated", **payload)
+
+
+def emit_stealth_marked_used(
+    *, stealth_pub: str, reason: str = "", ts: str | None = None, event_id: str | None = None
+) -> str:
+    payload: Dict[str, Any] = {"stealth_pub": stealth_pub, "reason": reason}
+    if ts:
+        payload["ts"] = ts
+    if event_id:
+        payload["event_id"] = event_id
+    return append_event("StealthMarkedUsed", **payload)
+
+
 __all__ = [
     "WRAPPER_MERKLE_STATE_PATH",
     "POOL_MERKLE_STATE_PATH",
@@ -242,4 +290,8 @@ __all__ = [
     "append_event",
     "replay",
     "metrics_all",
+    # optional helpers
+    "emit_profile_registered",
+    "emit_profiles_merkle_root_updated",
+    "emit_stealth_marked_used",
 ]

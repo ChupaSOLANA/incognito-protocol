@@ -28,30 +28,31 @@ except Exception:
 from . import cli_adapter as ca
 from . import eventlog as ev
 from .schemas_api import (
-    ConvertReq,
-    ConvertRes,
-    DepositReq,
-    DepositRes,
-    HandoffReq,
-    HandoffRes,
-    MetricRow,
-    MerkleStatus,
-    StealthItem,
-    StealthList,
-    SweepReq,
-    SweepRes,
-    WithdrawReq,
-    WithdrawRes,
+    ConvertReq, ConvertRes,
+    DepositReq, DepositRes,
+    HandoffReq, HandoffRes,
+    MetricRow, MerkleStatus,
+    StealthItem, StealthList,
+    SweepReq, SweepRes,
+    WithdrawReq, WithdrawRes,
     # marketplace
-    BuyReq,
-    BuyRes,
+    BuyReq, BuyRes,
     # listings
-    Listing,
-    ListingsPayload,
-    ListingCreateRes,
-    ListingUpdateRes,
-    ListingDeleteRes,
+    Listing, ListingsPayload, ListingCreateRes, ListingUpdateRes, ListingDeleteRes,
+    # profiles  ⬇️ add these
+    ProfileBlob,
+    ProfileRevealReq, ProfileRevealRes,
+    ProfileResolveRes,
+    ProfileRotateReq,
+    MarkStealthUsedReq, MarkStealthUsedRes,
 )
+
+try:
+    from . import schemas_api as _schemas
+    _schemas.ProfileResolveRes.update_forward_refs(**_schemas.__dict__)
+    _schemas.ProfileRevealRes.update_forward_refs(**_schemas.__dict__)
+except Exception:
+    pass
 
 app = FastAPI(title="Incognito Protocol API", version="0.1.0")
 
@@ -73,6 +74,11 @@ CSOL_SUPPLY_FILE = os.path.join(DATA_DIR, "csol_supply.json")  # miroir off-chai
 SHIPPING_EVENTS_PATH = os.path.join(DATA_DIR, "shipping_events.jsonl")
 SHIPPING_MERKLE_PATH = os.path.join(DATA_DIR, "shipping_merkle.json")
 
+# Profiles (append-only JSONL + Merkle mirror + used one-time stealth list)
+PROFILES_EVENTS = os.path.join(DATA_DIR, "profiles.jsonl")
+PROFILES_MERKLE = os.path.join(DATA_DIR, "profiles_merkle.json")
+USED_STEALTH_PATH = os.path.join(DATA_DIR, "used_stealth.jsonl")
+
 IPFS_GATEWAY = os.getenv("IPFS_GATEWAY", "http://127.0.0.1:8080/ipfs/")
 
 # Override explicite demandé pour la lecture du solde trésor/pool
@@ -87,6 +93,9 @@ for p, default in [
     (CSOL_SUPPLY_FILE, '{"total":"0"}'),
     (SHIPPING_EVENTS_PATH, ""),
     (SHIPPING_MERKLE_PATH, json.dumps({"leaves": [], "root": None, "version": 1})),
+    (PROFILES_EVENTS, ""),
+    (PROFILES_MERKLE, json.dumps({"leaves": [], "root": None, "version": 1})),
+    (USED_STEALTH_PATH, ""),
 ]:
     if not os.path.exists(p):
         try:
@@ -164,6 +173,9 @@ def _autowipe_on_cluster_change():
         _unlink(CSOL_SUPPLY_FILE)
         _unlink(SHIPPING_EVENTS_PATH)
         _unlink(SHIPPING_MERKLE_PATH)
+        _unlink(PROFILES_EVENTS)
+        _unlink(PROFILES_MERKLE)
+        _unlink(USED_STEALTH_PATH) 
         lst_path = os.getenv("LISTINGS_STATE_FILE")
         _unlink(lst_path)
 
@@ -863,13 +875,21 @@ def deposit(req: DepositReq):
 # ---------- Handoff ----------
 @app.post("/handoff", response_model=HandoffRes)
 def handoff(req: HandoffReq):
+    # Resolve recipient
+    if req.recipient_pub:
+        recip_pub = req.recipient_pub
+    else:
+        recip_pub = _resolve_username_to_pub(req.recipient_username)  # NEW
+
     sender_pub = ca.get_pubkey_from_keypair(req.sender_keyfile)
     st = ca.load_wrapper_state()
     avail = ca.total_available_for_recipient(st, sender_pub)
     if Decimal(str(avail)) <= 0:
         raise HTTPException(status_code=400, detail="No unspent notes")
 
-    chosen, total = ca.greedy_coin_select(ca.list_unspent_notes_for_recipient(st, sender_pub), req.amount_sol)
+    chosen, total = ca.greedy_coin_select(
+        ca.list_unspent_notes_for_recipient(st, sender_pub), req.amount_sol
+    )
     if not chosen:
         raise HTTPException(status_code=400, detail="Coin selection failed")
 
@@ -904,21 +924,20 @@ def handoff(req: HandoffReq):
 
         inputs_used.append({"index": idx, "commitment": n["commitment"]})
 
-    from services.crypto_core.splits import split_bounded
-
-    outputs = []
-    tag_hex = ca.recipient_tag(req.recipient_pub).hex()
-
+    # Create recipient output using resolved 'recip_pub'
     note_hex = secrets.token_bytes(32).hex()
     nonce_hex = secrets.token_bytes(16).hex()
     amt_str = ca.fmt_amt(req.amount_sol)
-    commitment = ca.make_commitment(bytes.fromhex(note_hex), amt_str, bytes.fromhex(nonce_hex), req.recipient_pub)
+    commitment = ca.make_commitment(
+        bytes.fromhex(note_hex), amt_str, bytes.fromhex(nonce_hex), recip_pub
+    )
     try:
         sig = ca.issue_blind_sig_for_commitment_hex(commitment)
     except Exception:
         sig = ""
-    ca.add_note_with_precomputed(st, amt_str, commitment, note_hex, nonce_hex, sig, tag_hex)
-    outputs.append({"amount": amt_str, "commitment": commitment, "sig_hex": sig})
+    ca.add_note_with_precomputed(
+        st, amt_str, commitment, note_hex, nonce_hex, sig, ca.recipient_tag(recip_pub).hex()
+    )
 
     total_dec = Decimal(str(total))
     change = (total_dec - req.amount_sol).quantize(Decimal("0.000000001"), rounding=ROUND_DOWN)
@@ -934,7 +953,12 @@ def handoff(req: HandoffReq):
     except Exception:
         pass
 
-    return HandoffRes(inputs_used=inputs_used, outputs_created=outputs, change_back_to_sender=chg_amt, new_merkle_root=new_root)
+    return HandoffRes(
+        inputs_used=inputs_used,
+        outputs_created=[{"amount": amt_str, "commitment": commitment, "sig_hex": sig}],
+        change_back_to_sender=chg_amt,
+        new_merkle_root=new_root,
+    )
 
 # ---------- Withdraw (classic SOL) ----------
 @app.post("/withdraw", response_model=WithdrawRes)
@@ -1635,3 +1659,311 @@ def shipping_inbox(seller_pub: str):
         })
     orders.sort(key=lambda x: x.get("ts") or "", reverse=True)
     return {"orders": orders}
+
+# =========================
+# Profiles (append-only JSONL + Merkle mirror)
+# =========================
+
+def _profiles__ensure_files():
+    if not os.path.exists(PROFILES_EVENTS):
+        try:
+            pathlib.Path(PROFILES_EVENTS).write_text("")
+        except Exception:
+            pass
+    if not os.path.exists(PROFILES_MERKLE):
+        try:
+            pathlib.Path(PROFILES_MERKLE).write_text(json.dumps({"leaves": [], "root": None, "version": 1}))
+        except Exception:
+            pass
+
+def _profiles_events_append(row: dict) -> None:
+    try:
+        with open(PROFILES_EVENTS, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+def _profiles_events_read_all() -> list[dict]:
+    out = []
+    try:
+        with open(PROFILES_EVENTS, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+    return out
+
+def _profiles_load_state() -> Dict[str, Any]:
+    _profiles__ensure_files()
+    try:
+        return json.loads(pathlib.Path(PROFILES_MERKLE).read_text())
+    except Exception:
+        return {"leaves": [], "root": None, "version": 1}
+
+def _profiles_save_state(st: Dict[str, Any]) -> None:
+    try:
+        pathlib.Path(PROFILES_MERKLE).write_text(json.dumps(st))
+    except Exception:
+        pass
+
+def _profile_leaf_hex(blob: Dict[str, Any]) -> str:
+    # Reuse crypto-core canonicalization + tagged hash
+    return ca.profile_hash_profile_leaf(blob)
+
+def _profiles_build_tree(leaves_hex: List[str]) -> MerkleTree:
+    mt = MerkleTree(leaves_hex if isinstance(leaves_hex, list) else [])
+    if not getattr(mt, "layers", None) and getattr(mt, "leaf_bytes", None):
+        mt.build_tree()
+    return mt
+
+def _profiles_find_latest_by_username(username: str) -> Optional[Dict[str, Any]]:
+    """
+    Return the latest ProfileRegistered row for this username that still exists in current leaves.
+    """
+    rows = _profiles_events_read_all()
+    st = _profiles_load_state()
+    leaves = st.get("leaves") or []
+    pos = {h: i for i, h in enumerate(leaves)}
+    latest = None
+    for r in rows:
+        if r.get("kind") != "ProfileRegistered":
+            continue
+        b = r.get("blob") or {}
+        if str(b.get("username", "")) != username:
+            continue
+        leaf = r.get("leaf") or _profile_leaf_hex(b)
+        if leaf in pos:
+            latest = {**r, "index": pos[leaf], "leaf": leaf}
+    return latest
+
+def _profiles_register_blob(blob: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Append a profile leaf (idempotent for identical blob), update Merkle, return proof pack.
+    """
+    _profiles__ensure_files()
+    leaf_hex = _profile_leaf_hex(blob)
+
+    st = _profiles_load_state()
+    leaves = list(st.get("leaves") or [])
+    if leaf_hex not in leaves:
+        leaves.append(leaf_hex)
+        st["leaves"] = leaves
+        _profiles_save_state(st)
+
+    mt = _profiles_build_tree(leaves)
+    root_hex = mt.root().hex()
+    st["root"] = root_hex
+    _profiles_save_state(st)
+
+    idx = leaves.index(leaf_hex)
+    proof = mt.get_proof(idx)
+    return {"leaf": leaf_hex, "root": root_hex, "index": idx, "proof": proof}
+
+# ------------- Profiles Endpoints -------------
+@app.post("/profiles/reveal", response_model=ProfileRevealRes)
+def profiles_reveal(req: ProfileRevealReq):
+    # Validate owner sig (any of pubs[]) over canonical blob (without 'sig')
+    blob = req.blob.dict()
+    pubs = list(blob.get("pubs") or [])
+    sig_hex = str(blob.get("sig") or "")
+    if not pubs:
+        raise HTTPException(status_code=400, detail="blob.pubs required")
+    msg = ca.profile_canonical_json_bytes(blob)  # strips 'sig' internally
+    if not sig_hex or not ca.profile_verify_owner_sig(msg, sig_hex, pubs):
+        raise HTTPException(status_code=400, detail="Invalid owner signature for profile blob")
+
+    pack = _profiles_register_blob(blob)
+
+    ev_row = {
+        "kind": "ProfileRegistered",
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "leaf": pack["leaf"],
+        "index": pack["index"],
+        "root": pack["root"],
+        "blob": blob,
+    }
+    _profiles_events_append(ev_row)
+    try:
+        ca.emit("ProfileRegistered", **ev_row)
+        ca.emit("ProfilesMerkleRootUpdated", root_hex=pack["root"])
+    except Exception:
+        pass
+
+    return ProfileRevealRes(ok=True, leaf=pack["leaf"], index=pack["index"], root=pack["root"], blob=ProfileBlob(**blob))
+
+@app.get("/profiles/resolve/{username}", response_model=ProfileResolveRes)
+def profiles_resolve(username: str):
+    row = _profiles_find_latest_by_username(username)
+    if not row:
+        return ProfileResolveRes(ok=False, username=username)
+
+    st = _profiles_load_state()
+    leaves = st.get("leaves") or []
+    mt = _profiles_build_tree(leaves)
+    root_hex = mt.root().hex()
+    idx = int(row["index"])
+    proof = mt.get_proof(idx)
+    blob = row.get("blob") or {}
+
+    return ProfileResolveRes(
+        ok=True,
+        username=username,
+        leaf=row["leaf"],
+        blob=ProfileBlob(**blob),
+        index=idx,
+        proof=proof,
+        root=root_hex,
+    )
+
+@app.post("/profiles/rotate", response_model=ProfileRevealRes)
+def profiles_rotate(req: ProfileRotateReq):
+    """
+    Step 1 of rotation: authorization.
+    - Verify 'req.sig' was made by ANY existing owner over {'username','new_pubs','meta'} (canonical).
+    - Return a 'blob' payload with 'sig' set to the canonical-bytes-hex the client must sign
+      using one of the NEW pubs. Client then calls /profiles/reveal with the finalized blob.
+    """
+    username = req.username
+    latest = _profiles_find_latest_by_username(username)
+    if not latest:
+        raise HTTPException(status_code=404, detail="Existing profile not found; use /profiles/reveal first")
+
+    old_blob = latest.get("blob") or {}
+    old_pubs = list(old_blob.get("pubs") or [])
+    if not old_pubs:
+        raise HTTPException(status_code=400, detail="Existing profile has no pubs[]")
+
+    payload = {"username": username, "new_pubs": list(req.new_pubs or []), "meta": req.meta or None}
+    if not payload["new_pubs"]:
+        raise HTTPException(status_code=400, detail="new_pubs required")
+
+    msg = ca.profile_canonical_json_bytes(payload)
+    if not ca.profile_verify_owner_sig(msg, req.sig, old_pubs):
+        raise HTTPException(status_code=400, detail="Rotation must be signed by an existing owner key")
+
+    # Build the new blob (version bump). Client must sign this (without 'sig') and call /profiles/reveal.
+    new_blob = {
+        "username": username,
+        "pubs": payload["new_pubs"],
+        "version": int(old_blob.get("version", 1)) + 1,
+        "meta": payload["meta"],
+        "sig": "",  # client will replace with signature over canonical(new_blob_without_sig)
+    }
+    to_sign = ca.profile_canonical_json_bytes(new_blob).hex()
+
+    # We return 'sig' as the canonical-bytes-hex to be signed (DX hint).
+    return ProfileRevealRes(
+        ok=True,
+        leaf="",
+        index=-1,
+        root=_profiles_load_state().get("root") or "",
+        blob=ProfileBlob(**{**new_blob, "sig": to_sign}),
+    )
+
+@app.post("/profiles/mark_stealth_used", response_model=MarkStealthUsedRes)
+def mark_stealth_used(req: MarkStealthUsedReq):
+    row = {
+        "kind": "StealthMarkedUsed",
+        "stealth_pub": req.stealth_pub,
+        "reason": req.reason or "",
+        "ts": datetime.utcnow().isoformat() + "Z",
+    }
+    try:
+        with open(USED_STEALTH_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to append to used_stealth.jsonl: {e}")
+
+    try:
+        ca.emit("StealthMarkedUsed", **row)
+    except Exception:
+        pass
+
+    return MarkStealthUsedRes(ok=True, stealth_pub=req.stealth_pub)
+
+# app.py
+def _normalize_username(alias: str) -> str:
+    """
+    Accept forms like '@alice', 'alice', 'alice.incognito' and return 'alice'.
+    """
+    s = (alias or "").strip()
+    if s.startswith("@"):
+        s = s[1:]
+    if s.endswith(".incognito"):
+        s = s[: -len(".incognito")]
+    return s
+
+def _resolve_username_to_pub(username: str) -> str:
+    """
+    Use the profiles Merkle mirror to resolve the latest profile and
+    return a primary pubkey. Policy: pick blob.pubs[0].
+    """
+    u = _normalize_username(username)
+    row = _profiles_find_latest_by_username(u)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Profile '{u}' not found")
+    blob = row.get("blob") or {}
+    pubs = list(blob.get("pubs") or [])
+    if not pubs:
+        raise HTTPException(status_code=400, detail=f"Profile '{u}' has no pubs[]")
+    return pubs[0]  # policy: first pub is the receive key
+
+# =========================
+# Profiles helpers (reverse lookup)
+# =========================
+
+def _profiles_find_latest_by_pub(pub: str) -> Optional[Dict[str, Any]]:
+    """
+    Return the latest ProfileRegistered row where blob.pubs includes `pub`
+    and the leaf still exists in current leaves.
+    """
+    rows = _profiles_events_read_all()
+    st = _profiles_load_state()
+    leaves = st.get("leaves") or []
+    pos = {h: i for i, h in enumerate(leaves)}
+    latest = None
+    for r in rows:
+        if r.get("kind") != "ProfileRegistered":
+            continue
+        b = r.get("blob") or {}
+        pubs = list(b.get("pubs") or [])
+        if pub not in pubs:
+            continue
+        leaf = r.get("leaf") or _profile_leaf_hex(b)
+        if leaf in pos:
+            latest = {**r, "index": pos[leaf], "leaf": leaf}
+    return latest
+
+# ------------- Profiles: resolve by pub -------------
+from .schemas_api import ProfileResolveByPubRes  # add this import near the others
+
+@app.get("/profiles/resolve_pub/{pub}", response_model=ProfileResolveByPubRes)
+def profiles_resolve_pub(pub: str):
+    row = _profiles_find_latest_by_pub(pub)
+    if not row:
+        return ProfileResolveByPubRes(ok=False, pub=pub)
+
+    st = _profiles_load_state()
+    leaves = st.get("leaves") or []
+    mt = _profiles_build_tree(leaves)
+    root_hex = mt.root().hex()
+    idx = int(row["index"])
+    proof = mt.get_proof(idx)
+    blob = row.get("blob") or {}
+    username = blob.get("username")
+
+    return ProfileResolveByPubRes(
+        ok=True,
+        pub=pub,
+        username=username,
+        leaf=row["leaf"],
+        index=idx,
+        proof=proof,
+        root=root_hex,
+    )
+

@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::hash::{hashv, Hash};
 
-declare_id!("DyCNNyUfcYL8X3PNCDcSDXiYtx4ycheG7i13mckjB32j"); // même clé que dans Anchor.toml
+declare_id!("6B3a1bofzDzACakZmf78jncUXMxFYdJgXxxSL1FpJ61y"); // même clé que dans Anchor.toml
 
 #[program]
 pub mod merkle_registry {
