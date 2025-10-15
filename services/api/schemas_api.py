@@ -1,4 +1,3 @@
-# services/api/schemas_api.py
 from __future__ import annotations
 
 from decimal import Decimal
@@ -59,13 +58,14 @@ class HandoffReq(BaseModel):
     sender_keyfile: str
     amount_sol: Decimal
     recipient_pub: Optional[str] = None
-    recipient_username: Optional[str] = None  # NEW
+    recipient_username: Optional[str] = None  # resolve via profiles (policy: pubs[0])
 
     @root_validator
     def _one_recipient(cls, values):
         if not values.get("recipient_pub") and not values.get("recipient_username"):
             raise ValueError("Provide either recipient_pub or recipient_username")
         return values
+
 
 class HandoffRes(Ok):
     inputs_used: List[dict]
@@ -165,9 +165,9 @@ class BuyReq(_DecimalAsStr):
     payment: Optional[Literal["auto", "csol", "sol"]] = Field(
         "auto", description="Payment mode preference."
     )
-    # ✅ support quantity
+    # support quantity
     quantity: conint(ge=1) = 1
-    # ✅ NEW: optional encrypted shipping payload (stored & merklized; server never decrypts)
+    # optional encrypted shipping payload (stored & merklized; server never decrypts)
     encrypted_shipping: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Optional encrypted shipping payload for the seller (ephemeral_pub_b58, nonce_hex, ciphertext_b64, thread_id_b64, algo).",
@@ -186,6 +186,7 @@ class BuyRes(Ok):
     spent_note_indices: Optional[List[int]] = None
     buyer_change: Optional[Dict[str, Any]] = None  # {"amount": "...", "commitment": "...", "index": int}
     new_merkle_root: Optional[str] = None
+    escrow_id: Optional[str] = None
 
 
 # ====== Listings (NEW) ======
@@ -210,7 +211,7 @@ class ListingCreateReq(_DecimalAsStr):
     description: Optional[str] = None
     unit_price_sol: condecimal(gt=0)
     quantity: conint(ge=0) = 1
-    # client peut fournir des URLs/IPFS
+    # client may provide URLs/IPFS
     image_uris: Optional[List[str]] = None
 
 
@@ -224,10 +225,10 @@ class ListingUpdateReq(_DecimalAsStr):
     title: Optional[str] = None
     description: Optional[str] = None
     unit_price_sol: Optional[condecimal(gt=0)] = None
-    # soit quantity_new (set), soit quantity_delta (+/-)
+    # either quantity_new (set) or quantity_delta (+/-)
     quantity_new: Optional[conint(ge=0)] = None
     quantity_delta: Optional[int] = None
-    # si fourni, remplace entièrement
+    # if provided, replaces entirely
     image_uris: Optional[List[str]] = None
 
 
@@ -244,6 +245,8 @@ class ListingDeleteRes(_DecimalAsStr):
     ok: bool = True
     removed: int
 
+
+# ===== Profiles =====
 class ProfileBlob(_DecimalAsStr):
     username: str
     pubs: List[str] = Field(..., description="Owner ed25519 pubkeys (base58). First is the primary.")
@@ -251,8 +254,10 @@ class ProfileBlob(_DecimalAsStr):
     meta: Optional[Dict[str, Any]] = None
     sig: str = Field(..., description="Owner signature (hex) over canonical blob (without 'sig').")
 
+
 class ProfileRevealReq(_DecimalAsStr):
     blob: ProfileBlob
+
 
 class ProfileRevealRes(_DecimalAsStr):
     ok: bool = True
@@ -260,6 +265,7 @@ class ProfileRevealRes(_DecimalAsStr):
     index: int
     root: str
     blob: ProfileBlob
+
 
 class ProfileResolveRes(_DecimalAsStr):
     ok: bool = True
@@ -270,12 +276,14 @@ class ProfileResolveRes(_DecimalAsStr):
     proof: List[str] = []
     root: Optional[str] = None
 
+
 class ProfileRotateReq(_DecimalAsStr):
     username: str
     new_pubs: List[str]
     meta: Optional[Dict[str, Any]] = None
     # signed by ANY existing pub from the latest registered profile
     sig: str = Field(..., description="Signature (hex) over canonical {'username','new_pubs','meta'} payload.")
+
 
 # --- Profiles: resolve by pub ---
 class ProfileResolveByPubRes(BaseModel):
@@ -287,13 +295,106 @@ class ProfileResolveByPubRes(BaseModel):
     root: Optional[str] = None
     proof: Optional[List[str]] = None
 
+
 class MarkStealthUsedReq(_DecimalAsStr):
     stealth_pub: str = Field(..., description="One-time stealth address to mark as used (block reuse).")
     reason: Optional[str] = None
 
+
 class MarkStealthUsedRes(_DecimalAsStr):
     ok: bool = True
     stealth_pub: str
+
+
+# ============================
+# ===== Escrow (Encrypted) ====
+# ============================
+
+# --- Encrypted payload wrapper (XChaCha20-Poly1305 style) ---
+class EncryptedBlob(_DecimalAsStr):
+    nonce_hex: str = Field(..., description="24-byte XChaCha20 nonce (hex).")
+    ciphertext_hex: str = Field(..., description="Ciphertext (hex).")
+
+
+# --- Escrow record / listing link ---
+class EscrowRecord(_DecimalAsStr):
+    id: str = Field(..., description="Escrow id (hex).")
+    buyer_pub: str = Field(..., description="Buyer public key (base58).")
+    seller_pub: str = Field(..., description="Seller public key (base58).")
+    amount_sol: str = Field(..., description="Escrowed amount (SOL as string).")
+    status: Literal[
+        "PENDING", "RELEASED", "REFUND_REQUESTED", "REFUNDED", "DISPUTED", "CANCELLED"
+    ] = Field(..., description="Current escrow status.")
+    # fully encrypted buyer message / shipping info / attachments manifest, etc.
+    details_ct: Optional[EncryptedBlob] = Field(None, description="Opaque encrypted order details.")
+    # optional ties to marketplace listing
+    listing_id: Optional[str] = Field(None, description="Listing id if associated.")
+    quantity: Optional[conint(ge=1)] = Field(None, description="Quantity if associated with a listing.")
+    # Merkle
+    commitment: str = Field(..., description="Escrow commitment (hex).")
+    leaf_index: Optional[int] = Field(None, description="Index in the escrow Merkle tree (if unspent).")
+    created_at: str = Field(..., description="ISO-8601 UTC time.")
+    updated_at: str = Field(..., description="ISO-8601 UTC time.")
+
+
+class EscrowOpenReq(_DecimalAsStr):
+    buyer_keyfile: str = Field(..., description="Buyer keyfile (./keys/user*.json).")
+    seller_pub: str = Field(..., description="Seller public key (base58).")
+    amount_sol: condecimal(gt=0) = Field(..., description="Escrow amount in SOL.")
+    # Payment preference, mirrors marketplace
+    payment: Optional[Literal["auto", "csol", "sol"]] = Field(
+        "auto", description="Use cSOL if possible; fallback to SOL-backed notes."
+    )
+    # Optional marketplace linkage
+    listing_id: Optional[str] = Field(None, description="Listing id (hex).")
+    quantity: Optional[conint(ge=1)] = Field(1, description="Purchase quantity.")
+    # Encrypted order details (nonce + ct)
+    details_ct: Optional[EncryptedBlob] = Field(
+        None,
+        description="Opaque encrypted details (XChaCha20-Poly1305); server stores but cannot read.",
+    )
+
+
+class EscrowOpenRes(Ok):
+    escrow: EscrowRecord
+
+
+class EscrowActionReq(_DecimalAsStr):
+    """
+    Actions on an escrow: release to seller, request refund, refund, dispute, cancel.
+    Some actions are permissioned: buyer-only (refund_request), seller-only (release?), or admin/arbiter.
+    """
+    actor_keyfile: str = Field(..., description="Keyfile of the actor performing the action.")
+    action: Literal[
+        "RELEASE",          # release funds to seller
+        "REFUND_REQUEST",   # buyer asks for refund (moves to REFUND_REQUESTED)
+        "REFUND",           # arbiter processes refund → buyer
+        "DISPUTE",          # either party opens a dispute
+        "CANCEL"            # mutual cancel or arbiter cancel (back to buyer)
+    ] = Field(..., description="Escrow action to perform.")
+    # Optional encrypted note for the action (e.g., dispute message)
+    note_ct: Optional[EncryptedBlob] = Field(None, description="Optional encrypted action note.")
+
+
+class EscrowActionRes(Ok):
+    escrow: EscrowRecord
+
+
+class EscrowGetRes(_DecimalAsStr):
+    escrow: EscrowRecord
+
+
+class EscrowListRes(_DecimalAsStr):
+    items: List[EscrowRecord]
+
+
+class EscrowMerkleStatus(_DecimalAsStr):
+    """
+    State snapshot for the escrow Merkle tree (distinct from wrapper/pool trees).
+    """
+    escrow_leaves: conint(ge=0) = Field(..., description="Number of active escrow leaves.")
+    escrow_root_hex: str = Field(..., description="Escrow Merkle root (hex).")
+
 
 __all__ = [
     # base/common
@@ -340,4 +441,14 @@ __all__ = [
     # mark-stealth-used
     "MarkStealthUsedReq",
     "MarkStealthUsedRes",
+    # escrow
+    "EncryptedBlob",
+    "EscrowRecord",
+    "EscrowOpenReq",
+    "EscrowOpenRes",
+    "EscrowActionReq",
+    "EscrowActionRes",
+    "EscrowGetRes",
+    "EscrowListRes",
+    "EscrowMerkleStatus",
 ]

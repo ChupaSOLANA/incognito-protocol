@@ -7,6 +7,8 @@ import requests
 import pathlib
 from decimal import Decimal
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Any
 
 import streamlit as st
 
@@ -117,6 +119,102 @@ def profiles_reveal(username: str, pubs: list[str], meta: dict | None, user_keyf
 
 def profiles_resolve(username: str):
     return api_get(f"/profiles/resolve/{username.strip()}")
+
+# ===== Escrow helpers =====
+@dataclass
+class EscrowEncBlob:
+    nonce_hex: str
+    ciphertext_hex: str
+
+def escrow_encrypt_details_hex(key_hex: str, plaintext_json: str) -> EscrowEncBlob:
+    """
+    Encrypts arbitrary JSON (string) with XChaCha20-Poly1305 using your repo's messages helper.
+    Returns {nonce_hex, ciphertext_hex} as expected by the API.
+    """
+    if messages is None:
+        raise RuntimeError("Crypto helpers unavailable (services.crypto_core.messages).")
+
+    key = bytes.fromhex(key_hex.strip())
+    if len(key) != 32:
+        raise ValueError("Escrow key must be 32 bytes (hex).")
+
+    nonce24, ct = messages.xchacha_encrypt(key, plaintext_json.encode("utf-8"))
+    return EscrowEncBlob(nonce_hex=nonce24.hex(), ciphertext_hex=ct.hex())
+
+def escrow_open(
+    buyer_keyfile_or_pub: str,
+    seller_pub: str,
+    amount_sol: str,
+    listing_id: str | None,
+    quantity: int | None,
+    details_ct: EscrowEncBlob | None,
+) -> tuple[int, dict]:
+    payload = {
+        "buyer_keyfile": buyer_keyfile_or_pub,
+        "seller_pub": seller_pub,
+        "amount_sol": amount_sol,
+        "payment": "auto",
+        "listing_id": listing_id or None,
+        "quantity": quantity,
+        "details_ct": (details_ct.__dict__ if details_ct else None),
+    }
+    return api_post("/escrow", payload)
+
+def escrow_action(escrow_id: str, actor_keyfile_or_pub: str, action: str, note_ct: EscrowEncBlob | None = None):
+    payload = {
+        "actor_keyfile": actor_keyfile_or_pub,
+        "action": action,
+        "note_ct": (note_ct.__dict__ if note_ct else None),
+    }
+    return api_post(f"/escrow/{escrow_id}/action", payload)
+
+def escrow_list(party_pub: str, role: str, status: str | None = None) -> list[dict]:
+    params = {"party_pub": party_pub, "role": role}
+    if status:
+        params["status"] = status
+    code, data = api_get("/escrow/list", **params)
+    if code == 200 and isinstance(data, dict):
+        return data.get("items", [])
+    return []
+
+def escrow_merkle_status() -> dict:
+    code, data = api_get("/escrow/merkle/status")
+    return data if code == 200 else {"error": data}
+
+def _escrow_action_buttons_buyer(row: Dict[str, Any], actor: str):
+    eid = row.get("id")
+    cols = st.columns(3)
+    if cols[0].button("Release", key=f"esc_rel_{eid}", use_container_width=True):
+        c, r = escrow_action(eid, actor, "RELEASE")
+        st.toast("Release sent" if c == 200 else f"Failed: {r}")
+        safe_rerun()
+    if cols[1].button("Request refund", key=f"esc_rr_{eid}", use_container_width=True):
+        c, r = escrow_action(eid, actor, "REFUND_REQUEST")
+        st.toast("Refund request sent" if c == 200 else f"Failed: {r}")
+        safe_rerun()
+    if cols[2].button("Dispute", key=f"esc_dp_{eid}", use_container_width=True):
+        c, r = escrow_action(eid, actor, "DISPUTE")
+        st.toast("Dispute sent" if c == 200 else f"Failed: {r}")
+        safe_rerun()
+
+
+def _escrow_action_buttons_seller(row: Dict[str, Any], actor: str):
+    eid = row.get("id")
+    can_refund = (row.get("status") == "REFUND_REQUESTED")
+    btn_type = "primary" if can_refund else "secondary"
+
+    clicked = st.button(
+        "Refund",
+        key=f"esc_rf_{eid}",
+        type=btn_type,
+        use_container_width=True,
+        disabled=not can_refund,  # interdit si le buyer n'a pas demandé un refund
+        help=("Enabled when buyer requested a refund." if not can_refund else None),
+    )
+    if clicked:
+        c, r = escrow_action(eid, actor, "REFUND")
+        st.toast("Refund sent" if c == 200 else f"Failed: {r}")
+        safe_rerun()
 
 # --------------- Utils ------------------
 def short(pk: str, n: int = 6) -> str:
@@ -340,26 +438,21 @@ def wait_for_state_update(
     owner_pub: str,
     prev_sol: Decimal | None,
     prev_stealth_total: Decimal | None,
-    timeout_s: int = 30,
-    interval_s: float = 1.0,
+    timeout_s: int = 10,          # plus court
+    interval_s: float = 0.75,
 ):
-    """
-    Polls for changes in either the plain SOL balance or stealth total.
-    Clears cached data before each poll to force fresh fetches.
-    Returns when a change is detected or timeout reached, then triggers a rerun.
-    """
     start = time.time()
     while time.time() - start < timeout_s:
         try:
-            st.cache_data.clear()
+            get_stealth.clear()
         except Exception:
             pass
 
         new_sol = get_sol_balance(owner_pub)
-        new_stealth = _read_stealth_total(owner_pub)
+        new_stealth = _read_stealth_total(owner_pub) if prev_stealth_total is not None else None
 
         changed_sol = (prev_sol is not None and new_sol is not None and new_sol != prev_sol)
-        changed_stealth = (prev_stealth_total is not None and new_stealth != prev_stealth_total)
+        changed_stealth = (prev_stealth_total is not None and new_stealth is not None and new_stealth != prev_stealth_total)
 
         if changed_sol or changed_stealth:
             break
@@ -986,12 +1079,12 @@ with tab_listings:
                                 c, res = api_post("/marketplace/buy", payload)
                                 if c == 200:
                                     st.success("Purchase confirmed ✅")
-                                    wait_for_state_update(active_pub, prev_sol, prev_stealth)
+                                    wait_for_state_update(active_pub, prev_sol, None)
                                 else:
                                     flash("Purchase failed ❌", "error")
                                     st.error(res)
 
-# --- Orders / Shipping tab (seller inbox) ---
+# --- Orders / Shipping tab (seller inbox + escrow) ---
 with tab_orders:
     st.subheader("My Orders / Shipping Info")
     st.caption("Encrypted shipping details sent by buyers for your sold listings.")
@@ -1016,7 +1109,10 @@ with tab_orders:
                         st.code(short(o.get("buyer_pub", ""), 8))
                     with c3:
                         st.caption("Amount")
-                        st.write(f"{o.get('quantity')} × {fmt_amt(o.get('unit_price'))} = {fmt_amt(o.get('total_price'))} cSOL")
+                        st.write(
+                            f"{o.get('quantity')} × {fmt_amt(o.get('unit_price'))} = "
+                            f"{fmt_amt(o.get('total_price'))} cSOL"
+                        )
                     with c4:
                         st.caption("Payment")
                         st.write(o.get("payment"))
@@ -1028,6 +1124,70 @@ with tab_orders:
                                 st.json(data)
                             except Exception as e:
                                 st.error(f"Reveal failed: {e}")
+
+    # ---- Escrow: My Buys ----
+    st.divider()
+    st.subheader("My Buys (Escrow)")
+    status_b = st.selectbox(
+        "Filter",
+        ["(all)", "PENDING", "REFUND_REQUESTED", "DISPUTED", "RELEASED", "REFUNDED", "CANCELLED"],
+        key="esc_f_buys",
+    )
+    flt_b = None if status_b == "(all)" else status_b
+    esc_buys = escrow_list(active_pub, role="buyer", status=flt_b)
+
+    if not esc_buys:
+        st.info("No escrows as buyer.")
+    else:
+        for row in esc_buys:
+            with st.container(border=True):
+                st.write(
+                    f"**Escrow** `{row.get('id')}` · **Status** `{row.get('status')}` · "
+                    f"**Amount** {fmt_amt(row.get('amount_sol','0'))} SOL"
+                )
+                st.caption(f"Seller: {row.get('seller_pub')}")
+                with st.expander("Details / JSON"):
+                    st.json(row)
+                _escrow_action_buttons_buyer(row, actor=active_key)
+
+
+    # ---- Escrow: My Sells ----
+    st.divider()
+    st.subheader("My Sells (Escrow)")
+    status_s = st.selectbox(
+        "Filter ",
+        ["(all)", "PENDING", "REFUND_REQUESTED", "DISPUTED", "RELEASED", "REFUNDED", "CANCELLED"],
+        key="esc_f_sells",
+    )
+    flt_s = None if status_s == "(all)" else status_s
+    esc_sells = escrow_list(active_pub, role="seller", status=flt_s)
+
+    if not esc_sells:
+        st.info("No escrows as seller.")
+    else:
+        for row in esc_sells:
+            with st.container(border=True):
+                st.write(
+                    f"**Escrow** `{row.get('id')}` · **Status** `{row.get('status')}` · "
+                    f"**Amount** {fmt_amt(row.get('amount_sol','0'))} SOL"
+                )
+                st.caption(f"Buyer: {row.get('buyer_pub')}")
+                with st.expander("Details / JSON"):
+                    st.json(row)
+                _escrow_action_buttons_seller(row, actor=active_key)
+
+    # ---- Escrow: Merkle status ----
+    st.divider()
+    st.subheader("Escrow Merkle")
+    try:
+        ms = escrow_merkle_status()
+        if "error" in ms:
+            st.error(ms["error"])
+        else:
+            st.metric("Leaves", ms.get("escrow_leaves", 0))
+            st.code(json.dumps(ms, indent=2), language="json")
+    except Exception as e:
+        st.error(f"Failed to fetch escrow merkle status: {e}")
 
 # --- My Profile (create/update) ---
 with tab_profile:

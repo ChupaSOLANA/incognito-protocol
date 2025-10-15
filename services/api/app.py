@@ -39,12 +39,16 @@ from .schemas_api import (
     BuyReq, BuyRes,
     # listings
     Listing, ListingsPayload, ListingCreateRes, ListingUpdateRes, ListingDeleteRes,
-    # profiles  ⬇️ add these
     ProfileBlob,
     ProfileRevealReq, ProfileRevealRes,
     ProfileResolveRes,
     ProfileRotateReq,
     MarkStealthUsedReq, MarkStealthUsedRes,
+    EncryptedBlob,
+    EscrowRecord,
+    EscrowOpenReq, EscrowOpenRes,
+    EscrowActionReq, EscrowActionRes,
+    EscrowGetRes, EscrowListRes, EscrowMerkleStatus,
 )
 
 try:
@@ -100,6 +104,19 @@ for p, default in [
     if not os.path.exists(p):
         try:
             pathlib.Path(p).write_text(default if isinstance(default, str) else json.dumps(default))
+        except Exception:
+            pass
+ESCROW_STATE_PATH = os.path.join(DATA_DIR, "escrow_state.json")
+ESCROW_MERKLE_PATH = os.path.join(DATA_DIR, "escrow_merkle_state.json")
+
+# Ensure they exist
+for p, default in [
+    (ESCROW_STATE_PATH, json.dumps({"escrows": [], "nullifiers": []})),
+    (ESCROW_MERKLE_PATH, json.dumps({"leaves": [], "root": ""})),
+]:
+    if not os.path.exists(p):
+        try:
+            pathlib.Path(p).write_text(default)
         except Exception:
             pass
 
@@ -1226,8 +1243,9 @@ def sweep(req: SweepReq):
 @app.post("/marketplace/buy", response_model=BuyRes)
 def marketplace_buy(req: BuyReq):
     """
-    Préférence: cSOL direct via app-ledger si suffisant.
-    Sinon: dépenser les notes (confidential) et payer le vendeur en cSOL depuis la réserve.
+    Always open an escrow on buy. No instant seller payout.
+    Funds are locked either by (a) debiting buyer's cSOL balance, or
+    (b) spending buyer's notes. Release/Refund happens later via escrow actions.
     """
     buyer_pub = ca.get_pubkey_from_keypair(req.buyer_keyfile)
     listing = ca.listing_get(req.listing_id)
@@ -1254,6 +1272,7 @@ def marketplace_buy(req: BuyReq):
         raise HTTPException(400, "Listing missing seller_pub")
     if seller_pub == buyer_pub:
         raise HTTPException(400, "Cannot buy your own listing")
+
     payment_pref = (req.payment or "auto").lower()
 
     encrypted_shipping_blob: Optional[Dict[str, Any]] = getattr(req, "encrypted_shipping", None)
@@ -1261,121 +1280,69 @@ def marketplace_buy(req: BuyReq):
     if isinstance(encrypted_shipping_blob, dict):
         order_id = secrets.token_hex(16)
 
-    if payment_pref in ("auto", "csol"):
-        buyer_credits = _csol_get(buyer_pub)
-        if buyer_credits >= total_price:
+    # Try cSOL first if allowed
+    buyer_credits = _csol_get(buyer_pub) if payment_pref in ("auto", "csol") else Decimal("0")
+
+    payment_mode = None
+    spent_note_indices: List[int] = []
+    buyer_change: Optional[Dict[str, Any]] = None
+
+    if buyer_credits >= total_price:
+        # ----- cSOL-held escrow: debit buyer cSOL now; seller will be credited upon RELEASE -----
+        _csol_sub(buyer_pub, total_price)
+        payment_mode = "csol"
+    else:
+        # ----- Fallback: lock value by spending notes now (seller paid later from reserve upon RELEASE) -----
+        st = ca.load_wrapper_state()
+        avail = Decimal(str(ca.total_available_for_recipient(st, buyer_pub))).quantize(CSOL_DEC)
+        if avail < total_price:
+            raise HTTPException(400, f"Insufficient funds. cSOL insufficient and notes available={avail} < total={total_price}")
+
+        notes = ca.list_unspent_notes_for_recipient(st, buyer_pub)
+        chosen, total_selected = ca.greedy_coin_select(notes, total_price)
+        if not chosen:
+            raise HTTPException(400, "Coin selection failed; consolidate notes")
+
+        mt = ca.build_merkle(st)
+        root_hex = mt.root().hex()
+        for n in chosen:
+            idx = int(n.get("index", -1))
+            proof = mt.get_proof(idx)
+            if idx < 0 or not verify_merkle(n["commitment"], proof, root_hex):
+                raise HTTPException(400, f"Merkle verification failed for note idx={idx}")
+            spent_note_indices.append(idx)
+
+        for n in chosen:
             try:
-                sig = ca.csol_confidential_transfer(req.buyer_keyfile, buyer_pub, seller_pub, str(total_price))
-            except Exception as e:
-                if payment_pref == "csol":
-                    raise HTTPException(400, f"cSOL transfer failed (ledger had {buyer_credits}): {e}")
-            else:
-                try:
-                    ca.listing_update_quantity(seller_pub, req.listing_id, quantity_delta=-qty)
-                except Exception:
-                    _deactivate_listing(req.listing_id)
-                _csol_sub(buyer_pub, total_price)
-                _csol_add(seller_pub, total_price)
+                nf = ca.make_nullifier(bytes.fromhex(n["note_hex"]))
+                ca.mark_nullifier(st, nf)
+                n["spent"] = True
+                ca.emit("NoteSpent", nullifier=nf, commitment=n["commitment"])
+            except Exception:
+                pass
 
-                shipping_commitment = None
-                if isinstance(encrypted_shipping_blob, dict):
-                    try:
-                        proof = _shipping_append_event(
-                            order_id=order_id or secrets.token_hex(16),
-                            listing_id=req.listing_id,
-                            buyer_pub=buyer_pub,
-                            seller_pub=seller_pub,
-                            encrypted_blob=encrypted_shipping_blob,
-                        )
-                        shipping_commitment = proof
-                    except Exception:
-                        shipping_commitment = None
+        change = (Decimal(str(total_selected)) - total_price).quantize(CSOL_DEC, rounding=ROUND_DOWN)
+        if change > 0:
+            note = secrets.token_bytes(32).hex()
+            nonce = secrets.token_bytes(16).hex()
+            rec = ca.add_note(st, buyer_pub, str(change), note, nonce)
+            buyer_change = {"amount": str(change), "commitment": rec["commitment"], "index": int(rec["index"])}
 
-                try:
-                    ca.emit(
-                        "ListingSold",
-                        listing_id=req.listing_id,
-                        payment="csol",
-                        price=str(total_price),
-                        unit_price=str(unit_price),
-                        quantity=qty,
-                        buyer=buyer_pub,
-                        seller=seller_pub,
-                        csol_sig=sig,
-                        order_id=(shipping_commitment or {}).get("order_id") if shipping_commitment else None,
-                        shipping_leaf=(shipping_commitment or {}).get("leaf") if shipping_commitment else None,
-                        shipping_root=(shipping_commitment or {}).get("root") if shipping_commitment else None,
-                        shipping_index=(shipping_commitment or {}).get("index") if shipping_commitment else None,
-                        shipping_proof=(shipping_commitment or {}).get("proof") if shipping_commitment else None,
-                    )
-                except Exception:
-                    pass
-                return BuyRes(
-                    ok=True,
-                    listing_id=req.listing_id,
-                    payment="csol",
-                    price=str(total_price),
-                    buyer_pub=buyer_pub,
-                    seller_pub=seller_pub,
-                    csol_tx_signature=sig,
-                )
-        elif payment_pref == "csol":
-            raise HTTPException(400, f"Insufficient cSOL credits (have {buyer_credits}, need {total_price}).")
-
-    # --- Fallback: SOL-backed ---
-    st = ca.load_wrapper_state()
-    avail = Decimal(str(ca.total_available_for_recipient(st, buyer_pub))).quantize(CSOL_DEC)
-    if avail < total_price:
-        raise HTTPException(400, f"Insufficient funds. cSOL insufficient and notes available={avail} < total={total_price}")
-
-    notes = ca.list_unspent_notes_for_recipient(st, buyer_pub)
-    chosen, total_selected = ca.greedy_coin_select(notes, total_price)
-    if not chosen:
-        raise HTTPException(400, "Coin selection failed; consolidate notes")
-
-    mt = ca.build_merkle(st)
-    root_hex = mt.root().hex()
-    spent_indices: List[int] = []
-    for n in chosen:
-        idx = int(n.get("index", -1))
-        proof = mt.get_proof(idx)
-        if idx < 0 or not verify_merkle(n["commitment"], proof, root_hex):
-            raise HTTPException(400, f"Merkle verification failed for note idx={idx}")
-        spent_indices.append(idx)
-    for n in chosen:
+        ca.save_wrapper_state(st)
         try:
-            nf = ca.make_nullifier(bytes.fromhex(n["note_hex"]))
-            ca.mark_nullifier(st, nf)
-            n["spent"] = True
-            ca.emit("NoteSpent", nullifier=nf, commitment=n["commitment"])
+            ca.emit("MerkleRootUpdated", root_hex=ca.build_merkle(st).root().hex())
         except Exception:
             pass
 
-    change = (Decimal(str(total_selected)) - total_price).quantize(CSOL_DEC, rounding=ROUND_DOWN)
-    buyer_change: Optional[Dict[str, Any]] = None
-    if change > 0:
-        note = secrets.token_bytes(32).hex()
-        nonce = secrets.token_bytes(16).hex()
-        rec = ca.add_note(st, buyer_pub, str(change), note, nonce)
-        buyer_change = {"amount": str(change), "commitment": rec["commitment"], "index": int(rec["index"])}
+        payment_mode = "sol-backed"
 
-    ca.save_wrapper_state(st)
-    new_root = ca.build_merkle(st).root().hex()
-    try:
-        ca.emit("MerkleRootUpdated", root_hex=new_root)
-    except Exception:
-        pass
-
-    _ensure_reserve_has(total_price)
-    csol_sig = ca.csol_transfer_from_reserve(seller_pub, str(total_price))
-
-    _csol_add(seller_pub, total_price)
-
+    # Reduce inventory immediately; listing becomes inactive if qty hits 0
     try:
         ca.listing_update_quantity(seller_pub, req.listing_id, quantity_delta=-qty)
     except Exception:
         _deactivate_listing(req.listing_id)
 
+    # Optional: append encrypted shipping commitment to the shipping log + Merkle
     shipping_commitment = None
     if isinstance(encrypted_shipping_blob, dict):
         try:
@@ -1390,45 +1357,75 @@ def marketplace_buy(req: BuyReq):
         except Exception:
             shipping_commitment = None
 
-    try:
-        reconcile_csol_supply()
-    except Exception:
-        pass
+    # ----- Open the ESCROW right here (status=PENDING) -----
+    amount_str = ca.fmt_amt(total_price)
+    note_hex, nonce_hex, commitment_hex = _mk_escrow_commitment(amount_str, seller_pub)
+    leaf_index = _escrow_append_leaf(commitment_hex)
 
+    st_esc = _escrow_state()
+    escrow_id = secrets.token_hex(16)
+    now = _utcnow_iso()
+    escrow_record = {
+        "id": escrow_id,
+        "buyer_pub": buyer_pub,
+        "seller_pub": seller_pub,
+        "amount_sol": amount_str,
+        "status": "PENDING",
+        "details_ct": None,  # you could also stuff a tiny encrypted order note here if desired
+        "listing_id": req.listing_id,
+        "quantity": qty,
+        "commitment": commitment_hex,
+        "leaf_index": int(leaf_index),
+        "note_hex": note_hex,
+        "nonce_hex": nonce_hex,
+        "created_at": now,
+        "updated_at": now,
+        # ---- internal helpers for settlement later (kept in raw record; not part of schema) ----
+        "payment_mode": payment_mode,  # "csol" | "sol-backed"
+        "held_csol": str(total_price) if payment_mode == "csol" else "0",
+        "spent_note_indices": spent_note_indices if payment_mode == "sol-backed" else [],
+    }
+    st_esc["escrows"].append(escrow_record)
+    _escrow_save(st_esc)
+    _escrow_rebuild_root()
+
+    # Emit a consolidated event for observability
     try:
         ca.emit(
             "ListingSold",
             listing_id=req.listing_id,
-            payment="sol-backed",
+            payment=payment_mode,  # now "csol" OR "sol-backed" escrow
             price=str(total_price),
             unit_price=str(unit_price),
             quantity=qty,
             buyer=buyer_pub,
             seller=seller_pub,
-            spent_note_indices=spent_indices,
+            spent_note_indices=(spent_note_indices or None),
             buyer_change=buyer_change,
-            csol_sig=csol_sig,
             order_id=(shipping_commitment or {}).get("order_id") if shipping_commitment else None,
             shipping_leaf=(shipping_commitment or {}).get("leaf") if shipping_commitment else None,
             shipping_root=(shipping_commitment or {}).get("root") if shipping_commitment else None,
             shipping_index=(shipping_commitment or {}).get("index") if shipping_commitment else None,
             shipping_proof=(shipping_commitment or {}).get("proof") if shipping_commitment else None,
+            escrow_id=escrow_id,
         )
     except Exception:
         pass
 
+    # Return legacy buy response (no immediate csol_tx_signature, since funds are escrowed)
     return BuyRes(
         ok=True,
         listing_id=req.listing_id,
-        payment="sol-backed",
+        payment=payment_mode,
         price=str(total_price),
         buyer_pub=buyer_pub,
         seller_pub=seller_pub,
-        spent_note_indices=spent_indices,
+        spent_note_indices=(spent_note_indices or None),
         buyer_change=buyer_change,
-        csol_tx_signature=csol_sig,
-        new_merkle_root=new_root,
+        new_merkle_root=None,  # buyer change root already emitted above; omit here
+        escrow_id=escrow_id,  
     )
+
 
 # ------------- Shipping Endpoints (no DB) -------------
 @app.post("/shipping/put")
@@ -1967,3 +1964,245 @@ def profiles_resolve_pub(pub: str):
         root=root_hex,
     )
 
+# =========================
+# Escrow (Encrypted + Merkle) helpers
+# =========================
+
+def _utcnow_iso() -> str:
+    from datetime import timezone
+    return datetime.now(timezone.utc).isoformat()
+
+def _json_load(path: str, default: dict) -> dict:
+    try:
+        if os.path.exists(path):
+            return json.loads(pathlib.Path(path).read_text())
+    except Exception:
+        pass
+    return default
+
+def _json_save(path: str, obj: dict) -> None:
+    tmp = path + ".tmp"
+    try:
+        pathlib.Path(tmp).write_text(json.dumps(obj, indent=2))
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+def _escrow_state() -> dict:
+    return _json_load(ESCROW_STATE_PATH, {"escrows": [], "nullifiers": []})
+
+def _escrow_save(st: dict) -> None:
+    _json_save(ESCROW_STATE_PATH, st)
+
+def _escrow_merkle() -> dict:
+    return _json_load(ESCROW_MERKLE_PATH, {"leaves": [], "root": ""})
+
+def _escrow_merkle_save(ms: dict) -> None:
+    _json_save(ESCROW_MERKLE_PATH, ms)
+
+def _escrow_rebuild_root() -> str:
+    ms = _escrow_merkle()
+    mt = MerkleTree(ms.get("leaves", []))
+    if not getattr(mt, "layers", None) and getattr(mt, "leaf_bytes", None):
+        mt.build_tree()
+    root = mt.root().hex() if hasattr(mt.root(), "hex") else (mt.root() or "")
+    ms["root"] = root
+    _escrow_merkle_save(ms)
+    return root
+
+def _escrow_find(st: dict, escrow_id: str) -> Optional[dict]:
+    for e in st.get("escrows", []):
+        if e.get("id") == escrow_id:
+            return e
+    return None
+
+def _escrow_append_leaf(commitment_hex: str) -> int:
+    ms = _escrow_merkle()
+    leaves = list(ms.get("leaves") or [])
+    leaves.append(commitment_hex)
+    ms["leaves"] = leaves
+    _escrow_merkle_save(ms)
+    return len(leaves) - 1
+
+def _mk_escrow_commitment(amount_str: str, seller_pub: str):
+    """
+    Uses your existing commitment primitive from cli_adapter (ca.*).
+    """
+    note = secrets.token_bytes(32)
+    nonce = secrets.token_bytes(24)  # long nonce ok (we only store hex)
+    commitment = ca.make_commitment(note, amount_str, nonce, seller_pub)
+    return note.hex(), nonce.hex(), commitment
+
+def _escrow_transition(cur: str, action: str, actor_pub: str, buyer_pub: str, seller_pub: str) -> str:
+    action = action.upper()
+
+    # Normalize allowed-from states
+    if action == "RELEASE":
+        # Only the buyer can release funds to the seller
+        if actor_pub != buyer_pub:
+            raise HTTPException(403, "Only the buyer can RELEASE funds.")
+        if cur not in ("PENDING", "REFUND_REQUESTED", "DISPUTED"):
+            raise HTTPException(400, f"Cannot RELEASE from {cur}.")
+        return "RELEASED"
+
+    if action == "REFUND_REQUEST":
+        # Buyer asks for a refund (no funds move yet)
+        if actor_pub != buyer_pub:
+            raise HTTPException(403, "Only the buyer can request a refund.")
+        if cur != "PENDING":
+            raise HTTPException(400, f"Cannot REFUND_REQUEST from {cur}.")
+        return "REFUND_REQUESTED"
+
+    if action == "REFUND":
+        # Only the seller can issue the refund
+        if actor_pub != seller_pub:
+            raise HTTPException(403, "Only the seller can REFUND.")
+        if cur not in ("PENDING", "REFUND_REQUESTED", "DISPUTED"):
+            raise HTTPException(400, f"Cannot REFUND from {cur}.")
+        return "REFUNDED"
+
+    if action == "DISPUTE":
+        # Either party can raise a dispute while not terminal
+        if actor_pub not in (buyer_pub, seller_pub):
+            raise HTTPException(403, "Only buyer or seller can DISPUTE.")
+        if cur not in ("PENDING", "REFUND_REQUESTED"):
+            raise HTTPException(400, f"Cannot DISPUTE from {cur}.")
+        return "DISPUTED"
+
+    if action == "CANCEL":
+        # Allow either party to cancel while still pending (adjust policy if needed)
+        if actor_pub not in (buyer_pub, seller_pub):
+            raise HTTPException(403, "Only buyer or seller can CANCEL.")
+        if cur != "PENDING":
+            raise HTTPException(400, f"Cannot CANCEL from {cur}.")
+        return "CANCELLED"
+
+    raise HTTPException(400, f"Unknown action {action}")
+
+
+# =========================
+# Escrow (Encrypted + Merkle) endpoints
+# =========================
+
+@app.get("/escrow/merkle/status", response_model=EscrowMerkleStatus)
+def escrow_merkle_status():
+    ms = _escrow_merkle()
+    root = _escrow_rebuild_root()
+    return EscrowMerkleStatus(escrow_leaves=len(ms.get("leaves", [])), escrow_root_hex=root)
+
+@app.get("/escrow/list", response_model=EscrowListRes)
+def escrow_list(
+    party_pub: Optional[str] = None,
+    role: Optional[str] = None,         # "buyer" | "seller"
+    status: Optional[str] = None,
+):
+    st = _escrow_state()
+    items = list(st.get("escrows", []))
+    if party_pub and role in ("buyer", "seller"):
+        key = "buyer_pub" if role == "buyer" else "seller_pub"
+        items = [e for e in items if e.get(key) == party_pub]
+    elif party_pub:
+        items = [e for e in items if e.get("buyer_pub") == party_pub or e.get("seller_pub") == party_pub]
+    if status:
+        items = [e for e in items if e.get("status") == status]
+    return EscrowListRes(items=[EscrowRecord(**e) for e in items])
+
+@app.get("/escrow/_debug_state")
+def escrow_debug_state():
+    """Return raw escrow state for diagnostics."""
+    return _escrow_state()
+
+@app.post("/escrow", response_model=EscrowOpenRes)
+def escrow_open(req: EscrowOpenReq):
+    # amount as string with your canonical quantization
+    amount_str = str(Decimal(str(req.amount_sol)).quantize(CSOL_DEC))
+    note_hex, nonce_hex, commitment_hex = _mk_escrow_commitment(amount_str, req.seller_pub)
+    leaf_index = _escrow_append_leaf(commitment_hex)
+
+    st = _escrow_state()
+    escrow_id = secrets.token_hex(16)
+    now = _utcnow_iso()
+    record = {
+        "id": escrow_id,
+        # In your app you often use keyfile to resolve pub; keep consistent with buyer identity you pass in
+        "buyer_pub": ca.get_pubkey_from_keypair(req.buyer_keyfile) if os.path.exists(req.buyer_keyfile) else req.buyer_keyfile,
+        "seller_pub": req.seller_pub,
+        "amount_sol": amount_str,
+        "status": "PENDING",
+        "details_ct": req.details_ct.dict() if req.details_ct else None,
+        "listing_id": req.listing_id,
+        "quantity": int(req.quantity) if req.quantity else None,
+        "commitment": commitment_hex,
+        "leaf_index": int(leaf_index),
+        "note_hex": note_hex,   # kept server-side to derive nullifier on terminal states
+        "nonce_hex": nonce_hex,
+        "created_at": now,
+        "updated_at": now,
+    }
+    st["escrows"].append(record)
+    _escrow_save(st)
+    _escrow_rebuild_root()
+    return EscrowOpenRes(escrow=EscrowRecord(**record))
+
+@app.post("/escrow/{escrow_id}/action", response_model=EscrowActionRes)
+def escrow_action(escrow_id: str, req: EscrowActionReq):
+    st = _escrow_state()
+    e = _escrow_find(st, escrow_id)
+    if not e:
+        raise HTTPException(404, "Escrow not found")
+
+    # Resolve actor to pubkey (keyfile path or raw pubkey)
+    actor_pub = (
+        ca.get_pubkey_from_keypair(req.actor_keyfile)
+        if os.path.exists(req.actor_keyfile)
+        else req.actor_keyfile
+    )
+
+    # Enforce role-based transition
+    new_status = _escrow_transition(
+        e["status"], req.action, actor_pub, e["buyer_pub"], e["seller_pub"]
+    )
+
+    # Settlement logic (unchanged)...
+    buyer_pub = e["buyer_pub"]
+    seller_pub = e["seller_pub"]
+    amt = Decimal(str(e["amount_sol"])).quantize(CSOL_DEC)
+    payment_mode = str(e.get("payment_mode") or "csol")
+
+    if new_status == "RELEASED":
+        if payment_mode == "csol":
+            _csol_add(seller_pub, amt)
+        else:
+            _ensure_reserve_has(amt)
+            csol_sig = ca.csol_transfer_from_reserve(seller_pub, str(amt))
+            try: ca.emit("EscrowReleasedPayout", escrow_id=escrow_id, csol_sig=csol_sig, amount=str(amt))
+            except Exception: pass
+
+    elif new_status in ("REFUNDED", "CANCELLED"):
+        if payment_mode == "csol":
+            _csol_add(buyer_pub, amt)
+        else:
+            stw = ca.load_wrapper_state()
+            note = secrets.token_bytes(32).hex()
+            nonce = secrets.token_bytes(16).hex()
+            ca.add_note(stw, buyer_pub, ca.fmt_amt(amt), note, nonce)
+            ca.save_wrapper_state(stw)
+            try: ca.emit("MerkleRootUpdated", root_hex=ca.build_merkle(stw).root().hex())
+            except Exception: pass
+
+    # Update record
+    e["status"] = new_status
+    e["updated_at"] = _utcnow_iso()
+    if req.note_ct:
+        e.setdefault("action_notes", []).append(req.note_ct.dict())
+
+    if new_status in ("RELEASED", "REFUNDED", "CANCELLED"):
+        try:
+            nf = ca.make_nullifier(bytes.fromhex(e["note_hex"]))
+            st.setdefault("nullifiers", []).append(nf)
+        except Exception:
+            pass
+
+    _escrow_save(st)
+    _escrow_rebuild_root()
+    return EscrowActionRes(escrow=EscrowRecord(**e))

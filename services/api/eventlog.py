@@ -46,6 +46,36 @@ CREATE TABLE IF NOT EXISTS metrics(
   spent_count INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL
 );
+
+-- ===== Escrow additions =====
+
+-- Latest known state for each escrow id (for quick dashboards)
+CREATE TABLE IF NOT EXISTS escrow_state(
+  escrow_id   TEXT PRIMARY KEY,
+  status      TEXT NOT NULL,
+  buyer_pub   TEXT NOT NULL,
+  seller_pub  TEXT NOT NULL,
+  amount_sol  TEXT NOT NULL,
+  commitment  TEXT NOT NULL,
+  leaf_index  INTEGER,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+);
+
+-- Append-only history for escrow actions & open events
+CREATE TABLE IF NOT EXISTS escrow_log(
+  id         TEXT PRIMARY KEY,
+  escrow_id  TEXT NOT NULL,
+  ts         TEXT NOT NULL,
+  action     TEXT NOT NULL,
+  payload    TEXT NOT NULL
+);
+
+-- Simple KV store (e.g., latest Escrow Merkle root)
+CREATE TABLE IF NOT EXISTS kv(
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 """
 
 
@@ -153,6 +183,13 @@ def _touch_metrics(cx: sqlite3.Connection, epoch: int) -> None:
     cx.execute("UPDATE metrics SET updated_at=? WHERE epoch=?", (now, epoch))
 
 
+def _kv_set(cx: sqlite3.Connection, key: str, value: str) -> None:
+    cx.execute(
+        "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
 def apply_event_row(cx: sqlite3.Connection, kind: str, payload: Dict[str, Any]) -> None:
     # --- Notes lifecycle (existing) ---
     if kind == "NoteIssued":
@@ -184,15 +221,99 @@ def apply_event_row(cx: sqlite3.Connection, kind: str, payload: Dict[str, Any]) 
         cx.execute("UPDATE metrics SET spent_count = spent_count + 1 WHERE epoch=?", (epoch,))
         return
 
-    # --- Known informational/no-op events (existing) ---
-    if kind in ("PoolStealthAdded", "CSOLConverted", "SweepDone", "MerkleRootUpdated"):
+    # --- Escrow events (NEW) ---
+    if kind == "EscrowOpened":
+        # Accept either a flat payload or {escrow:{...}}
+        esc = payload.get("escrow") or payload
+        escrow_id = esc.get("id") or esc.get("escrow_id")
+        if not escrow_id:
+            raise ValueError("EscrowOpened missing escrow id")
+
+        # Upsert state
+        cx.execute(
+            """
+            INSERT INTO escrow_state(escrow_id,status,buyer_pub,seller_pub,amount_sol,commitment,leaf_index,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(escrow_id) DO UPDATE SET
+              status=excluded.status,
+              buyer_pub=excluded.buyer_pub,
+              seller_pub=excluded.seller_pub,
+              amount_sol=excluded.amount_sol,
+              commitment=excluded.commitment,
+              leaf_index=excluded.leaf_index,
+              created_at=excluded.created_at,
+              updated_at=excluded.updated_at
+            """,
+            (
+                escrow_id,
+                esc.get("status") or "PENDING",
+                esc["buyer_pub"],
+                esc["seller_pub"],
+                str(esc.get("amount_sol")),
+                esc["commitment"],
+                int(esc.get("leaf_index") or -1),
+                esc.get("created_at") or payload.get("ts") or _now(),
+                esc.get("updated_at") or payload.get("ts") or _now(),
+            ),
+        )
+        # History row
+        cx.execute(
+            "INSERT OR IGNORE INTO escrow_log(id,escrow_id,ts,action,payload) VALUES(?,?,?,?,?)",
+            (
+                payload.get("event_id") or str(uuid.uuid4()),
+                escrow_id,
+                payload.get("ts") or _now(),
+                "OPENED",
+                json.dumps(esc, separators=(",", ":")),
+            ),
+        )
         return
 
-    # --- New profile/stealth events (no-op persistence; recorded in tx_log for replay/observability) ---
-    # Payloads expected (by convention from API layer):
-    # - ProfileRegistered: { leaf, index, root, blob, ts, ... }
-    # - ProfilesMerkleRootUpdated: { root_hex, ts, ... }
-    # - StealthMarkedUsed: { stealth_pub, reason, ts, ... }
+    if kind == "EscrowAction":
+        escrow_id = payload.get("escrow_id") or (payload.get("escrow") or {}).get("id")
+        if not escrow_id:
+            raise ValueError("EscrowAction missing escrow_id")
+
+        new_status = payload.get("new_status") or (payload.get("escrow") or {}).get("status")
+        action = payload.get("action") or "ACTION"
+        ts = payload.get("ts") or _now()
+
+        cx.execute(
+            "UPDATE escrow_state SET status=?, updated_at=? WHERE escrow_id=?",
+            (new_status or "PENDING", ts, escrow_id),
+        )
+        cx.execute(
+            "INSERT OR IGNORE INTO escrow_log(id,escrow_id,ts,action,payload) VALUES(?,?,?,?,?)",
+            (
+                payload.get("event_id") or str(uuid.uuid4()),
+                escrow_id,
+                ts,
+                action,
+                json.dumps(payload, separators=(",", ":")),
+            ),
+        )
+        return
+
+    if kind == "EscrowMerkleRootUpdated":
+        root_hex = payload.get("root_hex") or payload.get("root")
+        if root_hex:
+            _kv_set(cx, "escrow_merkle_root", root_hex)
+        return
+
+    # --- Known informational/no-op events (existing & misc marketplace/shipping) ---
+    if kind in (
+        "PoolStealthAdded",
+        "CSOLConverted",
+        "SweepDone",
+        "MerkleRootUpdated",
+        "ListingSold",
+        "ListingCreated",
+        "ListingUpdated",
+        "ListingDeleted",
+    ):
+        return
+
+    # --- Profile/stealth events (no-op persistence; recorded in tx_log for replay/observability) ---
     if kind in ("ProfileRegistered", "ProfilesMerkleRootUpdated", "StealthMarkedUsed"):
         return
 
@@ -220,6 +341,8 @@ def replay() -> int:
         cx.execute("DELETE FROM notes")
         cx.execute("DELETE FROM nullifiers")
         cx.execute("DELETE FROM metrics")
+        cx.execute("DELETE FROM escrow_state")
+        cx.execute("DELETE FROM escrow_log")
         rows: Iterable[Tuple[str, str]] = cx.execute(
             "SELECT kind, payload FROM tx_log ORDER BY ts ASC, id ASC"
         ).fetchall()
@@ -238,13 +361,10 @@ def metrics_all() -> List[Tuple[int, int, int, str]]:
         ).fetchall()
 
 
-# ---------- Optional typed emit helpers for new events ----------
+# ---------- Optional typed emit helpers ----------
 def emit_profile_registered(
     *, leaf: str, index: int, root: str, blob: Dict[str, Any], ts: str | None = None, event_id: str | None = None
 ) -> str:
-    """
-    Convenience wrapper; purely records the event (no DB side-effects).
-    """
     payload: Dict[str, Any] = {"leaf": leaf, "index": index, "root": root, "blob": blob}
     if ts:
         payload["ts"] = ts
@@ -275,6 +395,72 @@ def emit_stealth_marked_used(
     return append_event("StealthMarkedUsed", **payload)
 
 
+# ===== Escrow typed emitters (NEW) =====
+def emit_escrow_opened(
+    *,
+    escrow_id: str,
+    buyer_pub: str,
+    seller_pub: str,
+    amount_sol: str,
+    commitment: str,
+    leaf_index: int | None = None,
+    status: str = "PENDING",
+    created_at: str | None = None,
+    updated_at: str | None = None,
+    ts: str | None = None,
+    event_id: str | None = None,
+) -> str:
+    esc = {
+        "id": escrow_id,
+        "buyer_pub": buyer_pub,
+        "seller_pub": seller_pub,
+        "amount_sol": amount_sol,
+        "commitment": commitment,
+        "leaf_index": leaf_index,
+        "status": status,
+        "created_at": created_at or ts or _now(),
+        "updated_at": updated_at or ts or _now(),
+    }
+    payload: Dict[str, Any] = {"escrow": esc}
+    if ts:
+        payload["ts"] = ts
+    if event_id:
+        payload["event_id"] = event_id
+    return append_event("EscrowOpened", **payload)
+
+
+def emit_escrow_action(
+    *,
+    escrow_id: str,
+    action: str,
+    new_status: str,
+    ts: str | None = None,
+    note_ct: Dict[str, Any] | None = None,
+    event_id: str | None = None,
+) -> str:
+    payload: Dict[str, Any] = {
+        "escrow_id": escrow_id,
+        "action": action,
+        "new_status": new_status,
+    }
+    if note_ct is not None:
+        payload["note_ct"] = note_ct
+    if ts:
+        payload["ts"] = ts
+    if event_id:
+        payload["event_id"] = event_id
+    return append_event("EscrowAction", **payload)
+
+
+def emit_escrow_merkle_root_updated(*, root_hex: str, ts: str | None = None, event_id: str | None = None) -> str:
+    payload: Dict[str, Any] = {"root_hex": root_hex}
+    if ts:
+        payload["ts"] = ts
+    if event_id:
+        payload["event_id"] = event_id
+    return append_event("EscrowMerkleRootUpdated", **payload)
+
+
 __all__ = [
     "WRAPPER_MERKLE_STATE_PATH",
     "POOL_MERKLE_STATE_PATH",
@@ -290,8 +476,12 @@ __all__ = [
     "append_event",
     "replay",
     "metrics_all",
-    # optional helpers
+    # profile helpers
     "emit_profile_registered",
     "emit_profiles_merkle_root_updated",
     "emit_stealth_marked_used",
+    # escrow helpers
+    "emit_escrow_opened",
+    "emit_escrow_action",
+    "emit_escrow_merkle_root_updated",
 ]
