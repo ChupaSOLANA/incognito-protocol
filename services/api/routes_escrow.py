@@ -1,4 +1,3 @@
-# services/api/routes_escrow.py
 from __future__ import annotations
 
 from fastapi import APIRouter, Query
@@ -6,14 +5,10 @@ from typing import Optional, Literal
 
 from services.api.schemas_api import EscrowListRes
 
-# ---- Importe la même source d'état que /marketplace/buy utilise ----
-# Adapte ces imports selon où vivent tes helpers (_escrow_state)
 try:
-    # recommandé: un petit module escrow_store centralise l'état
     from services.api.escrow_store import escrow_state as _escrow_state
 except Exception:
-    # fallback si _escrow_state est défini dans le même module que marketplace/buy
-    from services.api.routes_marketplace import _escrow_state  # type: ignore
+    from services.api.routes_marketplace import _escrow_state
 
 router = APIRouter()
 
@@ -27,7 +22,7 @@ def escrow_list(
     Liste les escrows où `party_pub` est impliqué (côté buyer ou seller).
     On lit exactement le même store que /marketplace/buy a rempli.
     """
-    st = _escrow_state()  # IMPORTANT: même backing que buy
+    st = _escrow_state()
     items = list(st.get("escrows", []))
 
     if role == "buyer":
@@ -38,7 +33,6 @@ def escrow_list(
     if status:
         items = [e for e in items if e.get("status") == status]
 
-    # Façonne la vue publique (on enlève les champs internes comme payment_mode, note_hex, etc.)
     def _public(e: dict) -> dict:
         return {
             "id": e["id"],

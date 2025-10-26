@@ -1,0 +1,1680 @@
+// /Users/alex/Desktop/ArciumEscrow/escrow/programs/escrow/src/lib.rs
+//
+// ================================================================================================
+// ARCIUM-POWERED ENCRYPTED ESCROW MARKETPLACE
+// ================================================================================================
+//
+// This escrow system demonstrates how to build a privacy-preserving marketplace using Arcium MPC.
+//
+// ## PRIVACY FEATURES
+//
+// ### Current Implementation (Baseline Escrow):
+// - ✅ Secure fund custody via Solana PDAs
+// - ✅ State machine for order flow (Created → Accepted → Shipped → Delivered → Completed)
+// - ✅ Dispute resolution with arbiter system
+// - ✅ Reputation tracking
+// - ⚠️  All data is PUBLIC on-chain (amounts, addresses, states)
+//
+// ### MPC-Enhanced Privacy (Demonstrated Here):
+// - 🔐 **Private Reputation Scores**: Calculate reputation without revealing detailed stats
+// - 🔐 **Encrypted Shipping Addresses**: (Framework ready, integration needed)
+// - 🔐 **Private Amount Calculations**: (Framework ready, integration needed)
+//
+// ## HOW TO USE MPC FUNCTIONS
+//
+// ### Step 1: Initialize Computation Definitions (One-time Setup)
+// ```rust
+// // Call these once to set up MPC functions
+// init_encrypt_shipping_comp_def()
+// init_reputation_calc_comp_def()
+// ```
+//
+// ### Step 2: Queue MPC Computations
+// ```rust
+// // Encrypt user data client-side using MXE public key
+// let encrypted_data = encrypt_with_mxe_pubkey(plaintext);
+//
+// // Queue the computation
+// calculate_reputation_private(
+//     computation_offset,
+//     encrypted_stats, // [total, successful, won, lost]
+//     pub_key,
+//     nonce
+// )
+// ```
+//
+// ### Step 3: Handle Callbacks
+// ```rust
+// // MPC network processes computation and calls callback
+// calculate_reputation_private_callback(output) {
+//     // Receives encrypted result
+//     // Store or emit for authorized parties
+// }
+// ```
+//
+// ## PRIVACY MODEL
+//
+// - **What's Encrypted**: Reputation stats, sensitive calculations
+// - **What's Public**: Order states, participant addresses (PDAs), dispute existence
+// - **Who Can Decrypt**: Only authorized parties with proper keys
+// - **MPC Network Role**: Performs computations without seeing plaintext
+//
+// ## PRODUCTION CONSIDERATIONS
+//
+// To make this production-ready for a fully private marketplace:
+//
+// 1. **Encrypt All Sensitive Data**:
+//    - Order amounts (use homomorphic encryption or commitments)
+//    - Shipping addresses (encrypt before storing)
+//    - Fee calculations (compute via MPC)
+//
+// 2. **Implement Zero-Knowledge Proofs**:
+//    - Prove sufficient balance without revealing amount
+//    - Prove reputation threshold without revealing score
+//
+// 3. **Key Management**:
+//    - Secure client-side key generation
+//    - Proper key rotation
+//    - Backup/recovery mechanisms
+//
+// 4. **Selective Disclosure**:
+//    - Arbiter can decrypt only during disputes
+//    - Platform sees only aggregate statistics
+//    - Users control their data visibility
+//
+// 5. **Auditing & Compliance**:
+//    - Encrypted audit logs
+//    - Regulatory compliance through controlled decryption
+//    - Dispute evidence handling
+//
+// ================================================================================================
+
+use anchor_lang::prelude::*;
+use anchor_spl::{
+    associated_token::AssociatedToken,
+    token_2022::{self, Token2022, TransferChecked},
+};
+use arcium_anchor::prelude::*;
+
+// Computation definition offsets for all encrypted instructions
+const COMP_DEF_OFFSET_ENCRYPT_SHIPPING: u32 = comp_def_offset("encrypt_shipping_address");
+const COMP_DEF_OFFSET_CALC_REPUTATION: u32 = comp_def_offset("calculate_reputation_score");
+const COMP_DEF_OFFSET_VERIFY_AMOUNT: u32 = comp_def_offset("verify_escrow_amount");
+const COMP_DEF_OFFSET_CALC_STAKE: u32 = comp_def_offset("calculate_seller_stake");
+const COMP_DEF_OFFSET_CALC_FEE: u32 = comp_def_offset("calculate_platform_fee");
+const COMP_DEF_OFFSET_CALC_REFUND: u32 = comp_def_offset("calculate_refund_amount");
+
+const CSOL_DECIMALS: u8 = 9;
+
+declare_id!("5QvQbnrL7fKpM5pCMS3zNqgTK8ALNkgHgRvgd49YF7v4");
+
+#[arcium_program]
+pub mod escrow {
+    use super::*;
+
+    // ==================== MPC COMPUTATION INITIALIZATION ====================
+
+    /// Initialize the shipping address encryption computation definition
+    pub fn init_encrypt_shipping_comp_def(ctx: Context<InitEncryptShippingCompDef>) -> Result<()> {
+        init_comp_def(ctx.accounts, true, 0, None, None)?;
+        Ok(())
+    }
+
+    /// Initialize the reputation score calculation computation definition
+    pub fn init_reputation_calc_comp_def(ctx: Context<InitReputationCalcCompDef>) -> Result<()> {
+        init_comp_def(ctx.accounts, true, 0, None, None)?;
+        Ok(())
+    }
+
+    // ==================== PLATFORM INITIALIZATION ====================
+
+    pub fn initialize_platform(
+        ctx: Context<InitializePlatform>,
+        treasury: Pubkey,
+    ) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        config.authority = ctx.accounts.authority.key();
+        config.treasury = treasury;
+        config.platform_fee_bps = 200; // 2%
+        config.seller_stake_bps = 1000; // 10%
+        config.acceptance_deadline = 86400; // 24 hours
+        config.shipping_deadline = 604800; // 7 days
+        config.delivery_deadline = 1209600; // 14 days
+        config.dispute_window = 604800; // 7 days
+        config.arbiter_deadline = 259200; // 3 days
+        config.bump = ctx.bumps.config;
+        Ok(())
+    }
+
+    pub fn initialize_arbiter_pool(ctx: Context<InitializeArbiterPool>) -> Result<()> {
+        let pool = &mut ctx.accounts.arbiter_pool;
+        pool.authority = ctx.accounts.authority.key();
+        pool.arbiters = Vec::new();
+        pool.arbiter_stakes = Vec::new();
+        pool.bump = ctx.bumps.arbiter_pool;
+        Ok(())
+    }
+
+    pub fn add_arbiter(
+        ctx: Context<AddArbiter>,
+        arbiter: Pubkey,
+        stake: u64,
+    ) -> Result<()> {
+        let pool = &mut ctx.accounts.arbiter_pool;
+        
+        require!(
+            ctx.accounts.authority.key() == pool.authority,
+            ErrorCode::Unauthorized
+        );
+        require!(stake > 0, ErrorCode::InvalidAmount);
+        require!(
+            !pool.arbiters.contains(&arbiter),
+            ErrorCode::ArbiterAlreadyExists
+        );
+
+        pool.arbiters.push(arbiter);
+        pool.arbiter_stakes.push(stake);
+        Ok(())
+    }
+
+    // ==================== ESCROW CORE FLOW ====================
+
+    /// Create a new escrow order with privacy features
+    ///
+    /// PRIVACY MODEL:
+    /// - `amount`: Must be plaintext (Solana requires exact lamports for transfers)
+    /// - `amount_commitment`: Optional hash for off-chain privacy verification
+    /// - `encrypted_shipping`: MPC-encrypted shipping address (only seller can decrypt)
+    /// - `use_private_reputation`: Flag to calculate reputation privately via MPC
+    pub fn create_order(
+        ctx: Context<CreateOrder>,
+        amount: u64,
+        order_id: u64,
+        encrypted_shipping: Vec<u8>,
+        shipping_nonce: [u8; 16],
+        amount_commitment: Option<[u8; 32]>,
+        use_private_reputation: bool,
+    ) -> Result<()> {
+        require!(amount > 0, ErrorCode::InvalidAmount);
+        require!(
+            encrypted_shipping.len() <= 256,
+            ErrorCode::ShippingDataTooLarge
+        );
+        require!(
+            ctx.accounts.arbiter_pool.arbiters.len() > 0,
+            ErrorCode::NoArbitersAvailable
+        );
+
+        let config = &ctx.accounts.config;
+        let escrow = &mut ctx.accounts.escrow;
+        let clock = Clock::get()?;
+
+        let platform_fee = (amount * config.platform_fee_bps as u64) / 10000;
+        let total_required = amount + platform_fee;
+
+        // ===== CONFIDENTIAL TRANSFER: buyer → escrow (cSOL) =====
+        let cpi_accounts = TransferChecked {
+            from: ctx.accounts.buyer_ata.to_account_info(),
+            mint: ctx.accounts.csol_mint.to_account_info(),
+            to: ctx.accounts.escrow_ata.to_account_info(),
+            authority: ctx.accounts.buyer.to_account_info(),
+        };
+
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+
+        token_2022::transfer_checked(cpi_ctx, total_required, CSOL_DECIMALS)?;
+
+        let arbiter_index = (clock.unix_timestamp as usize) % ctx.accounts.arbiter_pool.arbiters.len();
+        let arbiter = ctx.accounts.arbiter_pool.arbiters[arbiter_index];
+
+        escrow.buyer = ctx.accounts.buyer.key();
+        escrow.seller = Pubkey::default();
+        escrow.arbiter = arbiter;
+        escrow.amount = amount;
+        escrow.seller_stake = 0;
+        escrow.platform_fee = platform_fee;
+        escrow.amount_commitment = amount_commitment.unwrap_or([0u8; 32]);
+        escrow.state = EscrowState::Created;
+        escrow.bump = ctx.bumps.escrow;
+        escrow.created_at = clock.unix_timestamp;
+        escrow.accepted_at = 0;
+        escrow.shipped_at = 0;
+        escrow.delivered_at = 0;
+        escrow.dispute_opened_at = 0;
+        escrow.encrypted_shipping = encrypted_shipping;
+        escrow.shipping_encryption_nonce = shipping_nonce;
+        escrow.tracking_number = String::new();
+        escrow.dispute_reason = String::new();
+        escrow.use_private_reputation = use_private_reputation;
+        escrow.csol_mint = ctx.accounts.csol_mint.key();
+        escrow.escrow_ata = ctx.accounts.escrow_ata.key();
+
+        if ctx.accounts.buyer_reputation.to_account_info().data_is_empty() {
+            let buyer_rep = &mut ctx.accounts.buyer_reputation;
+            buyer_rep.user = ctx.accounts.buyer.key();
+            buyer_rep.total_orders = 0;
+            buyer_rep.successful_orders = 0;
+            buyer_rep.disputes_opened = 0;
+            buyer_rep.disputes_won = 0;
+            buyer_rep.disputes_lost = 0;
+            buyer_rep.reputation_score = 500;
+            buyer_rep.bump = ctx.bumps.buyer_reputation;
+        }
+
+        emit!(OrderCreatedEvent {
+            order_id,
+            buyer: ctx.accounts.buyer.key(),
+            amount,
+            arbiter,
+        });
+
+        Ok(())
+    }
+
+    pub fn accept_order(ctx: Context<AcceptOrder>) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        let config = &ctx.accounts.config;
+        let clock = Clock::get()?;
+
+        require!(
+            escrow.state == EscrowState::Created,
+            ErrorCode::InvalidState
+        );
+
+        let deadline = escrow.created_at + config.acceptance_deadline;
+        require!(
+            clock.unix_timestamp <= deadline,
+            ErrorCode::DeadlineExpired
+        );
+
+        let seller_stake = (escrow.amount * config.seller_stake_bps as u64) / 10000;
+
+        // ===== CONFIDENTIAL TRANSFER: seller → escrow (stake) =====
+        let cpi_accounts = TransferChecked {
+            from: ctx.accounts.seller_ata.to_account_info(),
+            mint: ctx.accounts.csol_mint.to_account_info(),
+            to: ctx.accounts.escrow_ata.to_account_info(),
+            authority: ctx.accounts.seller.to_account_info(),
+        };
+
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+
+        token_2022::transfer_checked(cpi_ctx, seller_stake, CSOL_DECIMALS)?;
+
+        escrow.seller = ctx.accounts.seller.key();
+        escrow.seller_stake = seller_stake;
+        escrow.state = EscrowState::Accepted;
+        escrow.accepted_at = clock.unix_timestamp;
+
+        if ctx.accounts.seller_reputation.to_account_info().data_is_empty() {
+            let seller_rep = &mut ctx.accounts.seller_reputation;
+            seller_rep.user = ctx.accounts.seller.key();
+            seller_rep.total_orders = 0;
+            seller_rep.successful_orders = 0;
+            seller_rep.disputes_opened = 0;
+            seller_rep.disputes_won = 0;
+            seller_rep.disputes_lost = 0;
+            seller_rep.reputation_score = 500;
+            seller_rep.bump = ctx.bumps.seller_reputation;
+        }
+
+        emit!(OrderAcceptedEvent {
+            buyer: escrow.buyer,
+            seller: ctx.accounts.seller.key(),
+            amount: escrow.amount,
+        });
+
+        Ok(())
+    }
+
+    pub fn mark_shipped(
+        ctx: Context<MarkShipped>,
+        tracking_number: String,
+    ) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        let config = &ctx.accounts.config;
+        let clock = Clock::get()?;
+
+        // Validate state
+        require!(
+            escrow.state == EscrowState::Accepted,
+            ErrorCode::InvalidState
+        );
+
+        // Validate seller
+        require!(
+            ctx.accounts.seller.key() == escrow.seller,
+            ErrorCode::Unauthorized
+        );
+
+        // Check deadline
+        let deadline = escrow.accepted_at + config.shipping_deadline;
+        require!(
+            clock.unix_timestamp <= deadline,
+            ErrorCode::DeadlineExpired
+        );
+
+        // Validate tracking
+        require!(
+            tracking_number.len() > 0 && tracking_number.len() <= 64,
+            ErrorCode::InvalidTracking
+        );
+
+        // Update escrow
+        escrow.tracking_number = tracking_number.clone();
+        escrow.state = EscrowState::Shipped;
+        escrow.shipped_at = clock.unix_timestamp;
+
+        emit!(OrderShippedEvent {
+            buyer: escrow.buyer,
+            seller: escrow.seller,
+            tracking_number,
+        });
+
+        Ok(())
+    }
+
+    pub fn confirm_delivery(ctx: Context<ConfirmDelivery>) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        let clock = Clock::get()?;
+
+        // Validate state
+        require!(
+            escrow.state == EscrowState::Shipped,
+            ErrorCode::InvalidState
+        );
+
+        // Validate buyer
+        require!(
+            ctx.accounts.buyer.key() == escrow.buyer,
+            ErrorCode::Unauthorized
+        );
+
+        // Update escrow
+        escrow.state = EscrowState::Delivered;
+        escrow.delivered_at = clock.unix_timestamp;
+
+        emit!(OrderDeliveredEvent {
+            buyer: escrow.buyer,
+            seller: escrow.seller,
+        });
+
+        Ok(())
+    }
+
+    /// Finalize order after dispute window passes
+    ///
+    /// PRIVACY: If escrow.use_private_reputation = true, reputation updates should
+    /// be done via MPC using calculate_reputation_private() in a separate transaction.
+    /// This function updates stats but reputation scores should be computed privately.
+    pub fn finalize_order(ctx: Context<FinalizeOrder>) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        let config = &ctx.accounts.config;
+        let clock = Clock::get()?;
+
+        require!(
+            escrow.state == EscrowState::Delivered,
+            ErrorCode::InvalidState
+        );
+
+        let deadline = escrow.delivered_at + config.dispute_window;
+        require!(
+            clock.unix_timestamp > deadline,
+            ErrorCode::DeadlineNotReached
+        );
+
+        let to_seller = escrow.amount - escrow.platform_fee + escrow.seller_stake;
+        let to_platform = escrow.platform_fee;
+
+        let escrow_seeds = &[
+            b"escrow",
+            escrow.buyer.as_ref(),
+            &escrow.created_at.to_le_bytes(),
+            &[escrow.bump],
+        ];
+        let signer_seeds = &[&escrow_seeds[..]];
+
+        // ===== TRANSFER: escrow → seller =====
+        let cpi_accounts_seller = TransferChecked {
+            from: ctx.accounts.escrow_ata.to_account_info(),
+            mint: ctx.accounts.csol_mint.to_account_info(),
+            to: ctx.accounts.seller_ata.to_account_info(),
+            authority: escrow.to_account_info(),
+        };
+
+        let cpi_ctx_seller = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts_seller,
+            signer_seeds,
+        );
+
+        token_2022::transfer_checked(cpi_ctx_seller, to_seller, CSOL_DECIMALS)?;
+
+        // ===== TRANSFER: escrow → platform =====
+        let cpi_accounts_platform = TransferChecked {
+            from: ctx.accounts.escrow_ata.to_account_info(),
+            mint: ctx.accounts.csol_mint.to_account_info(),
+            to: ctx.accounts.treasury_ata.to_account_info(),
+            authority: escrow.to_account_info(),
+        };
+
+        let cpi_ctx_platform = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts_platform,
+            signer_seeds,
+        );
+
+        token_2022::transfer_checked(cpi_ctx_platform, to_platform, CSOL_DECIMALS)?;
+
+        let buyer_rep = &mut ctx.accounts.buyer_reputation;
+        buyer_rep.total_orders += 1;
+        buyer_rep.successful_orders += 1;
+
+        let seller_rep = &mut ctx.accounts.seller_reputation;
+        seller_rep.total_orders += 1;
+        seller_rep.successful_orders += 1;
+
+        if escrow.use_private_reputation {
+            buyer_rep.reputation_score = 0;
+            seller_rep.reputation_score = 0;
+
+            emit!(PrivateReputationUpdateNeeded {
+                buyer: escrow.buyer,
+                seller: escrow.seller,
+                msg: "Call calculate_reputation_private for both users".to_string(),
+            });
+        } else {
+            update_reputation_score(buyer_rep);
+            update_reputation_score(seller_rep);
+        }
+
+        escrow.state = EscrowState::Completed;
+
+        emit!(OrderCompletedEvent {
+            buyer: escrow.buyer,
+            seller: escrow.seller,
+            amount: escrow.amount,
+        });
+
+        Ok(())
+    }
+
+    pub fn auto_complete(ctx: Context<AutoComplete>) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        let config = &ctx.accounts.config;
+        let clock = Clock::get()?;
+
+        require!(
+            escrow.state == EscrowState::Shipped,
+            ErrorCode::InvalidState
+        );
+
+        let deadline = escrow.shipped_at + config.delivery_deadline;
+        require!(
+            clock.unix_timestamp > deadline,
+            ErrorCode::DeadlineNotReached
+        );
+
+        escrow.state = EscrowState::Delivered;
+        escrow.delivered_at = clock.unix_timestamp;
+
+        let to_seller = escrow.amount - escrow.platform_fee + escrow.seller_stake;
+        let to_platform = escrow.platform_fee;
+
+        let escrow_seeds = &[
+            b"escrow",
+            escrow.buyer.as_ref(),
+            &escrow.created_at.to_le_bytes(),
+            &[escrow.bump],
+        ];
+        let signer_seeds = &[&escrow_seeds[..]];
+
+        // ===== TRANSFER: escrow → seller =====
+        let cpi_accounts_seller = TransferChecked {
+            from: ctx.accounts.escrow_ata.to_account_info(),
+            mint: ctx.accounts.csol_mint.to_account_info(),
+            to: ctx.accounts.seller_ata.to_account_info(),
+            authority: escrow.to_account_info(),
+        };
+
+        let cpi_ctx_seller = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts_seller,
+            signer_seeds,
+        );
+
+        token_2022::transfer_checked(cpi_ctx_seller, to_seller, CSOL_DECIMALS)?;
+
+        // ===== TRANSFER: escrow → platform =====
+        let cpi_accounts_platform = TransferChecked {
+            from: ctx.accounts.escrow_ata.to_account_info(),
+            mint: ctx.accounts.csol_mint.to_account_info(),
+            to: ctx.accounts.treasury_ata.to_account_info(),
+            authority: escrow.to_account_info(),
+        };
+
+        let cpi_ctx_platform = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts_platform,
+            signer_seeds,
+        );
+
+        token_2022::transfer_checked(cpi_ctx_platform, to_platform, CSOL_DECIMALS)?;
+
+        let buyer_rep = &mut ctx.accounts.buyer_reputation;
+        buyer_rep.total_orders += 1;
+        buyer_rep.successful_orders += 1;
+        update_reputation_score(buyer_rep);
+
+        let seller_rep = &mut ctx.accounts.seller_reputation;
+        seller_rep.total_orders += 1;
+        seller_rep.successful_orders += 1;
+        update_reputation_score(seller_rep);
+
+        escrow.state = EscrowState::Completed;
+
+        emit!(OrderAutoCompletedEvent {
+            buyer: escrow.buyer,
+            seller: escrow.seller,
+        });
+
+        Ok(())
+    }
+
+    // ==================== TIMEOUT HANDLERS ====================
+
+    pub fn process_acceptance_timeout(ctx: Context<ProcessAcceptanceTimeout>) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        let config = &ctx.accounts.config;
+        let clock = Clock::get()?;
+
+        require!(
+            escrow.state == EscrowState::Created,
+            ErrorCode::InvalidState
+        );
+
+        let deadline = escrow.created_at + config.acceptance_deadline;
+        require!(
+            clock.unix_timestamp > deadline,
+            ErrorCode::DeadlineNotReached
+        );
+
+        let refund = escrow.amount;
+
+        let escrow_seeds = &[
+            b"escrow",
+            escrow.buyer.as_ref(),
+            &escrow.created_at.to_le_bytes(),
+            &[escrow.bump],
+        ];
+        let signer_seeds = &[&escrow_seeds[..]];
+
+        let cpi_accounts = TransferChecked {
+            from: ctx.accounts.escrow_ata.to_account_info(),
+            mint: ctx.accounts.csol_mint.to_account_info(),
+            to: ctx.accounts.buyer_ata.to_account_info(),
+            authority: escrow.to_account_info(),
+        };
+
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signer_seeds,
+        );
+
+        token_2022::transfer_checked(cpi_ctx, refund, CSOL_DECIMALS)?;
+
+        escrow.state = EscrowState::Refunded;
+
+        emit!(OrderRefundedEvent {
+            buyer: escrow.buyer,
+            amount: refund,
+            reason: "Acceptance timeout".to_string(),
+        });
+
+        Ok(())
+    }
+
+    pub fn process_shipping_timeout(ctx: Context<ProcessShippingTimeout>) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        let config = &ctx.accounts.config;
+        let clock = Clock::get()?;
+
+        require!(
+            escrow.state == EscrowState::Accepted,
+            ErrorCode::InvalidState
+        );
+
+        let deadline = escrow.accepted_at + config.shipping_deadline;
+        require!(
+            clock.unix_timestamp > deadline,
+            ErrorCode::DeadlineNotReached
+        );
+
+        let refund = escrow.amount + escrow.seller_stake;
+
+        let escrow_seeds = &[
+            b"escrow",
+            escrow.buyer.as_ref(),
+            &escrow.created_at.to_le_bytes(),
+            &[escrow.bump],
+        ];
+        let signer_seeds = &[&escrow_seeds[..]];
+
+        let cpi_accounts = TransferChecked {
+            from: ctx.accounts.escrow_ata.to_account_info(),
+            mint: ctx.accounts.csol_mint.to_account_info(),
+            to: ctx.accounts.buyer_ata.to_account_info(),
+            authority: escrow.to_account_info(),
+        };
+
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signer_seeds,
+        );
+
+        token_2022::transfer_checked(cpi_ctx, refund, CSOL_DECIMALS)?;
+
+        let buyer_rep = &mut ctx.accounts.buyer_reputation;
+        buyer_rep.total_orders += 1;
+        buyer_rep.successful_orders += 1;
+        update_reputation_score(buyer_rep);
+
+        let seller_rep = &mut ctx.accounts.seller_reputation;
+        seller_rep.total_orders += 1;
+        seller_rep.disputes_lost += 1;
+        update_reputation_score(seller_rep);
+
+        escrow.state = EscrowState::Refunded;
+
+        emit!(OrderRefundedEvent {
+            buyer: escrow.buyer,
+            amount: refund,
+            reason: "Shipping timeout".to_string(),
+        });
+
+        Ok(())
+    }
+
+    // ==================== DISPUTE SYSTEM ====================
+
+    pub fn open_dispute(
+        ctx: Context<OpenDispute>,
+        reason: String,
+    ) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        let config = &ctx.accounts.config;
+        let clock = Clock::get()?;
+
+        // Validate state
+        require!(
+            escrow.state == EscrowState::Delivered,
+            ErrorCode::InvalidState
+        );
+
+        // Validate buyer
+        require!(
+            ctx.accounts.buyer.key() == escrow.buyer,
+            ErrorCode::Unauthorized
+        );
+
+        // Check within dispute window
+        let deadline = escrow.delivered_at + config.dispute_window;
+        require!(
+            clock.unix_timestamp <= deadline,
+            ErrorCode::DeadlineExpired
+        );
+
+        // Validate reason
+        require!(
+            reason.len() > 0 && reason.len() <= 200,
+            ErrorCode::InvalidReason
+        );
+
+        // Update escrow
+        escrow.dispute_reason = reason.clone();
+        escrow.dispute_opened_at = clock.unix_timestamp;
+        escrow.state = EscrowState::Disputed;
+
+        // Update buyer reputation
+        let buyer_rep = &mut ctx.accounts.buyer_reputation;
+        buyer_rep.disputes_opened += 1;
+
+        emit!(DisputeOpenedEvent {
+            buyer: escrow.buyer,
+            seller: escrow.seller,
+            reason,
+        });
+
+        Ok(())
+    }
+
+    pub fn resolve_dispute(
+        ctx: Context<ResolveDispute>,
+        winner: DisputeWinner,
+    ) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        let config = &ctx.accounts.config;
+        let clock = Clock::get()?;
+
+        // Validate state
+        require!(
+            escrow.state == EscrowState::Disputed,
+            ErrorCode::InvalidState
+        );
+
+        // Validate arbiter
+        require!(
+            ctx.accounts.arbiter.key() == escrow.arbiter,
+            ErrorCode::Unauthorized
+        );
+
+        // Check within arbiter deadline
+        let deadline = escrow.dispute_opened_at + config.arbiter_deadline;
+        require!(
+            clock.unix_timestamp <= deadline,
+            ErrorCode::DeadlineExpired
+        );
+
+        let escrow_seeds = &[
+            b"escrow",
+            escrow.buyer.as_ref(),
+            &escrow.created_at.to_le_bytes(),
+            &[escrow.bump],
+        ];
+        let signer_seeds = &[&escrow_seeds[..]];
+
+        match winner {
+            DisputeWinner::Buyer => {
+                let refund = escrow.amount + escrow.seller_stake;
+
+                // Transfer to buyer
+                let cpi_accounts_buyer = TransferChecked {
+                    from: ctx.accounts.escrow_ata.to_account_info(),
+                    mint: ctx.accounts.csol_mint.to_account_info(),
+                    to: ctx.accounts.buyer_ata.to_account_info(),
+                    authority: escrow.to_account_info(),
+                };
+
+                let cpi_ctx_buyer = CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    cpi_accounts_buyer,
+                    signer_seeds,
+                );
+
+                token_2022::transfer_checked(cpi_ctx_buyer, refund, CSOL_DECIMALS)?;
+
+                // Transfer fee to platform
+                let fee = escrow.platform_fee;
+                let cpi_accounts_platform = TransferChecked {
+                    from: ctx.accounts.escrow_ata.to_account_info(),
+                    mint: ctx.accounts.csol_mint.to_account_info(),
+                    to: ctx.accounts.treasury_ata.to_account_info(),
+                    authority: escrow.to_account_info(),
+                };
+
+                let cpi_ctx_platform = CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    cpi_accounts_platform,
+                    signer_seeds,
+                );
+
+                token_2022::transfer_checked(cpi_ctx_platform, fee, CSOL_DECIMALS)?;
+
+                let buyer_rep = &mut ctx.accounts.buyer_reputation;
+                buyer_rep.total_orders += 1;
+                buyer_rep.disputes_won += 1;
+                update_reputation_score(buyer_rep);
+
+                let seller_rep = &mut ctx.accounts.seller_reputation;
+                seller_rep.total_orders += 1;
+                seller_rep.disputes_lost += 1;
+                update_reputation_score(seller_rep);
+
+                escrow.state = EscrowState::Refunded;
+            }
+            DisputeWinner::Seller => {
+                let payment = escrow.amount - escrow.platform_fee + escrow.seller_stake;
+
+                // Transfer to seller
+                let cpi_accounts_seller = TransferChecked {
+                    from: ctx.accounts.escrow_ata.to_account_info(),
+                    mint: ctx.accounts.csol_mint.to_account_info(),
+                    to: ctx.accounts.seller_ata.to_account_info(),
+                    authority: escrow.to_account_info(),
+                };
+
+                let cpi_ctx_seller = CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    cpi_accounts_seller,
+                    signer_seeds,
+                );
+
+                token_2022::transfer_checked(cpi_ctx_seller, payment, CSOL_DECIMALS)?;
+
+                // Transfer fee to platform
+                let fee = escrow.platform_fee;
+                let cpi_accounts_platform = TransferChecked {
+                    from: ctx.accounts.escrow_ata.to_account_info(),
+                    mint: ctx.accounts.csol_mint.to_account_info(),
+                    to: ctx.accounts.treasury_ata.to_account_info(),
+                    authority: escrow.to_account_info(),
+                };
+
+                let cpi_ctx_platform = CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    cpi_accounts_platform,
+                    signer_seeds,
+                );
+
+                token_2022::transfer_checked(cpi_ctx_platform, fee, CSOL_DECIMALS)?;
+
+                let buyer_rep = &mut ctx.accounts.buyer_reputation;
+                buyer_rep.total_orders += 1;
+                buyer_rep.disputes_lost += 1;
+                update_reputation_score(buyer_rep);
+
+                let seller_rep = &mut ctx.accounts.seller_reputation;
+                seller_rep.total_orders += 1;
+                seller_rep.disputes_won += 1;
+                update_reputation_score(seller_rep);
+
+                escrow.state = EscrowState::Completed;
+            }
+        }
+
+        emit!(DisputeResolvedEvent {
+            buyer: escrow.buyer,
+            seller: escrow.seller,
+            winner: match winner {
+                DisputeWinner::Buyer => "Buyer".to_string(),
+                DisputeWinner::Seller => "Seller".to_string(),
+            },
+        });
+
+        Ok(())
+    }
+
+    // ==================== REPUTATION ====================
+
+    pub fn initialize_reputation(ctx: Context<InitializeReputation>) -> Result<()> {
+        let reputation = &mut ctx.accounts.reputation;
+        reputation.user = ctx.accounts.user.key();
+        reputation.total_orders = 0;
+        reputation.successful_orders = 0;
+        reputation.disputes_opened = 0;
+        reputation.disputes_won = 0;
+        reputation.disputes_lost = 0;
+        reputation.reputation_score = 500;
+        reputation.bump = ctx.bumps.reputation;
+        Ok(())
+    }
+
+    // ==================== MPC-BASED PRIVATE REPUTATION ====================
+
+    /// Queue a private reputation calculation via MPC
+    /// This keeps the detailed stats encrypted and only reveals the final score
+    pub fn calculate_reputation_private(
+        ctx: Context<CalculateReputationPrivate>,
+        computation_offset: u64,
+        encrypted_stats: [[u8; 32]; 4], // encrypted: total, successful, won, lost
+        pub_key: [u8; 32],
+        nonce: u128,
+    ) -> Result<()> {
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+
+        // Queue MPC computation to calculate reputation privately
+        let args = vec![
+            Argument::ArcisPubkey(pub_key),
+            Argument::PlaintextU128(nonce),
+            Argument::EncryptedU8(encrypted_stats[0]), // total_orders
+            Argument::EncryptedU8(encrypted_stats[1]), // successful_orders
+            Argument::EncryptedU8(encrypted_stats[2]), // disputes_won
+            Argument::EncryptedU8(encrypted_stats[3]), // disputes_lost
+        ];
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            None,
+            vec![CalculateReputationScoreCallback::callback_ix(&[])],
+        )?;
+
+        Ok(())
+    }
+
+    /// Callback that receives the privately calculated reputation score
+    #[arcium_callback(encrypted_ix = "calculate_reputation_score")]
+    pub fn calculate_reputation_score_callback(
+        ctx: Context<CalculateReputationScoreCallback>,
+        output: ComputationOutputs<CalculateReputationScoreOutput>,
+    ) -> Result<()> {
+        let encrypted_score = match output {
+            ComputationOutputs::Success(CalculateReputationScoreOutput { field_0 }) => field_0,
+            _ => return Err(ErrorCode::AbortedComputation.into()),
+        };
+
+        emit!(ReputationCalculatedPrivateEvent {
+            encrypted_score: encrypted_score.ciphertexts[0],
+            nonce: encrypted_score.nonce.to_le_bytes(),
+        });
+
+        // In a full implementation, you would:
+        // 1. Store this encrypted score in a PDA
+        // 2. Use it for matchmaking/filtering without revealing exact reputation
+        // 3. Only decrypt for authorized viewers
+
+        Ok(())
+    }
+}
+
+// ==================== ACCOUNT STRUCTS ====================
+
+#[account]
+pub struct PlatformConfig {
+    pub authority: Pubkey,           // 32
+    pub treasury: Pubkey,            // 32
+    pub platform_fee_bps: u16,       // 2
+    pub seller_stake_bps: u16,       // 2
+    pub acceptance_deadline: i64,    // 8
+    pub shipping_deadline: i64,      // 8
+    pub delivery_deadline: i64,      // 8
+    pub dispute_window: i64,         // 8
+    pub arbiter_deadline: i64,       // 8
+    pub bump: u8,                    // 1
+}
+
+#[account]
+pub struct ArbiterPool {
+    pub authority: Pubkey,           // 32
+    pub arbiters: Vec<Pubkey>,       // 4 + (32 * n)
+    pub arbiter_stakes: Vec<u64>,    // 4 + (8 * n)
+    pub bump: u8,                    // 1
+}
+
+#[account]
+pub struct Escrow {
+    pub buyer: Pubkey,               // 32
+    pub seller: Pubkey,              // 32
+    pub arbiter: Pubkey,             // 32
+    pub amount: u64,                 // 8 - Amount in cSOL (smallest units)
+    pub seller_stake: u64,           // 8 - Seller's stake in cSOL
+    pub platform_fee: u64,           // 8 - Platform fee in cSOL
+    pub amount_commitment: [u8; 32], // 32 - Optional: Hash commitment for privacy
+    pub state: EscrowState,          // 1 + size
+    pub bump: u8,                    // 1
+    pub created_at: i64,             // 8
+    pub accepted_at: i64,            // 8
+    pub shipped_at: i64,             // 8
+    pub delivered_at: i64,           // 8
+    pub dispute_opened_at: i64,      // 8
+    pub encrypted_shipping: Vec<u8>, // 4 + 256 - MPC encrypted shipping address
+    pub shipping_encryption_nonce: [u8; 16], // 16 - Nonce for shipping encryption
+    pub tracking_number: String,     // 4 + 64
+    pub dispute_reason: String,      // 4 + 200
+    pub use_private_reputation: bool, // 1 - Flag to use MPC reputation
+    pub csol_mint: Pubkey,           // 32 - The cSOL mint address
+    pub escrow_ata: Pubkey,          // 32 - Escrow's cSOL ATA (holds funds)
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
+pub enum EscrowState {
+    Created,
+    Accepted,
+    Shipped,
+    Delivered,
+    Disputed,
+    Completed,
+    Refunded,
+}
+
+#[account]
+pub struct UserReputation {
+    pub user: Pubkey,                // 32
+    pub total_orders: u64,           // 8
+    pub successful_orders: u64,      // 8
+    pub disputes_opened: u64,        // 8
+    pub disputes_won: u64,           // 8
+    pub disputes_lost: u64,          // 8
+    pub reputation_score: u64,       // 8
+    pub bump: u8,                    // 1
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub enum DisputeWinner {
+    Buyer,
+    Seller,
+}
+
+// ==================== CONTEXT STRUCTS ====================
+
+#[derive(Accounts)]
+pub struct InitializePlatform<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + 32 + 32 + 2 + 2 + 8 + 8 + 8 + 8 + 8 + 1,
+        seeds = [b"config"],
+        bump
+    )]
+    pub config: Account<'info, PlatformConfig>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeArbiterPool<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + 32 + 4 + (32 * 10) + 4 + (8 * 10) + 1, // Support up to 10 arbiters
+        seeds = [b"arbiter_pool"],
+        bump
+    )]
+    pub arbiter_pool: Account<'info, ArbiterPool>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AddArbiter<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(mut)]
+    pub arbiter_pool: Account<'info, ArbiterPool>,
+}
+
+#[derive(Accounts)]
+#[instruction(amount: u64, order_id: u64, encrypted_shipping: Vec<u8>, shipping_nonce: [u8; 16])]
+pub struct CreateOrder<'info> {
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+
+    #[account(
+        init,
+        payer = fee_payer,
+        space = 8 + 32 + 32 + 32 + 8 + 8 + 8 + 32 + 1 + 1 + 8 + 8 + 8 + 8 + 8 + 260 + 16 + 68 + 204 + 1 + 32 + 32,
+        seeds = [b"escrow", buyer.key().as_ref(), &order_id.to_le_bytes()],
+        bump
+    )]
+    pub escrow: Account<'info, Escrow>,
+
+    /// CHECK: Token-2022 mint account
+    pub csol_mint: AccountInfo<'info>,
+
+    #[account(mut)]
+    /// CHECK: Token-2022 account
+    pub buyer_ata: AccountInfo<'info>,
+
+    #[account(mut)]
+    /// CHECK: Token-2022 account
+    pub escrow_ata: AccountInfo<'info>,
+
+    #[account(
+        init_if_needed,
+        payer = fee_payer,
+        space = 8 + 32 + 8 + 8 + 8 + 8 + 8 + 8 + 1,
+        seeds = [b"reputation", buyer.key().as_ref()],
+        bump
+    )]
+    pub buyer_reputation: Account<'info, UserReputation>,
+
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, PlatformConfig>,
+
+    #[account(seeds = [b"arbiter_pool"], bump = arbiter_pool.bump)]
+    pub arbiter_pool: Account<'info, ArbiterPool>,
+
+    #[account(mut)]
+    pub fee_payer: Signer<'info>,
+
+    pub token_program: Program<'info, Token2022>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AcceptOrder<'info> {
+    #[account(mut)]
+    pub seller: Signer<'info>,
+
+    #[account(mut)]
+    pub escrow: Account<'info, Escrow>,
+
+    /// CHECK: Token-2022 mint account
+    pub csol_mint: AccountInfo<'info>,
+
+    #[account(mut)]
+    /// CHECK: Token-2022 account
+    pub seller_ata: AccountInfo<'info>,
+
+    #[account(mut)]
+    /// CHECK: Token-2022 account
+    pub escrow_ata: AccountInfo<'info>,
+
+    #[account(
+        init_if_needed,
+        payer = fee_payer,
+        space = 8 + 32 + 8 + 8 + 8 + 8 + 8 + 8 + 1,
+        seeds = [b"reputation", seller.key().as_ref()],
+        bump
+    )]
+    pub seller_reputation: Account<'info, UserReputation>,
+
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, PlatformConfig>,
+
+    #[account(mut)]
+    pub fee_payer: Signer<'info>,
+
+    pub token_program: Program<'info, Token2022>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MarkShipped<'info> {
+    pub seller: Signer<'info>,
+    #[account(mut)]
+    pub escrow: Account<'info, Escrow>,
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, PlatformConfig>,
+}
+
+#[derive(Accounts)]
+pub struct ConfirmDelivery<'info> {
+    pub buyer: Signer<'info>,
+    #[account(mut)]
+    pub escrow: Account<'info, Escrow>,
+}
+
+#[derive(Accounts)]
+pub struct FinalizeOrder<'info> {
+    #[account(mut)]
+    pub escrow: Account<'info, Escrow>,
+
+    #[account(
+    )]
+    /// CHECK: Token-2022 mint account
+    pub csol_mint: AccountInfo<'info>,
+
+    #[account(
+        mut,
+    )]
+    /// CHECK: Token-2022 account
+    pub escrow_ata: AccountInfo<'info>,
+
+    #[account(
+        mut,
+    )]
+    /// CHECK: Token-2022 account
+    pub seller_ata: AccountInfo<'info>,
+
+    #[account(
+        mut,
+    )]
+    /// CHECK: Token-2022 account
+    pub treasury_ata: AccountInfo<'info>,
+
+    /// CHECK: Seller account
+    pub seller: UncheckedAccount<'info>,
+
+    /// CHECK: Treasury account
+    pub treasury: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub buyer_reputation: Account<'info, UserReputation>,
+
+    #[account(mut)]
+    pub seller_reputation: Account<'info, UserReputation>,
+
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, PlatformConfig>,
+
+    pub token_program: Program<'info, Token2022>,
+}
+
+#[derive(Accounts)]
+pub struct AutoComplete<'info> {
+    #[account(mut)]
+    pub escrow: Account<'info, Escrow>,
+
+    #[account(
+    )]
+    /// CHECK: Token-2022 mint account
+    pub csol_mint: AccountInfo<'info>,
+
+    #[account(
+        mut,
+    )]
+    /// CHECK: Token-2022 account
+    pub escrow_ata: AccountInfo<'info>,
+
+    #[account(
+        mut,
+    )]
+    /// CHECK: Token-2022 account
+    pub seller_ata: AccountInfo<'info>,
+
+    #[account(
+        mut,
+    )]
+    /// CHECK: Token-2022 account
+    pub treasury_ata: AccountInfo<'info>,
+
+    /// CHECK: Seller account
+    pub seller: UncheckedAccount<'info>,
+
+    /// CHECK: Treasury account
+    pub treasury: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub buyer_reputation: Account<'info, UserReputation>,
+
+    #[account(mut)]
+    pub seller_reputation: Account<'info, UserReputation>,
+
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, PlatformConfig>,
+
+    pub token_program: Program<'info, Token2022>,
+}
+
+#[derive(Accounts)]
+pub struct ProcessAcceptanceTimeout<'info> {
+    #[account(mut)]
+    pub escrow: Account<'info, Escrow>,
+
+    #[account(
+    )]
+    /// CHECK: Token-2022 mint account
+    pub csol_mint: AccountInfo<'info>,
+
+    #[account(
+        mut,
+    )]
+    /// CHECK: Token-2022 account
+    pub escrow_ata: AccountInfo<'info>,
+
+    #[account(
+        mut,
+    )]
+    /// CHECK: Token-2022 account
+    pub buyer_ata: AccountInfo<'info>,
+
+    /// CHECK: Buyer account
+    pub buyer: UncheckedAccount<'info>,
+
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, PlatformConfig>,
+
+    pub token_program: Program<'info, Token2022>,
+}
+
+#[derive(Accounts)]
+pub struct ProcessShippingTimeout<'info> {
+    #[account(mut)]
+    pub escrow: Account<'info, Escrow>,
+
+    #[account(
+    )]
+    /// CHECK: Token-2022 mint account
+    pub csol_mint: AccountInfo<'info>,
+
+    #[account(
+        mut,
+    )]
+    /// CHECK: Token-2022 account
+    pub escrow_ata: AccountInfo<'info>,
+
+    #[account(
+        mut,
+    )]
+    /// CHECK: Token-2022 account
+    pub buyer_ata: AccountInfo<'info>,
+
+    /// CHECK: Buyer account
+    pub buyer: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub buyer_reputation: Account<'info, UserReputation>,
+
+    #[account(mut)]
+    pub seller_reputation: Account<'info, UserReputation>,
+
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, PlatformConfig>,
+
+    pub token_program: Program<'info, Token2022>,
+}
+
+#[derive(Accounts)]
+pub struct OpenDispute<'info> {
+    pub buyer: Signer<'info>,
+    #[account(mut)]
+    pub escrow: Account<'info, Escrow>,
+    #[account(mut)]
+    pub buyer_reputation: Account<'info, UserReputation>,
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, PlatformConfig>,
+}
+
+#[derive(Accounts)]
+pub struct ResolveDispute<'info> {
+    pub arbiter: Signer<'info>,
+
+    #[account(mut)]
+    pub escrow: Account<'info, Escrow>,
+
+    #[account(
+    )]
+    /// CHECK: Token-2022 mint account
+    pub csol_mint: AccountInfo<'info>,
+
+    #[account(
+        mut,
+    )]
+    /// CHECK: Token-2022 account
+    pub escrow_ata: AccountInfo<'info>,
+
+    #[account(
+        mut,
+    )]
+    /// CHECK: Token-2022 account
+    pub buyer_ata: AccountInfo<'info>,
+
+    #[account(
+        mut,
+    )]
+    /// CHECK: Token-2022 account
+    pub seller_ata: AccountInfo<'info>,
+
+    #[account(
+        mut,
+    )]
+    /// CHECK: Token-2022 account
+    pub treasury_ata: AccountInfo<'info>,
+
+    /// CHECK: Buyer account
+    pub buyer: UncheckedAccount<'info>,
+
+    /// CHECK: Seller account
+    pub seller: UncheckedAccount<'info>,
+
+    /// CHECK: Treasury account
+    pub treasury: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub buyer_reputation: Account<'info, UserReputation>,
+
+    #[account(mut)]
+    pub seller_reputation: Account<'info, UserReputation>,
+
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, PlatformConfig>,
+
+    pub token_program: Program<'info, Token2022>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeReputation<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(
+        init,
+        payer = user,
+        space = 8 + 32 + 8 + 8 + 8 + 8 + 8 + 8 + 1,
+        seeds = [b"reputation", user.key().as_ref()],
+        bump
+    )]
+    pub reputation: Account<'info, UserReputation>,
+    pub system_program: Program<'info, System>,
+}
+
+// ==================== MPC COMPUTATION ACCOUNTS ====================
+
+#[queue_computation_accounts("calculate_reputation_score", payer)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64)]
+pub struct CalculateReputationPrivate<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        init_if_needed,
+        space = 9,
+        payer = payer,
+        seeds = [&SIGN_PDA_SEED],
+        bump,
+        address = derive_sign_pda!(),
+    )]
+    pub sign_pda_account: Account<'info, SignerAccount>,
+    #[account(
+        address = derive_mxe_pda!()
+    )]
+    pub mxe_account: Account<'info, MXEAccount>,
+    #[account(
+        mut,
+        address = derive_mempool_pda!()
+    )]
+    /// CHECK: mempool_account, checked by the arcium program.
+    pub mempool_account: UncheckedAccount<'info>,
+    #[account(
+        mut,
+        address = derive_execpool_pda!()
+    )]
+    /// CHECK: executing_pool, checked by the arcium program.
+    pub executing_pool: UncheckedAccount<'info>,
+    #[account(
+        mut,
+        address = derive_comp_pda!(computation_offset)
+    )]
+    /// CHECK: computation_account, checked by the arcium program.
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(
+        address = derive_comp_def_pda!(COMP_DEF_OFFSET_CALC_REPUTATION)
+    )]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(
+        mut,
+        address = derive_cluster_pda!(mxe_account)
+    )]
+    pub cluster_account: Account<'info, Cluster>,
+    #[account(
+        mut,
+        address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS,
+    )]
+    pub pool_account: Account<'info, FeePool>,
+    #[account(
+        address = ARCIUM_CLOCK_ACCOUNT_ADDRESS
+    )]
+    pub clock_account: Account<'info, ClockAccount>,
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+}
+
+#[callback_accounts("calculate_reputation_score")]
+#[derive(Accounts)]
+pub struct CalculateReputationScoreCallback<'info> {
+    pub arcium_program: Program<'info, Arcium>,
+    #[account(
+        address = derive_comp_def_pda!(COMP_DEF_OFFSET_CALC_REPUTATION)
+    )]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
+    /// CHECK: instructions_sysvar, checked by the account constraint
+    pub instructions_sysvar: AccountInfo<'info>,
+}
+
+// ==================== MPC COMPUTATION DEFINITION ACCOUNTS ====================
+
+#[init_computation_definition_accounts("encrypt_shipping_address", payer)]
+#[derive(Accounts)]
+pub struct InitEncryptShippingCompDef<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        mut,
+        address = derive_mxe_pda!()
+    )]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    #[account(mut)]
+    /// CHECK: comp_def_account, checked by arcium program.
+    pub comp_def_account: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+#[init_computation_definition_accounts("calculate_reputation_score", payer)]
+#[derive(Accounts)]
+pub struct InitReputationCalcCompDef<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        mut,
+        address = derive_mxe_pda!()
+    )]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    #[account(mut)]
+    /// CHECK: comp_def_account, checked by arcium program.
+    pub comp_def_account: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+// ==================== EVENTS ====================
+
+#[event]
+pub struct OrderCreatedEvent {
+    pub order_id: u64,
+    pub buyer: Pubkey,
+    pub amount: u64,
+    pub arbiter: Pubkey,
+}
+
+#[event]
+pub struct OrderAcceptedEvent {
+    pub buyer: Pubkey,
+    pub seller: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct OrderShippedEvent {
+    pub buyer: Pubkey,
+    pub seller: Pubkey,
+    pub tracking_number: String,
+}
+
+#[event]
+pub struct OrderDeliveredEvent {
+    pub buyer: Pubkey,
+    pub seller: Pubkey,
+}
+
+#[event]
+pub struct OrderCompletedEvent {
+    pub buyer: Pubkey,
+    pub seller: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct OrderAutoCompletedEvent {
+    pub buyer: Pubkey,
+    pub seller: Pubkey,
+}
+
+#[event]
+pub struct OrderRefundedEvent {
+    pub buyer: Pubkey,
+    pub amount: u64,
+    pub reason: String,
+}
+
+#[event]
+pub struct DisputeOpenedEvent {
+    pub buyer: Pubkey,
+    pub seller: Pubkey,
+    pub reason: String,
+}
+
+#[event]
+pub struct DisputeResolvedEvent {
+    pub buyer: Pubkey,
+    pub seller: Pubkey,
+    pub winner: String,
+}
+
+#[event]
+pub struct ReputationCalculatedPrivateEvent {
+    pub encrypted_score: [u8; 32],
+    pub nonce: [u8; 16],
+}
+
+#[event]
+pub struct PrivateReputationUpdateNeeded {
+    pub buyer: Pubkey,
+    pub seller: Pubkey,
+    pub msg: String,
+}
+
+// ==================== HELPER FUNCTIONS ====================
+
+fn update_reputation_score(rep: &mut UserReputation) {
+    if rep.total_orders == 0 {
+        rep.reputation_score = 500;
+        return;
+    }
+
+    let success_rate = (rep.successful_orders * 100) / rep.total_orders;
+    let penalty = rep.disputes_lost * 50;
+    let bonus = rep.disputes_won * 10;
+
+    let raw_score = success_rate + bonus;
+    let with_penalty = if raw_score >= penalty {
+        raw_score - penalty
+    } else {
+        0
+    };
+
+    rep.reputation_score = if with_penalty > 1000 {
+        1000
+    } else {
+        with_penalty
+    };
+}
+
+// ==================== ERROR CODES ====================
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("The computation was aborted")]
+    AbortedComputation,
+    #[msg("Cluster not set")]
+    ClusterNotSet,
+    #[msg("Invalid escrow state for this operation")]
+    InvalidState,
+    #[msg("Deadline has expired")]
+    DeadlineExpired,
+    #[msg("Deadline has not been reached yet")]
+    DeadlineNotReached,
+    #[msg("Unauthorized: wrong signer")]
+    Unauthorized,
+    #[msg("Invalid amount: must be greater than 0")]
+    InvalidAmount,
+    #[msg("Invalid tracking number")]
+    InvalidTracking,
+    #[msg("Invalid dispute reason")]
+    InvalidReason,
+    #[msg("No arbiters available in pool")]
+    NoArbitersAvailable,
+    #[msg("Shipping data too large (max 256 bytes)")]
+    ShippingDataTooLarge,
+    #[msg("Arbiter already exists in pool")]
+    ArbiterAlreadyExists,
+}

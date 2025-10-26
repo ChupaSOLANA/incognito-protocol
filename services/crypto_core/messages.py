@@ -26,19 +26,16 @@ def derive_thread_key(shared: bytes, thread_id: bytes) -> bytes:
 def shared_secret_from_ed25519(my_sk64: bytes, peer_ed_pub32: bytes) -> bytes:
     my_curve_sk, _ = ed25519_to_curve25519_keys(my_sk64, peer_ed_pub32)
     peer_curve_pk = crypto_sign_ed25519_pk_to_curve25519(peer_ed_pub32)
-    # X25519 via libsodium’s Box needs nacl.public keys:
     sk = PrivateKey(my_curve_sk)
     pk = PublicKey(peer_curve_pk)
     box = Box(sk, pk)
-    # We don't use box.encrypt; we only want the raw shared key
-    # libsodium derives via X25519 + HSalsa; SecretBox expects a 32B key; HKDF handles domain separation
     return box.shared_key()
 
 def xchacha_encrypt(key32: bytes, plaintext: bytes) -> Tuple[bytes, bytes]:
-    sb = SecretBox(key32)  # XChaCha20-Poly1305
+    sb = SecretBox(key32)
     nonce = nacl_random(24)
-    ct = sb.encrypt(plaintext, nonce)  # returns nonce+ciphertext; we provided nonce, so ct = nonce||cipher
-    return nonce, ct[24:]  # strip nonce
+    ct = sb.encrypt(plaintext, nonce)
+    return nonce, ct[24:]
 
 def xchacha_decrypt(key32: bytes, nonce24: bytes, ciphertext: bytes) -> bytes:
     sb = SecretBox(key32)

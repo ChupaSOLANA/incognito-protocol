@@ -79,7 +79,6 @@ CREATE TABLE IF NOT EXISTS kv(
 """
 
 
-# ---------- storage ----------
 def _conn() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     cx = sqlite3.connect(DB_PATH)
@@ -108,7 +107,6 @@ def _save(path: str, obj: dict) -> None:
         json.dump(obj, f, indent=2)
 
 
-# ---------- wrapper/pool state ----------
 def wrapper_state() -> dict:
     st = _load(WRAPPER_MERKLE_STATE_PATH)
     st["leaves"] = [n.get("commitment", "") for n in st.get("notes", []) if not n.get("spent", False)]
@@ -141,7 +139,6 @@ def _fmt(x: Decimal | str | float) -> str:
     return str(Decimal(str(x)).quantize(Decimal("0.000000001")))
 
 
-# ---------- note helpers ----------
 def mark_note_spent_emit(st: dict, note: dict) -> None:
     note["spent"] = True
 
@@ -171,7 +168,6 @@ def add_change_note_emit(st: dict, recipient_pub: str, amount_str: str) -> None:
     )
 
 
-# ---------- metrics & events ----------
 def _touch_metrics(cx: sqlite3.Connection, epoch: int) -> None:
     now = _now()
     cur = cx.execute("SELECT 1 FROM metrics WHERE epoch=?", (epoch,))
@@ -191,7 +187,6 @@ def _kv_set(cx: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def apply_event_row(cx: sqlite3.Connection, kind: str, payload: Dict[str, Any]) -> None:
-    # --- Notes lifecycle (existing) ---
     if kind == "NoteIssued":
         cx.execute(
             "INSERT OR REPLACE INTO notes(commitment,amount,recipient_tag_hex,blind_sig_hex,spent,inserted_at) "
@@ -221,15 +216,12 @@ def apply_event_row(cx: sqlite3.Connection, kind: str, payload: Dict[str, Any]) 
         cx.execute("UPDATE metrics SET spent_count = spent_count + 1 WHERE epoch=?", (epoch,))
         return
 
-    # --- Escrow events (NEW) ---
     if kind == "EscrowOpened":
-        # Accept either a flat payload or {escrow:{...}}
         esc = payload.get("escrow") or payload
         escrow_id = esc.get("id") or esc.get("escrow_id")
         if not escrow_id:
             raise ValueError("EscrowOpened missing escrow id")
 
-        # Upsert state
         cx.execute(
             """
             INSERT INTO escrow_state(escrow_id,status,buyer_pub,seller_pub,amount_sol,commitment,leaf_index,created_at,updated_at)
@@ -256,7 +248,6 @@ def apply_event_row(cx: sqlite3.Connection, kind: str, payload: Dict[str, Any]) 
                 esc.get("updated_at") or payload.get("ts") or _now(),
             ),
         )
-        # History row
         cx.execute(
             "INSERT OR IGNORE INTO escrow_log(id,escrow_id,ts,action,payload) VALUES(?,?,?,?,?)",
             (
@@ -300,7 +291,6 @@ def apply_event_row(cx: sqlite3.Connection, kind: str, payload: Dict[str, Any]) 
             _kv_set(cx, "escrow_merkle_root", root_hex)
         return
 
-    # --- Known informational/no-op events (existing & misc marketplace/shipping) ---
     if kind in (
         "PoolStealthAdded",
         "CSOLConverted",
@@ -313,11 +303,9 @@ def apply_event_row(cx: sqlite3.Connection, kind: str, payload: Dict[str, Any]) 
     ):
         return
 
-    # --- Profile/stealth events (no-op persistence; recorded in tx_log for replay/observability) ---
     if kind in ("ProfileRegistered", "ProfilesMerkleRootUpdated", "StealthMarkedUsed"):
         return
 
-    # Unknown event safety
     raise ValueError(f"Unknown event kind: {kind}")
 
 
@@ -361,7 +349,6 @@ def metrics_all() -> List[Tuple[int, int, int, str]]:
         ).fetchall()
 
 
-# ---------- Optional typed emit helpers ----------
 def emit_profile_registered(
     *, leaf: str, index: int, root: str, blob: Dict[str, Any], ts: str | None = None, event_id: str | None = None
 ) -> str:
@@ -395,7 +382,6 @@ def emit_stealth_marked_used(
     return append_event("StealthMarkedUsed", **payload)
 
 
-# ===== Escrow typed emitters (NEW) =====
 def emit_escrow_opened(
     *,
     escrow_id: str,
@@ -476,11 +462,9 @@ __all__ = [
     "append_event",
     "replay",
     "metrics_all",
-    # profile helpers
     "emit_profile_registered",
     "emit_profiles_merkle_root_updated",
     "emit_stealth_marked_used",
-    # escrow helpers
     "emit_escrow_opened",
     "emit_escrow_action",
     "emit_escrow_merkle_root_updated",

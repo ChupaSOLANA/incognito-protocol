@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# clients/cli/marketplace_anon.py
-# Anonymous Marketplace CLI (educational/localnet-devnet only)
 
 from __future__ import annotations
 
@@ -17,10 +15,8 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
-
 from clients.cli.emit import emit, events_replay
 
-# ===== UI =====
 class C:
     OK = "\033[92m"
     WARN = "\033[93m"
@@ -29,17 +25,14 @@ class C:
     BOLD = "\033[1m"
     RST = "\033[0m"
 
-
 def _short(pk: str) -> str:
     return f"{pk[:4]}…{pk[-5:]}" if pk and len(pk) > 10 else pk
 
-
-# ===== Config =====
 KEYS_DIR: str = "./keys"
 TREASURY_KEYPAIR: str = os.path.join(KEYS_DIR, "pool.json")
 WRAPPER_KEYPAIR: str = os.path.join(KEYS_DIR, "wrapper.json")
 MINT_KEYFILE = Path("/Users/alex/Desktop/incognito-protocol-1/keys/mint.json")
-MINT: str = "ESPU74xbyRqhRTeWUbGqMf3G9CU8oD12bpHP7oypYZnp"  # cSOL Token-2022
+MINT: str = "ESPU74xbyRqhRTeWUbGqMf3G9CU8oD12bpHP7oypYZnp"
 
 def _pubkey_from_keyfile(path: Path) -> str:
         r = subprocess.run(["solana-keygen", "pubkey", str(path)], capture_output=True, text=True, check=True)
@@ -47,7 +40,7 @@ def _pubkey_from_keyfile(path: Path) -> str:
 
 MINT: str = os.getenv("MINT") or _pubkey_from_keyfile(MINT_KEYFILE)
 
-FEE_PAYER: Optional[str] = None  # not used globally; per-call derived
+FEE_PAYER: Optional[str] = None
 STEALTH_FEE_SOL = "0.05"
 SWEEP_BUFFER_SOL = Decimal("0.001")
 STEP_DELAY_SEC = 2.0
@@ -61,29 +54,27 @@ DENOMINATIONS: List[str] = ["10", "25", "50", "100"]
 DUST_THRESHOLD_SOL = Decimal("0.01")
 VERBOSE = False
 
-# ===== crypto_core =====
-from services.crypto_core.stealth import (  # noqa: E402
+from services.crypto_core.stealth import (
     derive_stealth_from_recipient_secret,
     generate_stealth_for_recipient,
     read_secret_64_from_json_value,
 )
-from services.crypto_core.commitments import (  # noqa: E402
+from services.crypto_core.commitments import (
     make_commitment,
     make_nullifier,
     recipient_tag,
     recipient_tag_hex,
     sha256 as _sha256,
 )
-from services.crypto_core.merkle import MerkleTree, verify_merkle as _verify_merkle  # noqa: E402
-from services.crypto_core.blind_api import (  # noqa: E402
+from services.crypto_core.merkle import MerkleTree, verify_merkle as _verify_merkle
+from services.crypto_core.blind_api import (
     ensure_signer_keypair,
     issue_blind_sig_for_commitment_hex,
     load_pub as bs_load_pub,
     verify as bs_verify,
 )
-from services.crypto_core.splits import greedy_coin_select, split_bounded  # noqa: E402
+from services.crypto_core.splits import greedy_coin_select, split_bounded
 
-# ===== Shell helpers =====
 def _hint(msg: str) -> str:
     m = msg
     if "InsufficientFunds" in m:
@@ -94,41 +85,35 @@ def _hint(msg: str) -> str:
         m += f"  {C.DIM}(Pass the correct --owner for that token account.){C.RST}"
     return m
 
-# en haut : construire le chemin absolu vers le dossier anchor
-ROOT_DIR = Path(__file__).resolve().parents[2]      # /.../incognito-protocol-1/clients/cli/.. => ajuste si différent
-SOLANA_CONTRACTS_DIR = ROOT_DIR / "contracts" / "solana"
-TS_UPDATE_SCRIPT = SOLANA_CONTRACTS_DIR / "scripts" / "compute_and_update_roots.ts"
-TS_NODE_BIN = os.getenv("TS_NODE_BIN", "npx")  # on utilise npx pour résoudre les deps locales
+ROOT_DIR = Path(__file__).resolve().parents[2]
+INCOGNITO_CONTRACTS_DIR = ROOT_DIR / "contracts" / "incognito"
+TS_UPDATE_SCRIPT = ROOT_DIR / "clients" / "ts" / "compute_and_update_roots.ts"
+TS_NODE_BIN = os.getenv("TS_NODE_BIN", "npx")
 
 def _update_onchain_roots() -> None:
     if not TS_UPDATE_SCRIPT.exists():
         print(f"{C.DIM}[roots] script introuvable: {TS_UPDATE_SCRIPT}{C.RST}")
         return
 
-    # s'assurer que le dossier contracts/solana contient Anchor.toml
-    anchor_toml = SOLANA_CONTRACTS_DIR / "Anchor.toml"
+    anchor_toml = INCOGNITO_CONTRACTS_DIR / "Anchor.toml"
     if not anchor_toml.exists():
         print(f"{C.WARN}[roots] Anchor.toml absent: {anchor_toml}{C.RST}  (aborting update)")
         return
 
     env = os.environ.copy()
     env.setdefault("RPC_URL", env.get("RPC_URL", "http://127.0.0.1:8899"))
-    # Utiliser npx pour utiliser ts-node installé localement dans le projet
-    # cmd = ["ts-node", str(TS_UPDATE_SCRIPT)]   # si tu as ts-node global
     cmd = [TS_NODE_BIN, "--yes", "ts-node", str(TS_UPDATE_SCRIPT)]
 
     try:
-        # <-- IMPORTANT: passer cwd=SOLANA_CONTRACTS_DIR pour que Anchor trouve Anchor.toml
         out = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             env=env,
             check=True,
-            cwd=str(SOLANA_CONTRACTS_DIR),
+            cwd=str(ROOT_DIR),
         )
         if out.stdout.strip():
-            # affiche la dernière ligne utile (ou tout si tu préfères)
             print(f"{C.DIM}[roots]{C.RST} {out.stdout.strip().splitlines()[-1]}")
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr or "").strip()
@@ -138,7 +123,6 @@ def _update_onchain_roots() -> None:
             print("stdout:", stdout.splitlines()[-5:])
         if stderr:
             print("stderr:", stderr.splitlines()[-10:])
-
 
 def _run(cmd: List[str]) -> str:
     printable = " ".join(shlex.quote(c) for c in cmd)
@@ -154,7 +138,6 @@ def _run(cmd: List[str]) -> str:
         raise SystemExit(_hint(f"{C.ERR}Command failed (rc={proc.returncode}){C.RST}: {printable}"))
     return (out or "").strip()
 
-
 def _run_rc(cmd: List[str]) -> Tuple[int, str, str]:
     printable = " ".join(shlex.quote(c) for c in cmd)
     if VERBOSE:
@@ -165,7 +148,6 @@ def _run_rc(cmd: List[str]) -> Tuple[int, str, str]:
         print("stderr:", err.strip())
     return proc.returncode, (out or "").strip(), (err or "").strip()
 
-
 def _run_quiet(cmd: List[str]) -> str:
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     out, err = proc.communicate()
@@ -174,16 +156,13 @@ def _run_quiet(cmd: List[str]) -> str:
         raise SystemExit(f"Command failed (rc={proc.returncode}): {printable}")
     return (out or "").strip()
 
-
 _SIG_RE = re.compile(r'(?:Signature:\s*|["\']signature["\']\s*:\s*["\'])([1-9A-HJ-NP-Za-km-z]{32,})')
-
 
 def _extract_sig(txt: str) -> Optional[str]:
     if not txt:
         return None
     m = _SIG_RE.search(txt)
     return m.group(1) if m else None
-
 
 def _run_tx(cmd: List[str], label: str = "") -> str:
     printable = " ".join(shlex.quote(c) for c in cmd)
@@ -205,11 +184,9 @@ def _run_tx(cmd: List[str], label: str = "") -> str:
         print(f"{C.DIM}{prefix}signature:{C.RST} {sig}")
     return (out or "").strip()
 
-
 def _sleep(seconds: float = STEP_DELAY_SEC) -> None:
     print(f"{C.DIM}... waiting {seconds:.1f}s ...{C.RST}\n")
     time.sleep(seconds)
-
 
 def _detect_keygen_base() -> Tuple[str, ...]:
     try:
@@ -218,19 +195,15 @@ def _detect_keygen_base() -> Tuple[str, ...]:
     except Exception:
         return ("solana", "keygen")
 
-
 KEYGEN_BASE: Tuple[str, ...] = _detect_keygen_base()
-
 
 def get_pubkey_from_keypair(keypair_path: str) -> str:
     return _run_quiet(list(KEYGEN_BASE) + ["pubkey", keypair_path]).strip()
-
 
 def list_users() -> List[str]:
     if not os.path.isdir(KEYS_DIR):
         raise SystemExit(f"Keys directory not found: {KEYS_DIR}")
     return sorted(f for f in os.listdir(KEYS_DIR) if f.startswith("user") and f.endswith(".json"))
-
 
 def select_from_list(prompt: str, items: List[str]) -> int:
     if not items:
@@ -253,14 +226,12 @@ def select_from_list(prompt: str, items: List[str]) -> int:
         raise SystemExit("Selected index out of range.")
     return idx
 
-
 def get_ata_for_owner(mint: str, owner: str) -> str:
     out = _run(["spl-token", "address", "--token", mint, "--owner", owner, "--verbose"])
     for line in out.splitlines():
         if line.startswith("Associated token address:"):
             return line.split(":", 1)[1].strip()
     raise SystemExit(f"Unable to parse ATA for owner={owner}. Full output:\n{out}")
-
 
 def get_sol_balance(pubkey: str, quiet: bool = False) -> float:
     runner = _run_quiet if quiet else _run
@@ -271,16 +242,12 @@ def get_sol_balance(pubkey: str, quiet: bool = False) -> float:
     except ValueError:
         raise SystemExit(f"Unable to parse SOL balance from: {out}")
 
-
-# ===== Events & receipts =====
 def _lamports(amount: str | Decimal | float) -> int:
     d = Decimal(str(amount))
     return int((d * Decimal("1000000000")).to_integral_value(rounding=ROUND_DOWN))
 
-
 def _epoch() -> int:
     return int(time.time() // 60)
-
 
 def _write_receipt(kind: str, payload: dict) -> None:
     os.makedirs("receipts", exist_ok=True)
@@ -290,19 +257,15 @@ def _write_receipt(kind: str, payload: dict) -> None:
         json.dump(payload, f, indent=2)
     print(f"{C.DIM}(receipt saved → {fname}){C.RST}")
 
-
-# ===== State (wrapper/pool) =====
 def _load_state_raw(path: str) -> dict:
     if os.path.exists(path):
         with open(path, "r") as f:
             return json.load(f)
     return {"leaves": [], "nullifiers": [], "notes": []}
 
-
 def _save_state(path: str, st: dict) -> None:
     with open(path, "w") as f:
         json.dump(st, f, indent=2)
-
 
 def _normalize_wrapper_state(st: dict) -> dict:
     leaves = st.get("leaves", [])
@@ -337,15 +300,11 @@ def _normalize_wrapper_state(st: dict) -> dict:
             new_notes.append(rec)
     return {"leaves": new_leaves, "nullifiers": [str(x) for x in nulls], "notes": new_notes}
 
-
 def _load_wrapper_state() -> dict:
     return _normalize_wrapper_state(_load_state_raw(WRAPPER_MERKLE_STATE_PATH))
 
-
 def _save_wrapper_state(st: dict) -> None:
-    # Save only; do NOT push on-chain automatically.
     _save_state(WRAPPER_MERKLE_STATE_PATH, _normalize_wrapper_state(st))
-
 
 def _build_merkle_from_wrapper(st: dict) -> MerkleTree:
     leaves_hex = list(st.get("leaves", []))
@@ -353,7 +312,6 @@ def _build_merkle_from_wrapper(st: dict) -> MerkleTree:
     if not mt.layers and mt.leaf_bytes:
         mt.build_tree()
     return mt
-
 
 def _rebuild_and_reindex_wrapper(st: dict) -> None:
     leaves = [n["commitment"] for n in st.get("notes", []) if not n.get("spent", False)]
@@ -364,11 +322,9 @@ def _rebuild_and_reindex_wrapper(st: dict) -> None:
         n["index"] = idx_map.get(n["commitment"], -1) if not n.get("spent", False) else -1
     _save_wrapper_state(st)
 
-
 def _auto_prune_reindex() -> None:
     st = _load_wrapper_state()
     _rebuild_and_reindex_wrapper(st)
-
 
 def _normalize_pool_state(raw: dict) -> dict:
     records = raw.get("records", [])
@@ -386,14 +342,11 @@ def _normalize_pool_state(raw: dict) -> dict:
             )
     return {"records": norm}
 
-
 def _load_pool_state() -> dict:
     raw = _load_state_raw(POOL_MERKLE_STATE_PATH)
     return _normalize_pool_state(raw)
 
-
 def _save_pool_state(st: dict) -> None:
-    # Save only; do NOT push on-chain automatically.
     leaves = [r["commitment"] for r in st.get("records", [])]
     to_save = {"records": st.get("records", []), "leaves": leaves}
     _save_state(POOL_MERKLE_STATE_PATH, to_save)
@@ -401,7 +354,6 @@ def _save_pool_state(st: dict) -> None:
 def make_pool_stealth_commitment(stealth_pubkey: str, eph_pub_b58: str, counter: int = 0) -> str:
     payload = b"pst|" + stealth_pubkey.encode() + b"|" + eph_pub_b58.encode() + b"|" + str(counter).encode()
     return _sha256(payload).hex()
-
 
 def add_pool_stealth_record(owner_pubkey: str, stealth_pubkey: str, eph_pub_b58: str, counter: int = 0) -> str:
     st = _load_pool_state()
@@ -423,11 +375,8 @@ def add_pool_stealth_record(owner_pubkey: str, stealth_pubkey: str, eph_pub_b58:
         print(f"{C.DIM}[events] PoolStealthAdded emit failed: {e}{C.RST}")
     return c
 
-
-# ===== Wrapper notes =====
 def _fmt_amt(x: Decimal | float | str) -> str:
     return str(Decimal(str(x)).quantize(Decimal("0.000000001")))
-
 
 def _ask_amount_or_all(prompt: str, available: Decimal) -> Decimal:
     raw = input(f"{prompt} (available: {_fmt_amt(available)}): ").strip().lower()
@@ -442,7 +391,6 @@ def _ask_amount_or_all(prompt: str, available: Decimal) -> Decimal:
     if amt > available:
         raise SystemExit(f"Insufficient funds: requested {_fmt_amt(amt)} > available {_fmt_amt(available)}")
     return amt
-
 
 def add_note(st: dict, recipient_pub: str, amount_str: str, note_hex: str, nonce_hex: str) -> Dict[str, Any]:
     commitment = make_commitment(bytes.fromhex(note_hex), amount_str, bytes.fromhex(nonce_hex), recipient_pub)
@@ -482,7 +430,6 @@ def add_note(st: dict, recipient_pub: str, amount_str: str, note_hex: str, nonce
     except Exception as e:
         print(f"{C.DIM}[events] NoteIssued emit failed: {e}{C.RST}")
     return rec
-
 
 def add_note_with_precomputed_commitment(
     st: dict,
@@ -525,10 +472,8 @@ def add_note_with_precomputed_commitment(
         print(f"{C.DIM}[events] NoteIssued emit failed: {e}{C.RST}")
     return rec
 
-
 def _tag_hex_for_pub(pub: str) -> str:
     return recipient_tag_hex(pub)
-
 
 def list_unspent_notes_for_recipient(st: dict, recipient_pub: str) -> List[Dict[str, Any]]:
     tag_hex = _tag_hex_for_pub(recipient_pub)
@@ -540,7 +485,6 @@ def list_unspent_notes_for_recipient(st: dict, recipient_pub: str) -> List[Dict[
             res.append(n)
     return res
 
-
 def total_available_for_recipient(st: dict, recipient_pub: str) -> Decimal:
     total = Decimal("0")
     for n in list_unspent_notes_for_recipient(st, recipient_pub):
@@ -550,7 +494,6 @@ def total_available_for_recipient(st: dict, recipient_pub: str) -> Decimal:
             pass
     return total
 
-
 def mark_nullifier(st: dict, nullifier_hex: str) -> None:
     n = st.get("nullifiers", [])
     if nullifier_hex in n:
@@ -558,8 +501,6 @@ def mark_nullifier(st: dict, nullifier_hex: str) -> None:
     n.append(nullifier_hex)
     st["nullifiers"] = n
 
-
-# ===== Local helpers =====
 def _select_denomination() -> str:
     print("\nSelect deposit amount (SOL):")
     for i, d in enumerate(DENOMINATIONS, 1):
@@ -572,7 +513,6 @@ def _select_denomination() -> str:
         raise SystemExit("Choice out of range.")
     return DENOMINATIONS[idx]
 
-
 def _select_recipient() -> Tuple[Optional[str], str]:
     users = list_users()
     opts = users + ["Custom pubkey"]
@@ -584,7 +524,6 @@ def _select_recipient() -> Tuple[Optional[str], str]:
         return None, recipient_pub
     recipient_file = os.path.join(KEYS_DIR, opts[ridx])
     return recipient_file, get_pubkey_from_keypair(recipient_file)
-
 
 def _wait_pool_increase(pubkey: str, baseline: float, expected_increase_dec: Decimal, timeout: float = POLL_TIMEOUT_SEC) -> None:
     target = baseline + float(expected_increase_dec)
@@ -599,9 +538,7 @@ def _wait_pool_increase(pubkey: str, baseline: float, expected_increase_dec: Dec
         time.sleep(POLL_INTERVAL_SEC)
     raise SystemExit("Timeout: Treasury balance did not increase in time.")
 
-
 def _write_temp_keypair(kp) -> str:
-    # solders.Keypair → 64 bytes (secret||pub)
     sk_bytes = kp.to_bytes()
     arr = list(sk_bytes)
     fd, path = tempfile.mkstemp(prefix="stealth_", suffix=".json")
@@ -610,14 +547,12 @@ def _write_temp_keypair(kp) -> str:
         json.dump(arr, f)
     return path
 
-
 def _derive_fee_payer_tmpfile(eph_pub_b58: str, counter: int = 0) -> str:
     with open(TREASURY_KEYPAIR, "r") as f:
         treasury_secret_raw = json.load(f)
     rec_sk64 = read_secret_64_from_json_value(treasury_secret_raw)
     kp = derive_stealth_from_recipient_secret(rec_sk64, eph_pub_b58, counter)
     return _write_temp_keypair(kp)
-
 
 def _pick_treasury_fee_payer_tmpfile(min_balance: Decimal = Decimal("0.002")) -> Tuple[str, dict]:
     treasury_pub = get_pubkey_from_keypair(TREASURY_KEYPAIR)
@@ -640,8 +575,6 @@ def _pick_treasury_fee_payer_tmpfile(min_balance: Decimal = Decimal("0.002")) ->
             return tmp, meta
     raise SystemExit(f"No Treasury stealth has ≥ {min_balance} SOL to act as fee payer.")
 
-
-# ===== Flows =====
 def flow_status() -> None:
     print("\n=== STATUS ===")
     try:
@@ -687,7 +620,6 @@ def flow_status() -> None:
     print(f"Merkle root   : {wmt.root().hex()}")
     print(f"Nullifiers    : {len(wst.get('nullifiers', []))}")
     print(f"Unspent total : {_fmt_amt(unspent_sum)} SOL\n")
-
 
 def flow_shielded_deposit_split_to_pool() -> None:
     users = list_users()
@@ -779,9 +711,7 @@ def flow_shielded_deposit_split_to_pool() -> None:
         },
     )
     print(f"{C.OK}Shielded deposit completed.{C.RST}")
-    # Trigger on-chain root update once per flow
     _update_onchain_roots()
-
 
 def flow_blind_note_handoff() -> None:
     print(f"\n{C.DIM}[Info] This transfers wrapper notes off-chain, not cSOL or SOL.{C.RST}")
@@ -801,13 +731,11 @@ def flow_blind_note_handoff() -> None:
 
     req_amt = _ask_amount_or_all("Amount to handoff (or 'all')", avail)
 
-    # --- coin selection (inputs) ---
     notes = list_unspent_notes_for_recipient(st, sender_pub)
     chosen, total = greedy_coin_select(notes, req_amt)
     if not chosen:
         raise SystemExit("Coin selection failed.")
 
-    # --- verify Merkle & blind signatures on inputs ---
     mt = _build_merkle_from_wrapper(st)
     root_hex = mt.root().hex()
     pub = bs_load_pub()
@@ -831,7 +759,6 @@ def flow_blind_note_handoff() -> None:
             raise SystemExit(f"[BlindSig] Verification failed on input (idx={idx})")
         used_inputs.append({"index": idx, "commitment": n["commitment"]})
 
-    # --- mark inputs spent + emit ---
     for n in chosen:
         n["spent"] = True
         try:
@@ -844,7 +771,6 @@ def flow_blind_note_handoff() -> None:
         except Exception:
             pass
 
-    # --- single output to B ---
     outputs = []
     print("\n[Output -> B]")
     note = secrets.token_bytes(32)
@@ -864,7 +790,6 @@ def flow_blind_note_handoff() -> None:
     outputs.append({"amount": amount_str, "commitment": commitment, "sig_hex": blind_sig_hex})
     print(f"  Out: {amount_str} SOL | commit={commitment[:16]}… | sig={blind_sig_hex[:16]}…")
 
-    # --- change back to A (if inputs > requested) ---
     total_dec = Decimal(str(total))
     change = (total_dec - req_amt).quantize(Decimal("0.000000001"), rounding=ROUND_DOWN)
     chg_amt = None
@@ -875,7 +800,6 @@ def flow_blind_note_handoff() -> None:
         chg_amt = _fmt_amt(change)
         print(f"Change back to A: {chg_amt} SOL")
 
-    # --- rebuild & emit new root ---
     _rebuild_and_reindex_wrapper(st)
     new_root = _build_merkle_from_wrapper(st).root().hex()
     try:
@@ -892,16 +816,13 @@ def flow_blind_note_handoff() -> None:
             "to_pub": recipient_pub,
             "amount": _fmt_amt(req_amt),
             "inputs_used": used_inputs,
-            "outputs_created": outputs,  # now contains exactly 1 item
+            "outputs_created": outputs,
             "change_back_to_sender": chg_amt,
             "new_merkle_root": new_root,
             "ts": int(time.time()),
         },
     )
-    # Trigger on-chain root update once per flow
     _update_onchain_roots()
-
-
 
 def flow_withdraw_simple() -> None:
     users = list_users()
@@ -1015,7 +936,7 @@ def flow_withdraw_simple() -> None:
             print("Recipient is a custom pubkey. They must run `spl-token apply-pending-balance` themselves.")
     finally:
         try:
-            os.remove(fee_tmp)  # type: ignore[arg-type]
+            os.remove(fee_tmp)
         except Exception:
             pass
 
@@ -1072,9 +993,7 @@ def flow_withdraw_simple() -> None:
         },
     )
     print(f"\n{C.OK}Shielded withdraw completed.{C.RST}")
-    # Trigger on-chain root update once per flow
     _update_onchain_roots()
-
 
 def flow_convert_csol_to_sol_split() -> None:
     users = list_users()
@@ -1177,9 +1096,7 @@ def flow_convert_csol_to_sol_split() -> None:
             "ts": int(time.time()),
         },
     )
-    # Pool changed → update on-chain root once per flow
     _update_onchain_roots()
-
 
 def flow_list_stealth_for_owner() -> None:
     users = list_users()
@@ -1212,7 +1129,6 @@ def flow_list_stealth_for_owner() -> None:
         total += bal
     suffix = " (dust<0.01 ignored)" if hidden_dust else ""
     print(f"-----------------------------------\nTotal across listed{suffix}: {_fmt_amt(total)} SOL\n")
-
 
 def flow_sweep_stealth_to_pubkey() -> None:
     users = list_users()
@@ -1307,7 +1223,6 @@ def flow_sweep_stealth_to_pubkey() -> None:
     except Exception as e:
         print(f"{C.DIM}[events] SweepDone emit failed: {e}{C.RST}")
 
-
 def print_merkle_status() -> None:
     wst = _load_wrapper_state()
     wmt = _build_merkle_from_wrapper(wst)
@@ -1336,7 +1251,6 @@ def print_merkle_status() -> None:
     print(f"  Merkle root (hex) : {pmt.root().hex()}")
     print("---------------------\n")
 
-
 def flow_prune_reindex() -> None:
     st = _load_wrapper_state()
     _rebuild_and_reindex_wrapper(st)
@@ -1349,18 +1263,13 @@ def flow_prune_reindex() -> None:
         emit("MerkleRootUpdated", epoch=_epoch(), root_hex=new_root)
     except Exception as e:
         print(f"{C.DIM}[events] MerkleRootUpdated emit failed: {e}{C.RST}")
-    # Trigger on-chain root update once per flow
     _update_onchain_roots()
 
-
-# ===== Bootstrap blind signer =====
 try:
     ensure_signer_keypair()
 except Exception as e:
     print(f"[BlindSig] Warning: could not ensure blind keys: {e}")
 
-
-# ===== CLI =====
 def main() -> None:
     print(f"{C.DIM}Using state files:{C.RST}")
     _auto_prune_reindex()
@@ -1371,13 +1280,12 @@ def main() -> None:
         print("\n=== INCOGNITO ===")
         print("1. Shielded Deposit to Treasury (split main/stealth)")
         print("2. Shielded Withdraw (mint cSOL from notes → conf xfer)")
-        print("3. Off-chain Handoff (transfer notes)")
-        print("4. Convert cSOL → SOL (burn; Treasury stealth payouts)")
-        print("5. List Stealth addresses for a wallet")
-        print("6. Sweep Stealth → destination pubkey")
-        print("7. Show Merkle Trees (Wrapper & Treasury Stealth)")
-        print("8. Status (users, notes, treasury)")
-        print("9. Replay State from Event Log")
+        print("3. Convert cSOL → SOL (burn; Treasury stealth payouts)")
+        print("4. List Stealth addresses for a wallet")
+        print("5. Sweep Stealth → destination pubkey")
+        print("6. Show Merkle Trees (Wrapper & Treasury Stealth)")
+        print("7. Status (users, notes, treasury)")
+        print("8. Replay State from Event Log")
         print("q. Quit")
         choice = input("> ").strip().lower()
 
@@ -1386,28 +1294,24 @@ def main() -> None:
         elif choice == "2":
             flow_withdraw_simple()
         elif choice == "3":
-            flow_blind_note_handoff()
-        elif choice == "4":
             flow_convert_csol_to_sol_split()
-        elif choice == "5":
+        elif choice == "4":
             flow_list_stealth_for_owner()
-        elif choice == "6":
+        elif choice == "5":
             flow_sweep_stealth_to_pubkey()
-        elif choice == "7":
+        elif choice == "6":
             print_merkle_status()
-        elif choice == "8":
+        elif choice == "7":
             flow_status()
-        elif choice == "9":
+        elif choice == "8":
             n = events_replay()
             print(f"{C.OK}Replayed {n} events and rebuilt state from tx_log.{C.RST}")
-            # After replay, local roots changed → update on-chain once
             _update_onchain_roots()
         elif choice == "q":
             print("Bye.")
             break
         else:
             print("Invalid choice.")
-
 
 if __name__ == "__main__":
     try:

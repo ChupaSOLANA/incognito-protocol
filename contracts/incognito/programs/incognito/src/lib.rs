@@ -3,14 +3,12 @@ use anchor_lang::solana_program::sysvar::rent::Rent;
 use anchor_lang::solana_program::hash::hashv;
 use arcium_anchor::prelude::*;
 
-// ----------------------- Arcium comp-def offsets -----------------------
 const COMP_DEF_OFFSET_ADD_TOGETHER: u32 = comp_def_offset("add_together");
 const COMP_DEF_OFFSET_DEPOSIT_SHIELDED: u32 = comp_def_offset("deposit_shielded");
 const COMP_DEF_OFFSET_WITHDRAW_SHIELDED: u32 = comp_def_offset("withdraw_shielded");
 const COMP_DEF_OFFSET_DEPOSIT_NOTE: u32 = comp_def_offset("deposit_note");
 const COMP_DEF_OFFSET_WITHDRAW_NOTE_CHECK: u32 = comp_def_offset("withdraw_note_check");
 
-// ----------------------- Seeds / Constants -----------------------------
 pub const SOL_BALANCE_SEED: &[u8] = b"sol_balance";
 pub const SOL_VAULT_SEED: &[u8] = b"sol_vault";
 pub const POOL_STATE_SEED: &[u8] = b"pool_state";
@@ -18,10 +16,8 @@ pub const NULLIFIER_SEED: &[u8] = b"nf";
 pub const MAX_MERKLE_DEPTH: usize = 32;
 pub const COMMITMENT_SEED: &[u8] = b"commitment";
 
-// ----------------------- Program ID -----------------------------------
 declare_id!("4N49EyRoX9p9zoiv1weeeqpaJTGbEHizbzZVgrsrVQeC");
 
-// ----------------------- Accounts (existing/simple) --------------------
 #[account]
 pub struct SolBalance {
     pub ciphertext: [u8; 32],
@@ -30,7 +26,6 @@ pub struct SolBalance {
     pub bump: u8,
 }
 
-// ----------------------- SOL Vault Account -----------------------------
 #[account]
 pub struct SolVault {
     pub total_deposited: u64,
@@ -38,15 +33,14 @@ pub struct SolVault {
 }
 
 fn vault_space() -> usize {
-    8 + 8 + 1 // discriminator + total_deposited + bump
+    8 + 8 + 1
 }
 
-// ----------------------- Merkle Tree Account (Root Only) ---------------
 #[account]
 pub struct PoolState {
-    pub root: [u8; 32], // Current Merkle root
-    pub depth: u8,      // Tree depth
-    pub leaf_count: u64, // Number of leaves inserted
+    pub root: [u8; 32],
+    pub depth: u8,
+    pub leaf_count: u64,
     pub bump: u8,
 }
 
@@ -57,10 +51,9 @@ pub struct NullifierMarker {}
 pub struct CommitmentMarker {}
 
 fn ps_space() -> usize {
-    8 + 32 + 1 + 8 + 1 // discriminator + root + depth + leaf_count + bump
+    8 + 32 + 1 + 8 + 1
 }
 
-// ----------------------- Util: hashing & zeros -------------------------
 #[inline]
 fn h2(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     hashv(&[a, b]).to_bytes()
@@ -117,18 +110,15 @@ fn verify_and_insert_leaf(
 ) -> Result<()> {
     let ps = pool_state;
 
-    // Capacity check
     let cap = 1u128
         .checked_shl(ps.depth as u32)
         .ok_or(ErrorCode::InvalidDepth)?;
     require!((ps.leaf_count as u128) < cap, ErrorCode::TreeFull);
 
-    // Path length check
     require!(merkle_path.len() == ps.depth as usize, ErrorCode::InvalidPath);
 
     let index = ps.leaf_count;
 
-    // Step 1: verify provided path reconstructs current root using zero leaf at new index
     let mut current = [0u8; 32];
     let mut idx = index;
 
@@ -143,7 +133,6 @@ fn verify_and_insert_leaf(
 
     require!(current == ps.root, ErrorCode::InvalidMerklePath);
 
-    // Step 2: compute new root with actual leaf
     current = leaf;
     idx = index;
 
@@ -156,7 +145,6 @@ fn verify_and_insert_leaf(
         idx >>= 1;
     }
 
-    // Update state
     ps.root = current;
     ps.leaf_count = ps
         .leaf_count
@@ -166,7 +154,6 @@ fn verify_and_insert_leaf(
     Ok(())
 }
 
-// Backward-compat wrapper
 fn verify_and_insert_commitment(
     pool_state: &mut PoolState,
     commitment: [u8; 32],
@@ -175,7 +162,6 @@ fn verify_and_insert_commitment(
     verify_and_insert_leaf(pool_state, commitment, merkle_path)
 }
 
-// Leaf = H2(commitment, h1(nullifier))
 fn verify_and_insert_commitment_with_nf_hash(
     pool_state: &mut PoolState,
     commitment: [u8; 32],
@@ -186,11 +172,6 @@ fn verify_and_insert_commitment_with_nf_hash(
     verify_and_insert_leaf(pool_state, leaf, merkle_path)
 }
 
-// ======================================================================
-// Accounts for comp-defs/queues/callbacks must be above #[arcium_program]
-// ======================================================================
-
-// ----------------------- Init Comp-Def Accounts ------------------------
 #[init_computation_definition_accounts("add_together", payer)]
 #[derive(Accounts)]
 pub struct InitAddTogetherCompDef<'info> {
@@ -199,7 +180,6 @@ pub struct InitAddTogetherCompDef<'info> {
     #[account(mut, address = derive_mxe_pda!())]
     pub mxe_account: Box<Account<'info, MXEAccount>>,
     #[account(mut)]
-    /// CHECK:
     pub comp_def_account: UncheckedAccount<'info>,
     pub arcium_program: Program<'info, Arcium>,
     pub system_program: Program<'info, System>,
@@ -213,7 +193,6 @@ pub struct InitDepositShieldedCompDef<'info> {
     #[account(mut, address = derive_mxe_pda!())]
     pub mxe_account: Box<Account<'info, MXEAccount>>,
     #[account(mut)]
-    /// CHECK:
     pub comp_def_account: UncheckedAccount<'info>,
     pub arcium_program: Program<'info, Arcium>,
     pub system_program: Program<'info, System>,
@@ -227,7 +206,6 @@ pub struct InitWithdrawShieldedCompDef<'info> {
     #[account(mut, address = derive_mxe_pda!())]
     pub mxe_account: Box<Account<'info, MXEAccount>>,
     #[account(mut)]
-    /// CHECK:
     pub comp_def_account: UncheckedAccount<'info>,
     pub arcium_program: Program<'info, Arcium>,
     pub system_program: Program<'info, System>,
@@ -241,7 +219,6 @@ pub struct InitDepositNoteCompDef<'info> {
     #[account(mut, address = derive_mxe_pda!())]
     pub mxe_account: Box<Account<'info, MXEAccount>>,
     #[account(mut)]
-    /// CHECK:
     pub comp_def_account: UncheckedAccount<'info>,
     pub arcium_program: Program<'info, Arcium>,
     pub system_program: Program<'info, System>,
@@ -255,13 +232,11 @@ pub struct InitWithdrawNoteCheckCompDef<'info> {
     #[account(mut, address = derive_mxe_pda!())]
     pub mxe_account: Box<Account<'info, MXEAccount>>,
     #[account(mut)]
-    /// CHECK:
     pub comp_def_account: UncheckedAccount<'info>,
     pub arcium_program: Program<'info, Arcium>,
     pub system_program: Program<'info, System>,
 }
 
-// ----------------------- Queue Accounts -------------------------------
 #[queue_computation_accounts("add_together", payer)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64)]
@@ -280,13 +255,10 @@ pub struct AddTogether<'info> {
     #[account(address = derive_mxe_pda!())]
     pub mxe_account: Account<'info, MXEAccount>,
     #[account(mut, address = derive_mempool_pda!())]
-    /// CHECK:
     pub mempool_account: UncheckedAccount<'info>,
     #[account(mut, address = derive_execpool_pda!())]
-    /// CHECK:
     pub executing_pool: UncheckedAccount<'info>,
     #[account(mut, address = derive_comp_pda!(computation_offset))]
-    /// CHECK:
     pub computation_account: UncheckedAccount<'info>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_ADD_TOGETHER))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
@@ -318,13 +290,10 @@ pub struct DepositShielded<'info> {
     #[account(address = derive_mxe_pda!())]
     pub mxe_account: Account<'info, MXEAccount>,
     #[account(mut, address = derive_mempool_pda!())]
-    /// CHECK:
     pub mempool_account: UncheckedAccount<'info>,
     #[account(mut, address = derive_execpool_pda!())]
-    /// CHECK:
     pub executing_pool: UncheckedAccount<'info>,
     #[account(mut, address = derive_comp_pda!(computation_offset))]
-    /// CHECK:
     pub computation_account: UncheckedAccount<'info>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_DEPOSIT_SHIELDED))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
@@ -356,13 +325,10 @@ pub struct WithdrawShielded<'info> {
     #[account(address = derive_mxe_pda!())]
     pub mxe_account: Account<'info, MXEAccount>,
     #[account(mut, address = derive_mempool_pda!())]
-    /// CHECK:
     pub mempool_account: UncheckedAccount<'info>,
     #[account(mut, address = derive_execpool_pda!())]
-    /// CHECK:
     pub executing_pool: UncheckedAccount<'info>,
     #[account(mut, address = derive_comp_pda!(computation_offset))]
-    /// CHECK:
     pub computation_account: UncheckedAccount<'info>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_WITHDRAW_SHIELDED))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
@@ -394,13 +360,10 @@ pub struct DepositNote<'info> {
     #[account(address = derive_mxe_pda!())]
     pub mxe_account: Account<'info, MXEAccount>,
     #[account(mut, address = derive_mempool_pda!())]
-    /// CHECK:
     pub mempool_account: UncheckedAccount<'info>,
     #[account(mut, address = derive_execpool_pda!())]
-    /// CHECK:
     pub executing_pool: UncheckedAccount<'info>,
     #[account(mut, address = derive_comp_pda!(computation_offset))]
-    /// CHECK:
     pub computation_account: UncheckedAccount<'info>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_DEPOSIT_NOTE))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
@@ -432,13 +395,10 @@ pub struct WithdrawNoteCheck<'info> {
     #[account(address = derive_mxe_pda!())]
     pub mxe_account: Account<'info, MXEAccount>,
     #[account(mut, address = derive_mempool_pda!())]
-    /// CHECK:
     pub mempool_account: UncheckedAccount<'info>,
     #[account(mut, address = derive_execpool_pda!())]
-    /// CHECK:
     pub executing_pool: UncheckedAccount<'info>,
     #[account(mut, address = derive_comp_pda!(computation_offset))]
-    /// CHECK:
     pub computation_account: UncheckedAccount<'info>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_WITHDRAW_NOTE_CHECK))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
@@ -452,7 +412,6 @@ pub struct WithdrawNoteCheck<'info> {
     pub arcium_program: Program<'info, Arcium>,
 }
 
-// ----------------------- Callback Accounts -----------------------------
 #[callback_accounts("add_together")]
 #[derive(Accounts)]
 pub struct AddTogetherCallback<'info> {
@@ -460,7 +419,6 @@ pub struct AddTogetherCallback<'info> {
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_ADD_TOGETHER))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
-    /// CHECK:
     pub instructions_sysvar: AccountInfo<'info>,
 }
 
@@ -471,7 +429,6 @@ pub struct DepositShieldedCallback<'info> {
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_DEPOSIT_SHIELDED))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
-    /// CHECK:
     pub instructions_sysvar: AccountInfo<'info>,
 }
 
@@ -482,7 +439,6 @@ pub struct WithdrawShieldedCallback<'info> {
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_WITHDRAW_SHIELDED))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
-    /// CHECK:
     pub instructions_sysvar: AccountInfo<'info>,
 }
 
@@ -493,7 +449,6 @@ pub struct DepositNoteCallback<'info> {
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_DEPOSIT_NOTE))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
-    /// CHECK:
     pub instructions_sysvar: AccountInfo<'info>,
 }
 
@@ -504,11 +459,9 @@ pub struct WithdrawNoteCheckCallback<'info> {
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_WITHDRAW_NOTE_CHECK))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
-    /// CHECK:
     pub instructions_sysvar: AccountInfo<'info>,
 }
 
-// ----------------------- Vault Accounts --------------------------------
 #[derive(Accounts)]
 pub struct InitVault<'info> {
     #[account(mut)]
@@ -524,7 +477,6 @@ pub struct InitVault<'info> {
     pub system_program: Program<'info, System>,
 }
 
-// ----------------------- Pool & Note Management Accounts ---------------
 #[derive(Accounts)]
 pub struct InitPool<'info> {
     #[account(mut)]
@@ -563,7 +515,6 @@ pub struct DepositToPool<'info> {
     #[account(mut, seeds = [POOL_STATE_SEED], bump = pool_state.bump)]
     pub pool_state: Account<'info, PoolState>,
 
-    // NEW: Ensure commitment uniqueness
     #[account(
         init,
         payer = depositor,
@@ -573,7 +524,6 @@ pub struct DepositToPool<'info> {
     )]
     pub commitment_marker: Account<'info, CommitmentMarker>,
 
-    /// CHECK: Wrapper stealth address for fee payment (one-time address, no validation needed)
     #[account(mut)]
     pub wrapper_stealth_address: UncheckedAccount<'info>,
 
@@ -582,11 +532,11 @@ pub struct DepositToPool<'info> {
 
 #[derive(Accounts)]
 #[instruction(
-    amount: u64, 
-    commitment: [u8; 32], 
-    merkle_path: Vec<[u8; 32]>, 
-    nullifier: [u8; 32], 
-    index: u64, 
+    amount: u64,
+    commitment: [u8; 32],
+    merkle_path: Vec<[u8; 32]>,
+    nullifier: [u8; 32],
+    index: u64,
     recipient_pubkey: [u8; 32],
     change_commitment: Option<[u8; 32]>,
     change_nf_hash: Option<[u8; 32]>,
@@ -615,7 +565,6 @@ pub struct WithdrawFromPool<'info> {
     )]
     pub nullifier_marker: Account<'info, NullifierMarker>,
 
-    /// CHECK: When creating change, must match expected PDA. When not creating change, ignored.
     #[account(mut)]
     pub change_commitment_marker: UncheckedAccount<'info>,
 
@@ -649,7 +598,6 @@ pub struct VerifyProof<'info> {
     #[account(seeds = [POOL_STATE_SEED], bump = pool_state.bump)]
     pub pool_state: Account<'info, PoolState>,
 
-    // If this PDA already exists, Anchor will fail the init, preventing double-spend.
     #[account(
         init,
         payer = payer,
@@ -662,14 +610,10 @@ pub struct VerifyProof<'info> {
     pub system_program: Program<'info, System>,
 }
 
-// ======================================================================
-// Program
-// ======================================================================
 #[arcium_program]
 pub mod incognito {
     use super::*;
 
-    // ----------------------- Vault Management -----------------------
     pub fn init_vault(ctx: Context<InitVault>) -> Result<()> {
         let vault = &mut ctx.accounts.sol_vault;
         vault.total_deposited = 0;
@@ -679,7 +623,6 @@ pub mod incognito {
         Ok(())
     }
 
-    // ----------------------- add_together -----------------------
     pub fn init_add_together_comp_def(ctx: Context<InitAddTogetherCompDef>) -> Result<()> {
         init_comp_def(ctx.accounts, true, 0, None, None)?;
         Ok(())
@@ -726,7 +669,6 @@ pub mod incognito {
         Ok(())
     }
 
-    // ----------------------- deposit_shielded -----------------------
     pub fn init_deposit_shielded_comp_def(
         ctx: Context<InitDepositShieldedCompDef>,
     ) -> Result<()> {
@@ -775,7 +717,6 @@ pub mod incognito {
         Ok(())
     }
 
-    // ----------------------- withdraw_shielded -----------------------
     pub fn init_withdraw_shielded_comp_def(
         ctx: Context<InitWithdrawShieldedCompDef>,
     ) -> Result<()> {
@@ -827,7 +768,6 @@ pub mod incognito {
         Ok(())
     }
 
-    // ----------------------- Merkle Pool (Root Only) ----------------------
     pub fn init_pool(ctx: Context<InitPool>, depth: u8) -> Result<()> {
         require!((depth as usize) <= MAX_MERKLE_DEPTH, ErrorCode::InvalidDepth);
 
@@ -850,7 +790,6 @@ pub mod incognito {
         Ok(())
     }
 
-    /// Deposit SOL to pool and insert commitment bound with nf_hash
     pub fn deposit_to_pool(
         ctx: Context<DepositToPool>,
         amount: u64,
@@ -860,14 +799,11 @@ pub mod incognito {
     ) -> Result<()> {
         require!(amount > 0, ErrorCode::InvalidAmount);
 
-        // NEW: Define wrapper fee (0.05 SOL = 50_000_000 lamports)
         const WRAPPER_FEE: u64 = 50_000_000;
         require!(amount > WRAPPER_FEE, ErrorCode::InsufficientDepositAmount);
 
         let vault_amount = amount.checked_sub(WRAPPER_FEE).ok_or(ErrorCode::Overflow)?;
 
-        // Transfer wrapper fee to stealth address
-        // The stealth address will be created automatically if it doesn't exist
         anchor_lang::solana_program::program::invoke(
             &anchor_lang::solana_program::system_instruction::transfer(
                 &ctx.accounts.depositor.key(),
@@ -881,7 +817,6 @@ pub mod incognito {
             ],
         )?;
 
-        // Transfer remaining SOL to vault
         let vault_ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.depositor.key(),
             &ctx.accounts.sol_vault.key(),
@@ -895,7 +830,6 @@ pub mod incognito {
             ],
         )?;
 
-        // Update vault accounting (only vault_amount, not including fee)
         ctx.accounts.sol_vault.total_deposited = ctx
             .accounts
             .sol_vault
@@ -903,7 +837,6 @@ pub mod incognito {
             .checked_add(vault_amount)
             .ok_or(ErrorCode::Overflow)?;
 
-        // Insert leaf = H2(commitment, nf_hash)
         let index = ctx.accounts.pool_state.leaf_count;
         verify_and_insert_commitment_with_nf_hash(
             &mut ctx.accounts.pool_state,
@@ -923,7 +856,7 @@ pub mod incognito {
 
         Ok(())
     }
-    /// Withdraw SOL from pool with proof verification (bound to nullifier)
+
     pub fn withdraw_from_pool(
         ctx: Context<WithdrawFromPool>,
         amount: u64,
@@ -938,7 +871,7 @@ pub mod incognito {
     ) -> Result<()> {
         require!(amount > 0, ErrorCode::InvalidAmount);
 
-        let ps = &mut ctx.accounts.pool_state;  // CHANGED: now mutable
+        let ps = &mut ctx.accounts.pool_state;
 
         let recipient_key_bytes = ctx.accounts.recipient.key().to_bytes();
         require!(
@@ -946,40 +879,32 @@ pub mod incognito {
             ErrorCode::UnauthorizedRecipient
         );
 
-        // Bind NF to commitment by hashing nullifier and building leaf
         let nf_hash = h1(&nullifier);
         let bound_leaf = leaf_from(&commitment, &nf_hash);
 
-        // Verify Merkle proof
         require!(
             verify_merkle_path(bound_leaf, &merkle_path, ps.root, index, ps.depth),
             ErrorCode::InvalidMerkleProof
         );
 
-        // NEW: Create change note marker BEFORE the main transfer to avoid balance mismatch
         if let (Some(change_c), Some(change_nfh), Some(change_path)) =
             (change_commitment, change_nf_hash, change_merkle_path) {
 
-            // Derive expected PDA
             let (expected_pda, bump) = Pubkey::find_program_address(
                 &[COMMITMENT_SEED, change_c.as_ref()],
                 ctx.program_id,
             );
 
-            // Verify provided account matches expected PDA
             require!(
                 ctx.accounts.change_commitment_marker.key() == expected_pda,
                 ErrorCode::InvalidChangeMarker
             );
 
-            // Only create if account doesn't exist yet
             if ctx.accounts.change_commitment_marker.data_is_empty() {
-                // Create the commitment marker account
                 let rent = Rent::get()?;
                 let space = 8;
                 let lamports_needed = rent.minimum_balance(space);
 
-                // Create PDA using system program, paid by recipient
                 anchor_lang::solana_program::program::invoke_signed(
                     &anchor_lang::solana_program::system_instruction::create_account(
                         &ctx.accounts.recipient.key(),
@@ -1011,11 +936,9 @@ pub mod incognito {
             });
         }
 
-        // Vault balance check
         let vault_balance = ctx.accounts.sol_vault.to_account_info().lamports();
         require!(vault_balance >= amount, ErrorCode::InsufficientVaultBalance);
 
-        // Transfer lamports
         **ctx
             .accounts
             .sol_vault
@@ -1027,7 +950,6 @@ pub mod incognito {
             .to_account_info()
             .try_borrow_mut_lamports()? += amount;
 
-        // Update vault accounting
         ctx.accounts.sol_vault.total_deposited = ctx
             .accounts
             .sol_vault
@@ -1065,14 +987,9 @@ pub mod incognito {
     ) -> Result<()> {
         let ps = &ctx.accounts.pool_state;
 
-        // No explicit data_is_empty() check; Anchor init guarantees uniqueness of nullifier PDA.
-        // If PDA exists, the init will fail before this code runs, preventing double-spend.
-
-        // Bind nullifier and commitment
         let nf_hash = h1(&nullifier);
         let bound_leaf = leaf_from(&commitment, &nf_hash);
 
-        // Verify Merkle proof
         require!(
             verify_merkle_path(bound_leaf, &merkle_path, ps.root, index, ps.depth),
             ErrorCode::InvalidMerkleProof
@@ -1086,7 +1003,6 @@ pub mod incognito {
         Ok(())
     }
 
-    // ----------------------- Note circuits (deposit/withdraw) --------
     pub fn init_deposit_note_comp_def(ctx: Context<InitDepositNoteCompDef>) -> Result<()> {
         init_comp_def(ctx.accounts, true, 0, None, None)?;
         Ok(())
@@ -1172,8 +1088,8 @@ pub mod incognito {
             ComputationOutputs::Success(WithdrawNoteCheckOutput { field_0 }) => field_0,
             _ => return Err(ErrorCode::AbortedComputation.into()),
         };
-        let enc = group.field_0; // Enc<Shared,u64>
-        let ok = group.field_1; // bool
+        let enc = group.field_0;
+        let ok = group.field_1;
         emit!(WithdrawNoteCheckEvent {
             note_amount_ct: enc.ciphertexts[0],
             nonce: enc.nonce.to_le_bytes(),
@@ -1183,7 +1099,6 @@ pub mod incognito {
     }
 }
 
-// ----------------------- Events & Errors -----------------------
 #[event]
 pub struct VaultInitialized {}
 
@@ -1192,7 +1107,7 @@ pub struct RealDepositEvent {
     pub depositor: Pubkey,
     pub amount: u64,
     pub commitment: [u8; 32],
-    pub nf_hash: [u8; 32],  // Added: needed to reconstruct leaf = h2(commitment, nf_hash)
+    pub nf_hash: [u8; 32],
     pub index: u64,
     pub root: [u8; 32],
 }

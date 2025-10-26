@@ -1,4 +1,3 @@
-# crypto_core/stealth.py
 from __future__ import annotations
 import base58
 import hashlib

@@ -16,9 +16,9 @@ import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
 import { PublicKey, SystemProgram } from "@solana/web3.js";
 // @ts-ignore - ESM import resolution
-import { Incognito } from "../target/types/incognito";
+import { Incognito } from "../target/types/incognito.js";
 // @ts-ignore - ESM import resolution
-import { POOL_STATE_SEED, SOL_VAULT_SEED } from "./utils";
+import { POOL_STATE_SEED, SOL_VAULT_SEED } from "./utils.js";
 
 async function main() {
   const args = process.argv.slice(2);

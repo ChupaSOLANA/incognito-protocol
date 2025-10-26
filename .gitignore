@@ -7,6 +7,9 @@ __pycache__/
 .venv/
 .env
 *.env
+*.bak
+*Test.py
+*_test.py
 
 # --------------------
 # Editors / IDE
@@ -40,6 +43,7 @@ __pycache__/
 receipts/
 merkle_state.json
 pool_merkle_state.json
+notes/  # Credential files (NEVER commit - contains secrets!)
 
 # --------------------
 # Solana / Anchor / Rust

@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 """
-Setup complet pour localnet/devnet :
+Setup script for arcium-localnet environment:
 
-- Détection du workspace Anchor (Anchor.toml) ou via --workspace-root
+- Assumes arcium-localnet is already running (with built-in incognito program)
 - (Optionnel) purge du dossier data à la racine du repo
-- (Optionnel) clean (cargo clean + .anchor/)
-- anchor build
-- Déploiement MANUEL : `solana program deploy` (sans --program-id) -> NOUVEL ID à chaque run
-- Attente que le RPC voie le programme
-- (Optionnel) IDL on-chain: `anchor idl init` puis fallback `anchor idl upgrade`
-- (Optionnel) setup Token-2022 + CT (mint, ATAs, configure)
-- Export d'une config déploiement (PROGRAM_ID, TREE_SEED_HEX, IDL path, RPC, authority)
+- Initialize incognito pool
+- Setup Token-2022 + CT (mint, wrapper, users with ATAs)
+- Export configuration (PROGRAM_ID from Arcium, paths, etc.)
 
-⚠️ Aucun encodage/modification du Program ID dans Anchor.toml/lib.rs.
+⚠️ Does NOT build or deploy - the incognito program is built-in to arcium-localnet.
 
-Dépendances CLI : anchor, solana, spl-token
+Dépendances CLI : solana, spl-token, npx/ts-node
 """
 
 import os
@@ -31,21 +26,18 @@ import shutil
 import time
 from typing import Optional, List
 
-# ---------- Constantes ----------
 TOKEN_2022_PROGRAM_ID = os.environ.get(
     "TOKEN_2022_PROGRAM_ID",
-    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  # SPL Token-2022 officiel
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
 )
 DEFAULT_USERS = [u.strip() for u in os.environ.get("USERS_CSV", "A,B,C").split(",") if u.strip()]
 DEFAULT_AIRDROP_SOL = float(os.environ.get("AIRDROP_SOL", "50"))
-DEFAULT_PROGRAM_NAME = os.environ.get("PROGRAM_NAME", "merkle_registry")
+DEFAULT_PROGRAM_ID = "4N49EyRoX9p9zoiv1weeeqpaJTGbEHizbzZVgrsrVQeC"
 
-# ✅ Chemin par défaut pour sauvegarder les keypairs en JSON
 DEFAULT_KEYS_DIR = pathlib.Path(
     os.environ.get("KEYS_DIR", "/Users/alex/Desktop/incognito-protocol-1/keys")
 ).expanduser().resolve()
 
-# ---------- Utils shell ----------
 def run(cmd, env=None, capture=True, cwd=None):
     """Exécute une commande (str ou list). Lève RuntimeError si code != 0.
        Retourne "" si capture=False (stdout ignoré)."""
@@ -66,15 +58,14 @@ def run(cmd, env=None, capture=True, cwd=None):
         )
     return res.stdout.strip() if capture else ""
 
-# ---------- Purge data (repo_root/data) ----------
 def purge_data_dir():
     """
     Supprime tout le contenu de <repo_root>/data où:
     repo_root = Path(__file__).parent.parent  (…/incognito-protocol-1)
     """
-    script_dir = pathlib.Path(__file__).resolve().parent          # …/clients/cli
-    repo_root = script_dir.parent.parent                          # …/incognito-protocol-1
-    data_dir = (repo_root / "data").resolve()                     # …/incognito-protocol-1/data
+    script_dir = pathlib.Path(__file__).resolve().parent
+    repo_root = script_dir.parent.parent
+    data_dir = (repo_root / "data").resolve()
 
     if data_dir.exists() and data_dir.is_dir():
         print(f"== Purging data dir == {data_dir}")
@@ -90,7 +81,6 @@ def purge_data_dir():
         data_dir.mkdir(parents=True, exist_ok=True)
         print(f"== Created empty data dir == {data_dir}")
 
-# ---------- Solana helpers ----------
 def get_current_keypair_path() -> Optional[str]:
     out = run("solana config get")
     m = re.search(r"Keypair Path:\s+(.+)", out)
@@ -137,10 +127,11 @@ def rpc_ready() -> bool:
         return False
 
 def ensure_localnet_running():
+    """Check that we can reach the RPC endpoint (arcium-localnet should be running)"""
     url = get_current_rpc_url()
     if "127.0.0.1" in url or "localhost" in url:
         if not rpc_ready():
-            raise RuntimeError("Localnet RPC injoignable. Lance `solana-test-validator -r` dans un autre terminal.")
+            raise RuntimeError("Localnet RPC unreachable. Make sure arcium-localnet is running: arcium-localnet start")
 
 # ---------- Anchor workspace detection ----------
 def find_workspace_root(start: pathlib.Path) -> Optional[pathlib.Path]:
@@ -164,82 +155,20 @@ def detect_provider_wallet_path(workspace_root: pathlib.Path) -> pathlib.Path:
             return pathlib.Path(os.path.expanduser(m.group(1))).resolve()
     return pathlib.Path(os.path.expanduser("~/.config/solana/id.json")).resolve()
 
-# ---------- Anchor ops (avec cwd=workspace_root) ----------
-def anchor_clean(workspace_root: pathlib.Path):
-    try:
-        run("cargo clean", capture=False, cwd=workspace_root)
-    except Exception:
-        pass
-    anchor_dir = workspace_root / ".anchor"
-    if anchor_dir.exists():
-        shutil.rmtree(anchor_dir, ignore_errors=True)
-
-def anchor_build(workspace_root: pathlib.Path):
-    if not (workspace_root / "Anchor.toml").exists():
-        raise FileNotFoundError(f"Anchor.toml introuvable à {workspace_root}")
-    run("anchor build", capture=False, cwd=workspace_root)
-
-def ensure_deployer_funded(workspace_root: pathlib.Path, amount_sol: float):
-    wallet_path = detect_provider_wallet_path(workspace_root)
-    pubkey = wallet_pubkey_from_file(wallet_path)
-    print(f"== Funding deployer wallet {pubkey} ==")
-    airdrop(pubkey, amount_sol)
-    bal = balance_of(pubkey)
-    print(f"Deployer balance: {bal:.4f} SOL")
-
-# ---------- Déploiement manuel (NOUVEL ID à chaque run) ----------
+# ---------- Base58 pattern for parsing addresses ----------
 _BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,}"
 
-def parse_program_id_from_deploy_stdout(stdout: str) -> Optional[str]:
-    for line in stdout.splitlines():
-        m = re.search(r"Program Id:\s+(" + _BASE58 + r")", line)
-        if m:
-            return m.group(1)
-    m2 = re.search(_BASE58, stdout)
-    return m2.group(0) if m2 else None
-
-def manual_deploy_and_get_pid(workspace_root: pathlib.Path, program_name: str) -> str:
-    so = workspace_root / "target" / "deploy" / f"{program_name}.so"
-    if not so.exists():
-        raise FileNotFoundError(f"Binaire manquant: {so}")
-    out = run(f"solana program deploy {so}", capture=True, cwd=workspace_root)
-    print(out)
-    pid = parse_program_id_from_deploy_stdout(out)
-    if not pid:
-        raise RuntimeError("Impossible d'extraire le Program Id depuis la sortie de `solana program deploy`.")
-    return pid
-
-def wait_until_program_is_visible(program_id: str, retries: int = 30, delay: float = 0.5) -> bool:
-    for _ in range(retries):
-        try:
-            out = run(f"solana program show {program_id}")
-            if "Program Id:" in out or "Upgradeable" in out or "ProgramData" in out:
-                return True
-        except Exception:
-            pass
-        time.sleep(delay)
-    return False
-
-def init_or_upgrade_idl(workspace_root: pathlib.Path, program_name: str, program_id: str):
-    idl_json = workspace_root / "target" / "idl" / f"{program_name}.json"
-    if not idl_json.exists():
-        print("!! WARN: IDL JSON introuvable, skip IDL step.")
-        return
-    try:
-        print("== IDL init ==")
-        run(f"anchor idl init -f {idl_json} {program_id}", capture=False, cwd=workspace_root)
-        return
-    except Exception as e:
-        print(f"!! WARN: anchor idl init failed ({e}). Trying upgrade ...")
-        try:
-            run(f"anchor idl upgrade -f {idl_json} {program_id}", capture=False, cwd=workspace_root)
-        except Exception as e2:
-            print(f"!! WARN: anchor idl upgrade also failed ({e2}). Le binaire est déployé, on continue.")
-
 # ---------- Token-2022 ----------
-def keygen(outfile: pathlib.Path) -> str:
+def keygen(outfile: pathlib.Path, force: bool = True) -> str:
     outfile = outfile.with_suffix(".json")
     outfile.parent.mkdir(parents=True, exist_ok=True)
+
+    # If file exists and force=False, just return existing pubkey
+    if not force and outfile.exists():
+        pub = run(f"solana-keygen pubkey {outfile}")
+        return pub
+
+    # Otherwise generate new keypair
     run(f"solana-keygen new --outfile {outfile} --no-bip39-passphrase --force --silent")
     pub = run(f"solana-keygen pubkey {outfile}")
     return pub
@@ -323,57 +252,72 @@ def setup_token_flow(keys_dir: pathlib.Path, users: List[str], airdrop_sol: floa
     prev_keypair = get_current_keypair_path()
 
     print("== Generating keypairs ==")
-    pool_key = keys_dir / "pool.json"
     wrapper_key = keys_dir / "wrapper.json"
     mint_key = keys_dir / "mint.json"
     users_keys = [keys_dir / f"user{u}.json" for u in users]
 
-    pool_pub = keygen(pool_key)
     wrapper_pub = keygen(wrapper_key)
-    mint_pub = keygen(mint_key)
+    # IMPORTANT: Reuse existing mint keypair if it exists (don't regenerate)
+    mint_key_existed = mint_key.exists()
+    mint_pub = keygen(mint_key, force=False)
+    if mint_key_existed:
+        print(f"  ✓ Reusing existing mint keypair: {mint_pub}")
+    else:
+        print(f"  ✓ Created new mint keypair: {mint_pub}")
     users_pubs = [keygen(k) for k in users_keys]
 
     print("== Airdropping SOL ==")
-    airdrop(pool_pub, airdrop_sol)
+    airdrop(wrapper_pub, airdrop_sol * 2)  # Extra SOL for wrapper to pay setup fees
     for up in users_pubs:
         airdrop(up, airdrop_sol)
 
     print("== Creating Token-2022 mint with CT enabled ==")
-    token_mint = create_token_with_ct(mint_key, pool_key)
-    assert token_mint == mint_pub, f"Mint pubkey mismatch: {token_mint} != {mint_pub}"
+    # Check if mint already exists on-chain
+    try:
+        existing_mint_info = run(f"solana account {mint_pub} --output json 2>/dev/null", check=False)
+        mint_exists = existing_mint_info and "lamports" in existing_mint_info
+    except:
+        mint_exists = False
+
+    if mint_exists:
+        print(f"  ✓ Mint already exists on-chain: {mint_pub}")
+        token_mint = mint_pub
+    else:
+        print(f"  ✓ Creating new mint on-chain: {mint_pub}")
+        token_mint = create_token_with_ct(mint_key, wrapper_key)
+        assert token_mint == mint_pub, f"Mint pubkey mismatch: {token_mint} != {mint_pub}"
 
     print("== Setting wrapper as mint authority ==")
-    set_mint_authority(token_mint, pool_key, wrapper_pub)
+    set_mint_authority(token_mint, wrapper_key, wrapper_pub)
 
-    print("== Creating ATAs ==")
-    pool_ata = create_ata(token_mint, pool_pub, pool_key)
-    wrapper_ata = create_ata(token_mint, wrapper_pub, pool_key)
+    print("== Creating wrapper ATA ==")
+    wrapper_ata = create_ata(token_mint, wrapper_pub, wrapper_key)
 
+    print("== Creating user ATAs (users pay their own fees) ==")
     users_atas = []
     for up, ukey in zip(users_pubs, users_keys):
         try:
-            ata_addr = create_ata(token_mint, up, pool_key)
+            ata_addr = create_ata(token_mint, up, ukey)
         except Exception as e:
             print(f"!! WARN: create_ata failed for user pub {up}: {e}")
             ata_addr = ""
         users_atas.append(ata_addr)
 
-    print("== Enabling CT on all ATAs ==")
-    configure_ct_account(pool_ata, pool_key, fee_payer_keyfile=pool_key)
-    configure_ct_account(wrapper_ata, wrapper_key, fee_payer_keyfile=pool_key)
+    print("== Enabling CT on ATAs ==")
+    configure_ct_account(wrapper_ata, wrapper_key, fee_payer_keyfile=wrapper_key)
     for ata, ukey in zip(users_atas, users_keys):
         if ata:
             try:
-                configure_ct_account(ata, ukey, fee_payer_keyfile=pool_key)
+                configure_ct_account(ata, ukey, fee_payer_keyfile=ukey)
             except Exception as e:
                 print(f"!! WARN: configure_ct_account failed for {ata}: {e}")
 
-    print("== Seeding wrapper reserve with 100 confidential tokens (fee-payer = pool) ==")
+    print("== Seeding wrapper reserve with 100 confidential tokens (fee-payer = wrapper) ==")
     seed_wrapper_confidential(
         mint=token_mint,
         amount=100,
         wrapper_keyfile=wrapper_key,
-        pool_keyfile=pool_key,
+        pool_keyfile=wrapper_key,  # Use wrapper to pay fees
         wrapper_ata=wrapper_ata,
     )
 
@@ -408,12 +352,6 @@ def setup_token_flow(keys_dir: pathlib.Path, users: List[str], airdrop_sol: floa
                 "keyfile": str(mint_key),
                 "mint_authority": wrapper_pub
             },
-            "pool": {
-                "pubkey": pool_pub,
-                "keyfile": str(pool_key),
-                "ata": pool_ata,
-                "airdrop_SOL": airdrop_sol
-            },
             "wrapper": {
                 "pubkey": wrapper_pub,
                 "keyfile": str(wrapper_key),
@@ -430,7 +368,7 @@ def setup_token_flow(keys_dir: pathlib.Path, users: List[str], airdrop_sol: floa
 
 # ---------- Exports / persist helpers ----------
 def write_deploy_config(workspace_root: pathlib.Path, program_id: str, tree_seed_hex: str, authority_keypair_path: pathlib.Path) -> pathlib.Path:
-    idl_path = workspace_root / "target" / "idl" / f"{DEFAULT_PROGRAM_NAME}.json"
+    idl_path = workspace_root / "target" / "idl" / "incognito.json"
     cfg = {
         "program_id": program_id,
         "tree_seed_hex": tree_seed_hex,
@@ -445,13 +383,13 @@ def write_deploy_config(workspace_root: pathlib.Path, program_id: str, tree_seed
     return out
 
 def write_env_file(workspace_root: pathlib.Path, program_id: str, tree_seed_hex: str, authority_keypair_path: pathlib.Path) -> pathlib.Path:
-    idl_path = workspace_root / "target" / "idl" / f"{DEFAULT_PROGRAM_NAME}.json"
+    idl_path = workspace_root / "target" / "idl" / "incognito.json"
     env_path = workspace_root / "env.sh"
     lines = [
-        f'export MERKLE_PROG_ID="{program_id}"',
-        f'export TREE_SEED_HEX="{tree_seed_hex}"',
-        f'export MERKLE_IDL_PATH="{idl_path}"',
-        f'export MERKLE_AUTHORITY="{authority_keypair_path}"',
+        f'export INCOGNITO_PROG_ID="{program_id}"',
+        f'export POOL_SEED="{tree_seed_hex}"',
+        f'export INCOGNITO_IDL_PATH="{idl_path}"',
+        f'export INCOGNITO_AUTHORITY="{authority_keypair_path}"',
         f'export SOLANA_RPC_URL="{get_current_rpc_url()}"',
         "",
         '# Tip: run `source env.sh` to load these into your shell.',
@@ -465,39 +403,143 @@ def validate_tree_seed_hex(value: str) -> str:
         raise ValueError("TREE_SEED_HEX must be 32 bytes in hex (64 hex chars).")
     return v
 
+def reset_pool_merkle_state(workspace_root: pathlib.Path, depth: int = 10):
+    """
+    Reset the local pool_merkle_state.json file to match a fresh on-chain pool.
+    This should be called after initializing a new pool on-chain.
+    """
+    # Find repo root (3 levels up from workspace_root which is contracts/incognito)
+    repo_root = workspace_root.parent.parent
+    pool_state_path = repo_root / "pool_merkle_state.json"
+
+    print(f"== Resetting local pool Merkle state ==")
+
+    # Backup existing state if it exists
+    if pool_state_path.exists():
+        backup_path = repo_root / f"pool_merkle_state.backup.{int(time.time())}.json"
+        shutil.copy(pool_state_path, backup_path)
+        print(f"✓ Backed up existing state to {backup_path.name}")
+
+    # Create fresh empty state
+    fresh_state = {
+        "depth": depth,
+        "leaves": [],
+        "leaf_count": 0
+    }
+
+    with open(pool_state_path, 'w') as f:
+        json.dump(fresh_state, f, indent=2)
+
+    print(f"✓ Reset pool_merkle_state.json (depth={depth}, 0 leaves)")
+    print(f"  Path: {pool_state_path}")
+
+def init_incognito_pool(workspace_root: pathlib.Path, authority_keypair_path: pathlib.Path, depth: int = 10) -> bool:
+    """
+    Initialize the incognito pool by calling the init_pool.ts script.
+    Returns True if successful, False otherwise.
+    """
+    init_script = workspace_root / "scripts" / "init_pool.ts"
+    if not init_script.exists():
+        print(f"!! WARN: init_pool.ts not found at {init_script}")
+        return False
+
+    # Check if dependencies are installed (look for @coral-xyz/anchor specifically)
+    anchor_pkg = workspace_root / "node_modules" / "@coral-xyz" / "anchor"
+    if not anchor_pkg.exists():
+        print("== Installing npm dependencies ==")
+        try:
+            run("npm install", capture=False, cwd=workspace_root)
+        except Exception as e:
+            print(f"!! WARN: npm install failed: {e}")
+            return False
+
+        # Verify installation succeeded
+        if not anchor_pkg.exists():
+            print(f"!! ERROR: @coral-xyz/anchor not found after npm install")
+            return False
+
+    print(f"== Initializing incognito pool (depth={depth}) ==")
+    try:
+        # Set environment variables for the script
+        env = os.environ.copy()
+        env["ANCHOR_PROVIDER_URL"] = get_current_rpc_url()
+        env["ANCHOR_WALLET"] = str(authority_keypair_path)
+
+        # Run the init_pool script using tsx (better ESM support than ts-node)
+        # Set a timeout to prevent hanging (60 seconds should be enough)
+        result = subprocess.run(
+            ["npx", "tsx", "scripts/init_pool.ts", str(depth)],
+            cwd=str(workspace_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60
+        )
+
+        if result.returncode == 0:
+            try:
+                output = json.loads(result.stdout)
+                if output.get("success"):
+                    print(f"✓ Pool initialized successfully!")
+                    print(f"  - Pool address: {output.get('pool_address')}")
+                    print(f"  - Vault address: {output.get('vault_address')}")
+                    print(f"  - Depth: {output.get('depth')}")
+                    print(f"  - Root: 0x{output.get('root', '')[:16]}...")
+                    return True
+                else:
+                    error = output.get('error', 'Unknown error')
+                    if 'already initialized' in error.lower():
+                        print(f"✓ Pool already initialized (skipped)")
+                        return True
+                    print(f"✗ Pool initialization failed: {error}")
+                    return False
+            except json.JSONDecodeError:
+                print(f"✓ Pool initialization completed")
+                print(result.stdout)
+                return True
+        else:
+            print(f"✗ Pool initialization failed:")
+            print(f"STDOUT: {result.stdout}")
+            print(f"STDERR: {result.stderr}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        print(f"!! ERROR: Pool initialization timed out after 60 seconds")
+        print("This usually means:")
+        print("  1. Arcium localnet is not running")
+        print("  2. RPC endpoint is not responding")
+        print("  3. The init_pool script has an issue")
+        return False
+    except Exception as e:
+        print(f"!! ERROR initializing pool: {e}")
+        return False
+
 # ---------- Main ----------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--cluster", choices=["localnet", "devnet", "mainnet-beta"], default="localnet")
+    parser = argparse.ArgumentParser(
+        description="Setup incognito environment (assumes arcium-localnet is running)"
+    )
+    parser.add_argument("--cluster", choices=["localnet"], default="localnet",
+                        help="Only localnet is supported (arcium-localnet)")
     parser.add_argument("--workspace-root", default=None,
-                        help="Chemin du workspace Anchor (où se trouve Anchor.toml). Ex: contracts/solana")
-    parser.add_argument("--no-clean", action="store_true", help="Ne pas nettoyer le workspace avant build")
-    parser.add_argument("--skip-token", action="store_true", help="Ne pas exécuter la partie Token-2022/CT")
-    parser.add_argument("--keys-dir", default=str(DEFAULT_KEYS_DIR), help="Dossier où stocker les keypairs (defaut: /Users/alex/Desktop/incognito-protocol-1/keys)")
-    parser.add_argument("--users", default=",".join(DEFAULT_USERS), help="Liste d'utilisateurs: ex A,B,C")
-    parser.add_argument("--airdrop-sol", type=float, default=DEFAULT_AIRDROP_SOL, help="Montant SOL pour pool + users")
-    parser.add_argument("--fund-sol", type=float, default=10.0,
-                        help="Airdrop au wallet déployeur avant déploiement (localnet/devnet)")
-    parser.add_argument("--no-fund", action="store_true", help="Ne pas airdrop le wallet déployeur")
-    parser.add_argument("--program-name", default=DEFAULT_PROGRAM_NAME, help="Nom du programme (ex: merkle_registry)")
-    parser.add_argument(
-        "--purge-data",
-        dest="purge_data",
-        action="store_true",
-        help="Purger <repo_root>/data avant le build/deploy"
-    )
-    parser.add_argument(
-        "--onchain-idl",
-        dest="onchain_idl",
-        action="store_true",
-        help="Tente d'initialiser/mettre à jour l'IDL on-chain (nécessite un Program ID stable)."
-    )
-    parser.add_argument(
-        "--tree-seed-hex",
-        dest="tree_seed_hex",
-        default=os.environ.get("TREE_SEED_HEX", "00"*32),
-        help="Seed (32 bytes hex) pour dériver le PDA de l'arbre Merkle. Par défaut 0x" + "00"*32,
-    )
+                        help="Path to workspace (where Anchor.toml is). Ex: contracts/incognito")
+    parser.add_argument("--skip-token", action="store_true",
+                        help="Skip Token-2022/CT setup")
+    parser.add_argument("--skip-pool", action="store_true",
+                        help="Skip pool initialization")
+    parser.add_argument("--keys-dir", default=str(DEFAULT_KEYS_DIR),
+                        help=f"Directory to store keypairs (default: {DEFAULT_KEYS_DIR})")
+    parser.add_argument("--users", default=",".join(DEFAULT_USERS),
+                        help="Comma-separated list of users (e.g., A,B,C)")
+    parser.add_argument("--airdrop-sol", type=float, default=DEFAULT_AIRDROP_SOL,
+                        help="SOL amount to airdrop to pool + users")
+    parser.add_argument("--purge-data", action="store_true",
+                        help="Purge <repo_root>/data before setup")
+    parser.add_argument("--tree-seed-hex", default=os.environ.get("TREE_SEED_HEX", "00"*32),
+                        help="Seed (32 bytes hex) for deriving pool PDA. Default: 0x" + "00"*32)
+    parser.add_argument("--pool-depth", type=int, default=10,
+                        help="Merkle tree depth for the incognito pool (1-32). Default: 10")
     args = parser.parse_args()
 
     try:
@@ -509,78 +551,74 @@ def main():
     print(f"== Cluster: {args.cluster} ==")
     set_cluster(args.cluster)
 
-    # 1) Trouver le workspace Anchor
+    # Check that localnet is running
+    print("== Checking RPC connection ==")
+    ensure_localnet_running()
+    print("✓ RPC is reachable\n")
+
+    # 1) Find workspace
     if args.workspace_root:
         workspace_root = pathlib.Path(args.workspace_root).expanduser().resolve()
     else:
         workspace_root = find_workspace_root(pathlib.Path(__file__).resolve().parent) or \
                          find_workspace_root(pathlib.Path.cwd())
     if workspace_root is None or not (workspace_root / "Anchor.toml").exists():
-        raise FileNotFoundError("Impossible de trouver Anchor.toml. Passe --workspace-root contracts/solana.")
-    print(f"== Workspace Anchor == {workspace_root}")
+        raise FileNotFoundError("Cannot find Anchor.toml. Pass --workspace-root contracts/incognito")
+    print(f"== Workspace == {workspace_root}")
 
-    # 2) Dossier des clés
-    keys_dir = pathlib.Path(args.keys_dir).expanduser().resolve() if args.keys_dir else DEFAULT_KEYS_DIR
+    # 2) Keys directory
+    keys_dir = pathlib.Path(args.keys_dir).expanduser().resolve()
     keys_dir.mkdir(parents=True, exist_ok=True)
     print(f"== Keys dir == {keys_dir}")
 
-    # 2.5) Purge optionnelle du dossier data (à la racine du repo)
+    # 3) Optional data purge
     if args.purge_data:
         purge_data_dir()
 
-    # 3) Clean + Build
-    if not args.no_clean:
-        print("== Cleaning project ==")
-        anchor_clean(workspace_root)
+    # 4) Use built-in program ID from arcium-localnet
+    pid = DEFAULT_PROGRAM_ID
+    print(f"== Using built-in incognito program ID: {pid} ==\n")
 
-    print("== Anchor build ==")
-    anchor_build(workspace_root)
-
-    # 4) Vérifs localnet, funding déployeur
-    if args.cluster == "localnet":
-        ensure_localnet_running()
-    if args.cluster in ("localnet", "devnet") and not args.no_fund:
-        ensure_deployer_funded(workspace_root, amount_sol=args.fund_sol)
-
-    # 5) Déploiement manuel -> NOUVEL ID à chaque run
-    print("== Manual deploy (solana program deploy) ==")
-    pid = manual_deploy_and_get_pid(workspace_root, program_name=args.program_name)
-    print(f"Program ID: {pid}")
-
-    print("== Waiting for program to be visible on RPC ==")
-    if not wait_until_program_is_visible(pid):
-        raise RuntimeError("Program not visible after deploy (RPC not ready).")
-
-    # 6) IDL init/upgrade (optionnel)
-    if args.onchain_idl:
-        init_or_upgrade_idl(workspace_root, args.program_name, pid)
-    else:
-        print("== Skip on-chain IDL (use local target/idl/*.json in your clients) ==")
-
-    # 7) (Optionnel) Token-2022 / CT
+    # 5) Token-2022 / CT setup
     if not args.skip_token:
         users = [u.strip() for u in args.users.split(",") if u.strip()]
         print("== Token-2022 / CT setup ==")
         setup_token_flow(keys_dir=keys_dir, users=users, airdrop_sol=args.airdrop_sol)
+        print()
     else:
-        print("== Skip Token-2022 stage ==")
+        print("== Skip Token-2022 stage ==\n")
 
-    # 8) Exports déploiement (PROGRAM_ID, TREE_SEED_HEX, IDL, RPC, authority)
+    # 6) Initialize pool
     authority_keypair_path = detect_provider_wallet_path(workspace_root)
+    if not args.skip_pool:
+        init_pool_success = init_incognito_pool(workspace_root, authority_keypair_path, args.pool_depth)
+        if not init_pool_success:
+            print(f"\n!! WARN: Pool initialization failed or skipped.")
+            print("You may need to run manually:")
+            print(f'  cd {workspace_root / "scripts"}')
+            print(f'  npx ts-node init_pool.ts {args.pool_depth}')
+        else:
+            # Reset local pool Merkle state to match fresh on-chain pool
+            reset_pool_merkle_state(workspace_root, args.pool_depth)
+        print()
+    else:
+        print("== Skip pool initialization ==\n")
+
+    # 7) Export configuration
     cfg_path = write_deploy_config(workspace_root, pid, tree_seed_hex, authority_keypair_path)
     env_path = write_env_file(workspace_root, pid, tree_seed_hex, authority_keypair_path)
 
-    print("\n== Deploy configuration saved ==")
+    print("== Configuration saved ==")
     print(f"- JSON : {cfg_path}")
     print(f"- Env  : {env_path}\n")
 
     print("You can now load these in your shell:")
     print(f'  source "{env_path}"')
     print("\nOr export inline:")
-    print(f'  export MERKLE_PROG_ID="{pid}"')
-    print(f'  export TREE_SEED_HEX="{tree_seed_hex}"')
-    print(f'  export MERKLE_IDL_PATH="{workspace_root / "target" / "idl" / f"{DEFAULT_PROGRAM_NAME}.json"}"')
-    print(f'  export MERKLE_AUTHORITY="{authority_keypair_path}"')
+    print(f'  export INCOGNITO_PROG_ID="{pid}"')
+    print(f'  export POOL_SEED="{tree_seed_hex}"')
+    print(f'  export INCOGNITO_IDL_PATH="{workspace_root / "target" / "idl" / "incognito.json"}"')
+    print(f'  export INCOGNITO_AUTHORITY="{authority_keypair_path}"')
     print(f'  export SOLANA_RPC_URL="{get_current_rpc_url()}"')
 
 if __name__ == "__main__":

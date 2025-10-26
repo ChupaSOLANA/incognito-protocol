@@ -20,6 +20,10 @@ wallet = "~/.config/solana/id.json"
 address = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 program = "../token-2022-src/dist/spl_token_2022.so"
 
+[[test.genesis]]
+address = "5QvQbnrL7fKpM5pCMS3zNqgTK8ALNkgHgRvgd49YF7v4"
+program = "../escrow/target/deploy/escrow.so"
+
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\""
 

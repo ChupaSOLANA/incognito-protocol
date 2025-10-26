@@ -1,4 +1,3 @@
-# crypto_core/blind_api.py
 """
 Chaumian Blind Signatures (RSA, educational).
 Exposes a tiny interface used by the CLI without leaking RSA details.
@@ -11,7 +10,7 @@ try:
     from Crypto.PublicKey import RSA
     from Crypto.Util.number import inverse, getRandomRange
 except Exception as e:
-    raise SystemExit("Install pycryptodome: pip install pycryptodome")  # noqa
+    raise SystemExit("Install pycryptodome: pip install pycryptodome")
 
 BLIND_KEYS_DIR = "./blind_keys"
 BLIND_PRIV_PEM = os.path.join(BLIND_KEYS_DIR, "pool_blind_priv.pem")

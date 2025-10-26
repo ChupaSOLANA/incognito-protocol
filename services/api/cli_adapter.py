@@ -1,4 +1,3 @@
-# services/api/cli_adapter.py
 from __future__ import annotations
 
 import json
@@ -13,68 +12,84 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 import re
 
-from services.crypto_core.profile import (  # noqa: E402
+from services.crypto_core.profile import (
     canonical_json_bytes as profile_canonical_json_bytes,
     hash_profile_leaf as profile_hash_profile_leaf,
     verify_owner_sig as profile_verify_owner_sig,
 )
+from services.crypto_core.escrow_payments import (
+    escrow_receive_payment,
+    escrow_pay_seller,
+    escrow_refund_buyer,
+    PaymentMethod,
+    InsufficientFundsError,
+)
+USER_NOTES_PATH = Path(__file__).parent.parent.parent / "data" / "user_notes.json"
 
 from clients.cli import incognito_marketplace as mp
 try:
-    from clients.cli import listings as li  # Merkle-backed listings backend
+    from clients.cli import listings as li
 except Exception:
     li = None
 
 LOG = logging.getLogger("cli_adapter")
 LOG.addHandler(logging.NullHandler())
 
-# ===== Config =====
 MINT_KEYFILE = Path("/Users/alex/Desktop/incognito-protocol-1/keys/mint.json")
 
 def _pubkey_from_keyfile(path: Path) -> str:
     r = subprocess.run(["solana-keygen", "pubkey", str(path)], capture_output=True, text=True, check=True)
     return r.stdout.strip()
 
-# cSOL mint (Token-2022 w/ confidential transfer extension)
 MINT: str = os.getenv("MINT") or _pubkey_from_keyfile(MINT_KEYFILE)
 
-# Wrapper = program-owned authority for mint/reserve movements
 WRAPPER_KEYPAIR: str = os.getenv("WRAPPER_KEYPAIR", "keys/wrapper.json")
-# Treasury = SOL pool
 TREASURY_KEYPAIR: str = os.getenv("TREASURY_KEYPAIR", "keys/pool.json")
 
-# Public key of the wrapper (reserve owner). Can be overridden via env.
+def _wrapper_keypair_abs() -> str:
+    """Get absolute path to wrapper keypair"""
+    if os.path.isabs(WRAPPER_KEYPAIR):
+        return WRAPPER_KEYPAIR
+    repo_root = Path(__file__).parent.parent.parent
+    return str(repo_root / WRAPPER_KEYPAIR)
+
 WRAPPER_RESERVE_PUB: str = os.getenv("WRAPPER_RESERVE_PUB", "")
 
 STEALTH_FEE_SOL: Decimal = Decimal(os.getenv("STEALTH_FEE_SOL", "0.05"))
 VERBOSE: bool = bool(int(os.getenv("VERBOSE", "0")))
 
-# Minimum SOL we require on a fee-payer for typical flows
-FEE_MIN_1TX: Decimal = Decimal(os.getenv("FEE_MIN_1TX", "0.01"))  # ~1 tx buffer
-FEE_MIN_2TX: Decimal = Decimal(os.getenv("FEE_MIN_2TX", "0.02"))  # ~2 tx buffer
+FEE_MIN_1TX: Decimal = Decimal(os.getenv("FEE_MIN_1TX", "0.01"))
+FEE_MIN_2TX: Decimal = Decimal(os.getenv("FEE_MIN_2TX", "0.02"))
 
-# ===== Exceptions =====
 class CLIAdapterError(RuntimeError):
     """Raised when a commanded CLI operation fails in a recoverable/expected way."""
 
-# ===== Shell helpers =====
-def _run(cmd: List[str]) -> str:
+def _run(cmd: List[str], cwd: Optional[str] = None, env: Optional[dict] = None) -> str:
     """
     Run a command and return stdout (stripped).
     Raises CLIAdapterError on non-zero exit.
     Preserves verbose printing similar to your previous behavior.
+
+    Args:
+        cmd: Command and arguments as list
+        cwd: Optional working directory to run command in
+        env: Optional environment variables (merged with os.environ)
     """
     printable = " ".join(shlex.quote(x) for x in cmd)
     if VERBOSE:
         print(f"$ {printable}")
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, env=merged_env)
     out, err = p.communicate()
     out = (out or "").strip()
     err = (err or "").strip()
     if VERBOSE and out:
         print(out)
     if err:
-        # Always print stderr so developer can see unexpected messages
         print(err)
     if p.returncode != 0:
         raise CLIAdapterError(f"Command failed (rc={p.returncode}): {printable}\nstdout: {out!r}\nstderr: {err!r}")
@@ -109,18 +124,14 @@ def _sol_balance(pubkey: str) -> Decimal:
         return Decimal("0")
 
 def get_sol_balance(pubkey: str, quiet: bool = False) -> Decimal:
-    # `quiet` kept for signature parity
     return _sol_balance(pubkey)
 
 def _lamports(amount_sol: str | float | Decimal) -> int:
     d = Decimal(str(amount_sol))
     return int((d * Decimal(1_000_000_000)).to_integral_value())
 
-# ===== Formatting =====
 def fmt_amt(x: Decimal | float | str) -> str:
     return str(Decimal(str(x)).quantize(Decimal("0.000000001")))
-
-# ===== cSOL helpers =====
 
 def _parse_first_decimal(s: str) -> str:
     m = re.search(r"([0-9]+(?:\.[0-9]+)?)", s.replace(",", ""))
@@ -141,7 +152,6 @@ def csol_balance(owner_pub_or_keyfile: str) -> str:
     """
     ata = get_ata_for_owner(MINT, owner_pub_or_keyfile)
 
-    # Try to apply pending so "available" reflects up-to-date
     try:
         fee_tmp, _info = pick_treasury_fee_payer_tmpfile()
         if fee_tmp:
@@ -155,7 +165,7 @@ def csol_balance(owner_pub_or_keyfile: str) -> str:
     variants = [
         ["spl-token", "confidential-transfer-get-balance", "--address", ata, "--owner", owner_pub_or_keyfile],
         ["spl-token", "confidential-transfer-get-balance", MINT, "--address", ata, "--owner", owner_pub_or_keyfile],
-        ["spl-token", "balance", ata],  # sometimes returns 0 for CT accounts
+        ["spl-token", "balance", ata],
         ["spl-token", "balance", MINT, "--owner", owner_pub_or_keyfile],
     ]
     for cmd in variants:
@@ -169,24 +179,16 @@ def csol_balance(owner_pub_or_keyfile: str) -> str:
 def csol_transfer_from_reserve(dst_pub: str, amount_str: str) -> str:
     """
     Wrapper reserve → dst (seller) confidential transfer.
-    Requires a funded fee-payer (treasury stealth preferred).
+    Uses wrapper itself as fee payer.
     """
     ensure_csol_ata(dst_pub)
-    tmp_fee, _info = pick_treasury_fee_payer_tmpfile(FEE_MIN_1TX)
-    if not tmp_fee:
-        raise CLIAdapterError(f"Insufficient fee balance for transfer (need ≥ {FEE_MIN_1TX} SOL)")
-    try:
-        sig = spl_transfer_from_wrapper(amount_str, dst_pub, tmp_fee)
-        # best-effort: apply pending to dst
-        try:
-            spl_apply(dst_pub if os.path.exists(dst_pub) else WRAPPER_KEYPAIR, tmp_fee)
-        except Exception:
-            pass
-        return sig
-    finally:
-        _safe_unlink(tmp_fee)
 
-# ===== SPL helpers (ATA) =====
+    wrapper_kf = _wrapper_keypair_abs()
+
+    sig = spl_transfer_from_wrapper(amount_str, dst_pub, wrapper_kf)
+
+    return sig
+
 def _parse_ata_from_verbose(out: str) -> str:
     """
     Parse ATA from `spl-token address --verbose` output.
@@ -195,7 +197,6 @@ def _parse_ata_from_verbose(out: str) -> str:
     for line in out.splitlines():
         if line.strip().lower().startswith("associated token address:"):
             return line.split(":", 1)[1].strip()
-    # fallback: return first non-empty line
     for line in out.splitlines():
         s = line.strip()
         if s:
@@ -251,7 +252,6 @@ def get_ata_for_owner(mint: str, owner: str) -> str:
     Retrieve the ATA associated with (mint, owner). If not present, attempt creation and retry.
     `owner` may be a pubkey or a keypair path.
     """
-    # 1) Try address variants first
     success, out, err = _try_address_variants(mint, owner)
     if success and out:
         try:
@@ -261,7 +261,6 @@ def get_ata_for_owner(mint: str, owner: str) -> str:
             if lines:
                 return lines[0]
 
-    # 2) If output or error indicates no account found, attempt to create the ATA
     combined = " ".join([out or "", err or ""]).lower()
     if "not found" in combined or "no associated token account" in combined or ("token account" in combined and "not found" in combined):
         LOG.info("ATA not found for mint=%s owner=%s: attempting to create", mint, owner)
@@ -304,7 +303,6 @@ def get_ata_for_owner(mint: str, owner: str) -> str:
             % (mint, owner, out3, err3)
         )
 
-    # 3) One last query attempt
     success4, out4, err4 = _try_address_variants(mint, owner)
     if success4 and out4:
         try:
@@ -315,43 +313,50 @@ def get_ata_for_owner(mint: str, owner: str) -> str:
                 return lines[0]
     raise CLIAdapterError(f"Unable to determine ATA for mint={mint} owner={owner}. stdout={out4!r} stderr={err4!r}")
 
-# ===== SPL ops (Wrapper reserve) =====
 def spl_mint_to_wrapper(amount_str: str, fee_payer: Optional[str] = None) -> str:
     ata = get_wrapper_ata()
-    cmd = ["spl-token", "mint", MINT, amount_str, ata, "--mint-authority", WRAPPER_KEYPAIR]
+    wrapper_kf = _wrapper_keypair_abs()
+    cmd = ["spl-token", "mint", MINT, amount_str, ata, "--mint-authority", wrapper_kf]
     if fee_payer:
         cmd += ["--fee-payer", fee_payer]
     return _run(cmd)
 
 def spl_deposit_to_wrapper(amount_str: str, fee_payer: Optional[str] = None) -> str:
     ata = get_wrapper_ata()
-    cmd = ["spl-token", "deposit-confidential-tokens", MINT, amount_str, "--address", ata, "--owner", WRAPPER_KEYPAIR]
+    wrapper_kf = _wrapper_keypair_abs()
+    cmd = ["spl-token", "deposit-confidential-tokens", MINT, amount_str, "--address", ata, "--owner", wrapper_kf]
     if fee_payer:
         cmd += ["--fee-payer", fee_payer]
     return _run(cmd)
 
 def spl_withdraw_from_wrapper(amount_str: str, fee_payer: Optional[str] = None) -> str:
     ata = get_wrapper_ata()
-    cmd = ["spl-token", "withdraw-confidential-tokens", MINT, amount_str, "--address", ata, "--owner", WRAPPER_KEYPAIR]
+    wrapper_kf = _wrapper_keypair_abs()
+    cmd = ["spl-token", "withdraw-confidential-tokens", MINT, amount_str, "--address", ata, "--owner", wrapper_kf]
     if fee_payer:
         cmd += ["--fee-payer", fee_payer]
     return _run(cmd)
 
 def spl_burn_from_wrapper(amount_str: str, fee_payer: Optional[str] = None) -> str:
     ata = get_wrapper_ata()
-    cmd = ["spl-token", "burn", ata, amount_str, "--owner", WRAPPER_KEYPAIR]
+    wrapper_kf = _wrapper_keypair_abs()
+    cmd = ["spl-token", "burn", ata, amount_str, "--owner", wrapper_kf]
     if fee_payer:
         cmd += ["--fee-payer", fee_payer]
     return _run(cmd)
 
 def spl_transfer_from_wrapper(amount: str, recipient_owner: str, fee_payer: str) -> str:
-    # >>> NEW: ensure wrapper’s pending → available before transfer <<<
-    try:
-        spl_apply(WRAPPER_KEYPAIR, fee_payer)  # spl-token apply-pending-balance <MINT> --owner <wrapper>
-    except Exception:
-        pass
+    wrapper_kf = _wrapper_keypair_abs()
 
-    return _run(
+    try:
+        result = _run(["spl-token", "apply-pending-balance", MINT, "--owner", wrapper_kf, "--fee-payer", wrapper_kf])
+        LOG.info(f"[spl_transfer_from_wrapper] Applied pending balance on wrapper: {result}")
+    except Exception as e:
+        LOG.warning(f"[spl_transfer_from_wrapper] apply-pending-balance on wrapper failed (may be ok): {e}")
+
+    ensure_csol_ata(recipient_owner)
+
+    sig = _run(
         [
             "spl-token",
             "transfer",
@@ -359,14 +364,15 @@ def spl_transfer_from_wrapper(amount: str, recipient_owner: str, fee_payer: str)
             amount,
             get_ata_for_owner(MINT, recipient_owner),
             "--owner",
-            WRAPPER_KEYPAIR,
-            "--confidential",
-            "--allow-unfunded-recipient",
+            wrapper_kf,
             "--fee-payer",
             fee_payer,
+            "--confidential",
         ]
     )
 
+
+    return sig
 
 def spl_apply(owner_keyfile: str, fee_payer: str) -> str:
     rc, out, err = _run_rc(["spl-token", "apply-pending-balance", MINT, "--owner", owner_keyfile, "--fee-payer", fee_payer])
@@ -377,7 +383,6 @@ def spl_apply(owner_keyfile: str, fee_payer: str) -> str:
         return out2 or "OK"
     raise CLIAdapterError((err or err2).strip() or "apply failed")
 
-# ===== Fee-payer selection (Treasury stealth) =====
 def _mp_func(*candidates: str) -> Callable[..., Any]:
     for name in candidates:
         fn = getattr(mp, name, None)
@@ -417,14 +422,13 @@ def _richest_treasury_stealth_record(min_balance: Decimal = Decimal("0.001")) ->
             best, best_bal = r, bal
     return best
 
-# ---- serialize solders.Keypair into a temp keypair file (64-byte array JSON)
 def _write_temp_keypair_from_solders(kp) -> str:
     """
     Write a solders.Keypair to a temporary JSON file as a 64-byte array
     compatible with solana-keygen (secret||pub).
     """
     try:
-        sk_bytes = kp.to_bytes()  # solders API
+        sk_bytes = kp.to_bytes()
     except Exception as e:
         raise RuntimeError(f"Cannot serialize Keypair: {e}")
     arr = list(sk_bytes)
@@ -433,6 +437,81 @@ def _write_temp_keypair_from_solders(kp) -> str:
     with open(path, "w") as f:
         json.dump(arr, f)
     return path
+
+def _write_keypair_from_solders(kp, path: str) -> str:
+    """Write a solders Keypair to a specific file path"""
+    try:
+        sk_bytes = kp.to_bytes()
+    except Exception as e:
+        raise RuntimeError(f"Cannot serialize Keypair: {e}")
+    arr = list(sk_bytes)
+    with open(path, "w") as f:
+        json.dump(arr, f)
+    return path
+
+def pick_wrapper_stealth_fee_payer(min_required: Decimal | str | None = None) -> Tuple[Optional[str], dict]:
+    """
+    Choose a fee-payer keyfile from wrapper stealth addresses:
+      1) richest funded wrapper stealth (>= min_required)
+      2) else return (None, {...}) so the caller can fail cleanly
+    """
+    from services.crypto_core.wrapper_stealth import (
+        get_available_wrapper_addresses,
+        DEFAULT_STATE_PATH as WRAPPER_STEALTH_STATE_PATH
+    )
+    from services.crypto_core.stealth import derive_stealth_from_recipient_secret
+    import os
+    import hashlib
+
+    req = Decimal(str(min_required)) if min_required is not None else FEE_MIN_1TX
+
+    try:
+        available = get_available_wrapper_addresses(
+            min_balance=int(req * 1_000_000_000),
+            state_path=WRAPPER_STEALTH_STATE_PATH
+        )
+
+        if not available:
+            LOG.error("[fee] no funded wrapper stealth addresses available (need >= %.9f SOL)", req)
+            return None, {"source": "none", "needed_sol": str(req), "available_count": 0}
+
+        available.sort(key=lambda x: x.current_balance, reverse=True)
+        richest = available[0]
+
+        wrapper_keyfile = WRAPPER_KEYPAIR
+        if not os.path.isabs(wrapper_keyfile):
+            repo_root = Path(__file__).parent.parent.parent
+            wrapper_keyfile = str(repo_root / wrapper_keyfile)
+
+        wrapper_secret = _read_secret_64_from_keyfile(wrapper_keyfile)
+        kp = derive_stealth_from_recipient_secret(wrapper_secret, richest.ephemeral_pub)
+
+        addr_hash = hashlib.sha256(richest.stealth_address.encode()).hexdigest()[:16]
+        repo_root = Path(__file__).parent.parent.parent
+        stealth_dir = repo_root / "keys" / "stealth_wrapper"
+        stealth_dir.mkdir(parents=True, exist_ok=True)
+        keypair_path = stealth_dir / f"stealth_{addr_hash}.json"
+
+        keypair_path = _write_keypair_from_solders(kp, str(keypair_path))
+
+        LOG.info(
+            "[fee] using wrapper stealth %s (bal=%.9f >= %.9f)",
+            richest.stealth_address,
+            richest.current_balance / 1_000_000_000,
+            req
+        )
+
+        return str(keypair_path), {
+            "source": "wrapper_stealth",
+            "stealth_address": richest.stealth_address,
+            "ephemeral_pub": richest.ephemeral_pub,
+            "min_required": str(req),
+            "balance": str(richest.current_balance / 1_000_000_000),
+        }
+
+    except Exception as e:
+        LOG.error("[fee] error getting wrapper stealth fee payer: %s", e)
+        return None, {"source": "error", "needed_sol": str(req), "error": str(e)}
 
 def pick_treasury_fee_payer_tmpfile(min_required: Decimal | str | None = None) -> Tuple[Optional[str], dict]:
     """
@@ -443,7 +522,6 @@ def pick_treasury_fee_payer_tmpfile(min_required: Decimal | str | None = None) -
     """
     req = Decimal(str(min_required)) if min_required is not None else FEE_MIN_1TX
 
-    # 1) try stealth, but only if funded
     rec = _richest_treasury_stealth_record(req)
     if rec:
         bal = _sol_balance(rec["stealth_pubkey"])
@@ -451,7 +529,6 @@ def pick_treasury_fee_payer_tmpfile(min_required: Decimal | str | None = None) -
             pool_secret = _read_secret_64_from_keyfile(TREASURY_KEYPAIR)
             eph_b58 = rec["eph_pub_b58"]
             counter = int(rec.get("counter", 0))
-            # imported later below; looked up at call time
             kp = derive_stealth_from_recipient_secret(pool_secret, eph_b58, counter)
             tmp = _write_temp_keypair_from_solders(kp)
             LOG.info("[fee] using treasury stealth %s (bal=%.9f >= %.9f)", rec["stealth_pubkey"], bal, req)
@@ -465,7 +542,6 @@ def pick_treasury_fee_payer_tmpfile(min_required: Decimal | str | None = None) -
             }
         LOG.info("[fee] treasury stealth underfunded: %s (bal=%.9f < %.9f)", rec["stealth_pubkey"], bal, req)
 
-    # 2) fallback: pool owner, but only if funded
     pool_pub = _pool_pub()
     pool_bal = _sol_balance(pool_pub)
     if pool_bal >= req:
@@ -478,7 +554,6 @@ def pick_treasury_fee_payer_tmpfile(min_required: Decimal | str | None = None) -
         LOG.info("[fee] using pool owner %s (bal=%.9f >= %.9f)", pool_pub, pool_bal, req)
         return tmp, {"source": "pool_owner", "pool_pub": pool_pub, "min_required": str(req), "balance": str(pool_bal)}
 
-    # 3) none is funded enough
     LOG.error("[fee] no funded fee-payer available (need >= %.9f SOL). pool=%s bal=%.9f", req, pool_pub, pool_bal)
     return None, {"source": "none", "needed_sol": str(req), "pool_pub": pool_pub, "pool_balance": str(pool_bal)}
 
@@ -490,7 +565,6 @@ def _safe_unlink(path: Optional[str]) -> None:
     except Exception:
         pass
 
-# ===== Misc utilities =====
 def solana_transfer(fee_payer_keyfile: str, dest_pub: str, amount_sol_str: str) -> str:
     return _run(
         [
@@ -507,7 +581,6 @@ def solana_transfer(fee_payer_keyfile: str, dest_pub: str, amount_sol_str: str) 
         ]
     )
 
-# ===== cSOL utilities (Token-2022 Confidential) =====
 def ensure_csol_ata(owner_pub_or_kf: str) -> str:
     """
     Ensure an ATA exists for the cSOL mint for the given owner (pubkey or keypair path).
@@ -526,7 +599,6 @@ def csol_confidential_transfer(buyer_kf: str, buyer_pub: str, seller_pub: str, a
     tmp_fee, _info = pick_treasury_fee_payer_tmpfile(FEE_MIN_1TX)
     fee_payer = tmp_fee or buyer_kf
 
-    # If we fell back to the buyer as fee-payer, check the buyer has enough SOL too.
     if not tmp_fee:
         buyer_sol = _sol_balance(buyer_pub if buyer_pub else _pubkey_from_keyfile(buyer_kf))
         if buyer_sol < FEE_MIN_1TX:
@@ -535,9 +607,8 @@ def csol_confidential_transfer(buyer_kf: str, buyer_pub: str, seller_pub: str, a
             )
 
     try:
-        # >>> NEW: always make buyer's pending → available before spending <<<
         try:
-            spl_apply(buyer_kf, fee_payer)  # this runs: spl-token apply-pending-balance <MINT> --owner <buyer_kf>
+            spl_apply(buyer_kf, fee_payer)
         except Exception:
             pass
 
@@ -557,7 +628,6 @@ def csol_confidential_transfer(buyer_kf: str, buyer_pub: str, seller_pub: str, a
             ]
         )
 
-        # best-effort for the receiver (we don't own seller's key, so just skip if not a keyfile path)
         try:
             if os.path.exists(seller_pub):
                 spl_apply(seller_pub, fee_payer)
@@ -569,51 +639,104 @@ def csol_confidential_transfer(buyer_kf: str, buyer_pub: str, seller_pub: str, a
         if tmp_fee:
             _safe_unlink(tmp_fee)
 
-
 def csol_mint_to_reserve(amount_str: str) -> str:
-    tmp_fee, _info = pick_treasury_fee_payer_tmpfile(FEE_MIN_2TX)
-    if not tmp_fee:
-        raise CLIAdapterError(f"Insufficient fee balance for mint/deposit (need ≥ {FEE_MIN_2TX} SOL)")
+    """
+    Mint cSOL to wrapper reserve.
+    Uses wrapper itself as fee payer.
+    """
+    wrapper_kf = _wrapper_keypair_abs()
+
+    sig1 = spl_mint_to_wrapper(amount_str, fee_payer=wrapper_kf)
+    sig2 = spl_deposit_to_wrapper(amount_str, fee_payer=wrapper_kf)
+
     try:
-        sig1 = spl_mint_to_wrapper(amount_str, fee_payer=tmp_fee)
-        sig2 = spl_deposit_to_wrapper(amount_str, fee_payer=tmp_fee)
-        # >>> NEW: apply on wrapper so reserve is immediately spendable <<<
-        try:
-            spl_apply(WRAPPER_KEYPAIR, tmp_fee)
-        except Exception:
-            pass
-        return f"{sig1}\n{sig2}".strip()
-    finally:
-        _safe_unlink(tmp_fee)
+        spl_apply(wrapper_kf, wrapper_kf)
+    except Exception as e:
+        LOG.warning(f"[csol_mint_to_reserve] apply-pending failed: {e}")
+
+    return f"{sig1}\n{sig2}".strip()
 
 def csol_burn_from_reserve(amount_str: str) -> str:
-    tmp_fee, _info = pick_treasury_fee_payer_tmpfile(FEE_MIN_2TX)
-    if not tmp_fee:
-        raise CLIAdapterError(f"Insufficient fee balance for withdraw/burn (need ≥ {FEE_MIN_2TX} SOL)")
+    """
+    Burn cSOL from wrapper reserve.
+    Uses wrapper itself as fee payer.
+    """
+    wrapper_kf = _wrapper_keypair_abs()
+
+    sig1 = spl_withdraw_from_wrapper(amount_str, fee_payer=wrapper_kf)
+
     try:
-        sig1 = spl_withdraw_from_wrapper(amount_str, fee_payer=tmp_fee)
-        # >>> NEW: apply so the withdrawn tokens are actually available to burn <<<
-        try:
-            spl_apply(WRAPPER_KEYPAIR, tmp_fee)
-        except Exception:
-            pass
-        sig2 = spl_burn_from_wrapper(amount_str, fee_payer=tmp_fee)
-        return f"{sig1}\n{sig2}".strip()
-    finally:
-        _safe_unlink(tmp_fee)
+        spl_apply(wrapper_kf, wrapper_kf)
+    except Exception:
+        pass
 
+    sig2 = spl_burn_from_wrapper(amount_str, fee_payer=wrapper_kf)
+    return f"{sig1}\n{sig2}".strip()
 
-# ===== Re-exports: crypto_core =====
-from services.crypto_core.commitments import make_commitment as make_commitment  # noqa: E402
-from services.crypto_core.blind_api import (  # noqa: E402
+def csol_user_to_wrapper_and_burn(user_keyfile: str, amount_str: str) -> dict:
+    """
+    Transfer cSOL from user to wrapper, then burn it.
+    Returns dict with transaction signatures.
+
+    This is used when converting cSOL back to a privacy note:
+    1. User transfers cSOL to wrapper
+    2. Wrapper burns the cSOL (reducing supply)
+    3. Wrapper can then deposit SOL to create a note for the user
+    """
+    user_kf = user_keyfile
+    if not os.path.isabs(user_kf):
+        repo_root = Path(__file__).parent.parent.parent
+        user_kf = str(repo_root / user_kf)
+
+    wrapper_kf = _wrapper_keypair_abs()
+
+    user_pub = _pubkey_from_keyfile(user_kf)
+    wrapper_pub = _pubkey_from_keyfile(wrapper_kf)
+
+    ensure_csol_ata(user_pub)
+    ensure_csol_ata(wrapper_pub)
+
+    try:
+        spl_apply(user_kf, user_kf)
+    except Exception as e:
+        LOG.warning(f"[csol_user_to_wrapper_and_burn] apply-pending for user failed (may be ok): {e}")
+
+    sig_transfer = _run(
+        [
+            "spl-token",
+            "transfer",
+            MINT,
+            amount_str,
+            get_ata_for_owner(MINT, wrapper_pub),
+            "--owner",
+            user_kf,
+            "--confidential",
+            "--fee-payer",
+            user_kf,
+        ]
+    )
+
+    try:
+        spl_apply(wrapper_kf, wrapper_kf)
+    except Exception as e:
+        LOG.warning(f"[csol_user_to_wrapper_and_burn] apply-pending for wrapper failed (may be ok): {e}")
+
+    sig_burn = csol_burn_from_reserve(amount_str)
+
+    return {
+        "sig_transfer": sig_transfer,
+        "sig_burn": sig_burn,
+    }
+
+from services.crypto_core.commitments import make_commitment as make_commitment
+from services.crypto_core.blind_api import (
     issue_blind_sig_for_commitment_hex as issue_blind_sig_for_commitment_hex,
     load_pub as bs_load_pub,
 )
-from services.crypto_core.stealth import (  # noqa: E402
+from services.crypto_core.stealth import (
     derive_stealth_from_recipient_secret as derive_stealth_from_recipient_secret,
 )
 
-# ===== Re-exports/passthrough from CLI module =====
 def load_wrapper_state():
     return _mp_func("load_wrapper_state", "_load_wrapper_state")()
 
@@ -632,7 +755,6 @@ def add_note_with_precomputed(
     sig_hex: str,
     tag_hex: str,
 ):
-    # Name in incognito_marketplace is `add_note_with_precomputed_commitment`
     return _mp_func(
         "add_note_with_precomputed_commitment",
         "add_note_with_precomputed",
@@ -672,8 +794,7 @@ def read_secret_64_from_json_value(v) -> bytes:
             return bytes(v[:64])
         raise ValueError("Unsupported secret key JSON format")
 
-# ===== Merkle passthrough =====
-from services.crypto_core.merkle import MerkleTree as _MerkleTree  # noqa: E402
+from services.crypto_core.merkle import MerkleTree as _MerkleTree
 
 def build_merkle(state_dict):
     leaves = state_dict.get("leaves") or [n["commitment"] for n in state_dict.get("notes", []) if "commitment" in n]
@@ -682,15 +803,13 @@ def build_merkle(state_dict):
         mt.build_tree()
     return mt
 
-# ===== Events passthrough =====
 def emit(kind: str, **payload) -> None:
     try:
-        from clients.cli.emit import emit as _emit  # noqa: WPS433
+        from clients.cli.emit import emit as _emit
         _emit(kind, **payload)
     except Exception:
         pass
 
-# ====== Listings wrappers ======
 def _li_func(*candidates: str):
     if li:
         for name in candidates:
@@ -724,7 +843,6 @@ def listings_by_owner(owner_pubkey: str) -> list[dict]:
     return list(out) if isinstance(out, (list, tuple)) else []
 
 def listing_get(listing_id_hex: str) -> dict | None:
-    # Prefer the Merkle-backed backend first
     fn = getattr(li, "get_listing", None) or getattr(mp, "_load_listing", None)
     if callable(fn):
         try:
@@ -781,9 +899,7 @@ def listing_delete(owner_pubkey: str, listing_id_hex: str) -> int:
             return int(fn(owner_pubkey=owner_pubkey, listing_id_hex=listing_id_hex))
     raise CLIAdapterError("No delete support in listings backend")
 
-# services/api/cli_adapter.py
 def listings_reset_all() -> int:
-    # Try explicit backend methods first
     if li:
         for name in ("reset_all", "clear_all", "wipe_all", "remove_all", "delete_all"):
             fn = getattr(li, name, None)
@@ -792,7 +908,6 @@ def listings_reset_all() -> int:
                     return int(fn())
                 except Exception:
                     pass
-    # Fallback: remove a known state file if your listings backend uses one
     path = os.getenv("LISTINGS_STATE_FILE")
     if path and os.path.exists(path):
         try:
@@ -803,20 +918,315 @@ def listings_reset_all() -> int:
     return 0
 
 
+ESCROW_CONTRACT_DIR = Path(__file__).parent.parent.parent / "contracts" / "escrow"
+ESCROW_CLIENT_SCRIPT = ESCROW_CONTRACT_DIR / "scripts" / "escrow_client.ts"
+ESCROW_INIT_SCRIPT = ESCROW_CONTRACT_DIR / "scripts" / "init_platform.ts"
+ESCROW_PROGRAM_ID = "5QvQbnrL7fKpM5pCMS3zNqgTK8ALNkgHgRvgd49YF7v4"
+
+_ESCROW_PLATFORM_INITIALIZED = False
+
+def _abs_keypair_path(path: str) -> str:
+    """Convert relative keypair path to absolute (relative to repo root)."""
+    if os.path.isabs(path):
+        return path
+    repo_root = Path(__file__).parent.parent.parent
+    return str(repo_root / path)
+
+def _ensure_escrow_platform_initialized():
+    """Initialize escrow platform if not already done (one-time setup)."""
+    global _ESCROW_PLATFORM_INITIALIZED
+
+    if _ESCROW_PLATFORM_INITIALIZED:
+        return
+
+    LOG.info("Checking escrow platform initialization...")
+
+    anchor_env = {
+        "ANCHOR_PROVIDER_URL": os.getenv("ANCHOR_PROVIDER_URL", "http://127.0.0.1:8899"),
+        "ANCHOR_WALLET": os.getenv("ANCHOR_WALLET") or _wrapper_keypair_abs(),
+        "MINT": MINT,
+        "WRAPPER_KEYPAIR": _wrapper_keypair_abs(),
+        "TREASURY_KEYPAIR": os.getenv("TREASURY_KEYPAIR") or _abs_keypair_path(TREASURY_KEYPAIR),
+    }
+
+    LOG.info(f"Initializing with ANCHOR_PROVIDER_URL={anchor_env['ANCHOR_PROVIDER_URL']}")
+    LOG.info(f"Using wrapper keypair: {anchor_env['WRAPPER_KEYPAIR']}")
+
+    cmd = ["yarn", "node", "-r", "ts-node/register/transpile-only", str(ESCROW_INIT_SCRIPT)]
+
+    try:
+        output = _run(cmd, cwd=str(ESCROW_CONTRACT_DIR), env=anchor_env)
+        LOG.info(f"Init script output: {output}")
+        result = json.loads(output)
+
+        if result.get("success"):
+            if result.get("already_initialized"):
+                LOG.info("Escrow platform already initialized")
+            else:
+                LOG.info(f"Escrow platform initialized successfully: {result.get('config_pda')}")
+            _ESCROW_PLATFORM_INITIALIZED = True
+        else:
+            error_msg = result.get('error', 'Unknown error')
+            LOG.error(f"Platform initialization failed: {error_msg}")
+            raise CLIAdapterError(f"Platform initialization failed: {error_msg}")
+    except json.JSONDecodeError as e:
+        LOG.error(f"Failed to parse init script output: {e}\nRaw output: {output if 'output' in locals() else 'N/A'}")
+        raise CLIAdapterError(f"Failed to parse escrow init output: {e}")
+    except CLIAdapterError:
+        raise
+    except Exception as e:
+        LOG.error(f"Failed to initialize escrow platform: {e}", exc_info=True)
+        raise CLIAdapterError(f"Escrow platform initialization failed: {e}")
+
+def _call_escrow_client(command: str, args: List[str]) -> dict:
+    """Call TypeScript escrow client and return JSON result."""
+    cmd = ["yarn", "node", "-r", "ts-node/register/transpile-only", str(ESCROW_CLIENT_SCRIPT), command] + args
+
+    anchor_env = {
+        "ANCHOR_PROVIDER_URL": os.getenv("ANCHOR_PROVIDER_URL", "http://127.0.0.1:8899"),
+        "ANCHOR_WALLET": os.getenv("ANCHOR_WALLET") or _wrapper_keypair_abs(),
+        "MINT": MINT,
+        "WRAPPER_KEYPAIR": _wrapper_keypair_abs(),
+    }
+
+    try:
+        output = _run(cmd, cwd=str(ESCROW_CONTRACT_DIR), env=anchor_env)
+        return json.loads(output)
+    except json.JSONDecodeError as e:
+        raise CLIAdapterError(f"Failed to parse escrow client output: {e}\nOutput: {output}")
+    except Exception as e:
+        raise CLIAdapterError(f"Escrow client failed: {e}")
+
+def escrow_create_order(
+    buyer_keypair_path: str,
+    amount_sol: str,
+    order_id: int,
+    seller_pub: str,
+    encrypted_shipping: str = "encrypted_data",
+    shipping_nonce: Optional[List[int]] = None
+) -> dict:
+    """
+    Create an escrow order on-chain with dual payment support.
+
+    Payment flow:
+    1. Try cSOL payment (buyer → wrapper confidential transfer)
+    2. If no cSOL, try note payment (spend from privacy pool)
+    3. Create escrow state on-chain (NO token transfer in contract)
+
+    Args:
+        buyer_keypair_path: Path to buyer's keypair file (relative to repo root)
+        amount_sol: Amount in SOL (will be converted to lamports)
+        order_id: Unique order ID (u64)
+        seller_pub: Seller's public key
+        encrypted_shipping: Base64 or string of encrypted shipping data
+        shipping_nonce: 16-byte nonce array
+
+    Returns:
+        {"success": true, "tx": "signature", "escrowPDA": "address", "orderId": "123",
+         "paymentMethod": "csol"|"note", "paymentTx": "..."}
+    """
+    _ensure_escrow_platform_initialized()
+
+    amount_lamports = _lamports(amount_sol)
+    nonce = shipping_nonce or [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]
+
+    buyer_keyfile_abs = _abs_keypair_path(buyer_keypair_path)
+    wrapper_keyfile_abs = _wrapper_keypair_abs()
+
+    buyer_pub = get_pubkey_from_keypair(buyer_keyfile_abs)
+    wrapper_pub = get_pubkey_from_keypair(wrapper_keyfile_abs)
+
+    try:
+        payment_method, payment_data = escrow_receive_payment(
+            buyer_keyfile=buyer_keyfile_abs,
+            buyer_pubkey=buyer_pub,
+            wrapper_keyfile=wrapper_keyfile_abs,
+            wrapper_pubkey=wrapper_pub,
+            amount_lamports=amount_lamports,
+            mint=MINT,
+            notes_state_path=USER_NOTES_PATH,
+        )
+        LOG.info(f" Payment received via {payment_method.value}: {payment_data[:64]}...")
+    except InsufficientFundsError as e:
+        return {
+            "success": False,
+            "error": f"Insufficient funds: {str(e)}"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Payment failed: {str(e)}"
+        }
+
+    args = [
+        buyer_keyfile_abs,
+        str(amount_lamports),
+        str(order_id),
+        seller_pub,
+        encrypted_shipping,
+        json.dumps(nonce)
+    ]
+
+    result = _call_escrow_client("create_order", args)
+
+    if result.get("success"):
+        result["paymentMethod"] = payment_method.value
+        result["paymentTx"] = payment_data
+
+    return result
+
+def escrow_accept_order(seller_keypair_path: str, escrow_pda: str) -> dict:
+    """
+    Seller accepts an escrow order.
+
+    Args:
+        seller_keypair_path: Path to seller's keypair file (relative to repo root)
+        escrow_pda: Escrow PDA address
+
+    Returns:
+        {"success": true, "tx": "signature"}
+    """
+    return _call_escrow_client("accept_order", [_abs_keypair_path(seller_keypair_path), escrow_pda])
+
+def escrow_mark_shipped(seller_keypair_path: str, escrow_pda: str, tracking_number: str) -> dict:
+    """
+    Seller marks order as shipped with tracking number.
+
+    Args:
+        seller_keypair_path: Path to seller's keypair file (relative to repo root)
+        escrow_pda: Escrow PDA address
+        tracking_number: Tracking number string
+
+    Returns:
+        {"success": true, "tx": "signature"}
+    """
+    return _call_escrow_client("mark_shipped", [_abs_keypair_path(seller_keypair_path), escrow_pda, tracking_number])
+
+def escrow_confirm_delivery(buyer_keypair_path: str, escrow_pda: str) -> dict:
+    """
+    Buyer confirms delivery of order.
+
+    Args:
+        buyer_keypair_path: Path to buyer's keypair file (relative to repo root)
+        escrow_pda: Escrow PDA address
+
+    Returns:
+        {"success": true, "tx": "signature"}
+    """
+    return _call_escrow_client("confirm_delivery", [_abs_keypair_path(buyer_keypair_path), escrow_pda])
+
+def escrow_finalize_order(escrow_pda: str) -> dict:
+    """
+    Finalize order after dispute window passes (7 days after delivery).
+
+    Flow:
+    1. Call contract to update escrow state (no token transfer)
+    2. Pay seller from wrapper's escrow holdings (cSOL confidential transfer)
+
+    Args:
+        escrow_pda: Escrow PDA address
+
+    Returns:
+        {"success": true, "tx": "signature", "paymentTx": "signature"}
+    """
+    result = _call_escrow_client("finalize_order", [escrow_pda])
+
+    if not result.get("success"):
+        return result
+
+    try:
+        total_payment = int(result.get("totalPayment", 0))
+        seller_pub = result.get("seller")
+
+        if not seller_pub or total_payment == 0:
+            return {
+                "success": False,
+                "error": "Missing payment info from contract response"
+            }
+
+        wrapper_keyfile_abs = _wrapper_keypair_abs()
+
+        payment_tx = escrow_pay_seller(
+            wrapper_keyfile=wrapper_keyfile_abs,
+            seller_pubkey=seller_pub,
+            amount_lamports=total_payment,
+            mint=MINT,
+        )
+
+        LOG.info(f" Paid seller {seller_pub}: {total_payment} lamports (tx: {payment_tx})")
+
+        result["paymentTx"] = payment_tx
+        return result
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Payment to seller failed: {str(e)}",
+            "stateTx": result.get("tx")
+        }
+
+def escrow_refund_order(escrow_pda: str, buyer_pubkey: str, amount_lamports: int) -> dict:
+    """
+    Refund buyer from escrow (used for disputes, timeouts, cancellations).
+
+    Always refunds as cSOL, regardless of original payment method.
+
+    Args:
+        escrow_pda: Escrow PDA address
+        buyer_pubkey: Buyer's public key
+        amount_lamports: Amount to refund
+
+    Returns:
+        {"success": true, "refundTx": "signature"}
+    """
+    try:
+        wrapper_keyfile_abs = _wrapper_keypair_abs()
+
+        refund_tx = escrow_refund_buyer(
+            wrapper_keyfile=wrapper_keyfile_abs,
+            buyer_pubkey=buyer_pubkey,
+            amount_lamports=amount_lamports,
+            mint=MINT,
+        )
+
+        LOG.info(f" Refunded buyer {buyer_pubkey}: {amount_lamports} lamports (tx: {refund_tx})")
+
+        return {
+            "success": True,
+            "refundTx": refund_tx,
+            "amount": amount_lamports,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Refund failed: {str(e)}"
+        }
+
+def escrow_get_pda(buyer_pub: str, order_id: int) -> str:
+    """
+    Derive escrow PDA address.
+
+    Args:
+        buyer_pub: Buyer's public key
+        order_id: Order ID (u64)
+
+    Returns:
+        Escrow PDA address as string
+    """
+    raise NotImplementedError("Use result from escrow_create_order instead")
+
 __all__ = [
-    # config
     "MINT",
     "WRAPPER_KEYPAIR",
     "TREASURY_KEYPAIR",
     "WRAPPER_RESERVE_PUB",
     "STEALTH_FEE_SOL",
     "VERBOSE",
-    # shell
     "get_pubkey_from_keypair",
     "get_sol_balance",
     "fmt_amt",
     "_lamports",
-    # ata/spl
     "get_wrapper_ata",
     "get_ata_for_owner",
     "spl_mint_to_wrapper",
@@ -825,11 +1235,9 @@ __all__ = [
     "spl_burn_from_wrapper",
     "spl_transfer_from_wrapper",
     "spl_apply",
-    # fee-payer
     "pick_treasury_fee_payer_tmpfile",
-    # utils
+    "pick_wrapper_stealth_fee_payer",
     "solana_transfer",
-    # cSOL utilities
     "ensure_csol_ata",
     "csol_total_supply",
     "csol_balance",
@@ -837,12 +1245,10 @@ __all__ = [
     "csol_transfer_from_reserve",
     "csol_mint_to_reserve",
     "csol_burn_from_reserve",
-    # re-exports crypto_core
     "make_commitment",
     "issue_blind_sig_for_commitment_hex",
     "bs_load_pub",
     "derive_stealth_from_recipient_secret",
-    # cli passthrough
     "load_wrapper_state",
     "save_wrapper_state",
     "load_pool_state",
@@ -857,10 +1263,8 @@ __all__ = [
     "add_pool_stealth_record",
     "recipient_tag",
     "read_secret_64_from_json_value",
-    # merkle/events
     "build_merkle",
     "emit",
-    # listings
     "listing_create",
     "listings_active",
     "listings_by_owner",
@@ -875,4 +1279,11 @@ __all__ = [
     "profile_canonical_json_bytes",
     "profile_hash_profile_leaf",
     "profile_verify_owner_sig",
+    "ESCROW_PROGRAM_ID",
+    "escrow_create_order",
+    "escrow_accept_order",
+    "escrow_mark_shipped",
+    "escrow_confirm_delivery",
+    "escrow_finalize_order",
+    "escrow_refund_order",
 ]

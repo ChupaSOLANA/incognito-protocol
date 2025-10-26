@@ -1,4 +1,3 @@
-# services/crypto_core/profile.py
 from __future__ import annotations
 from typing import Any, Iterable
 import json, hashlib, base58

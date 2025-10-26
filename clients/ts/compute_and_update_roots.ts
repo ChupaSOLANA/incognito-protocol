@@ -1,4 +1,3 @@
-// scripts/compute_and_update_roots.ts
 import * as fs from "fs";
 import * as path from "path";
 import { createHash } from "crypto";
@@ -6,9 +5,20 @@ import MerkleTree from "merkletreejs";
 import * as anchor from "@coral-xyz/anchor";
 import { Program, AnchorProvider, BN } from "@coral-xyz/anchor";
 import { PublicKey, Connection, Keypair } from "@solana/web3.js";
-import { MerkleRegistry } from "../target/types/merkle_registry";
 
 const sha256 = (d: Buffer) => createHash("sha256").update(d).digest();
+
+function h2(a: Buffer, b: Buffer): Buffer {
+  return sha256(Buffer.concat([a, b]));
+}
+
+function h1(x: Buffer): Buffer {
+  return sha256(x);
+}
+
+function leafFrom(commitment: Buffer, nfHash: Buffer): Buffer {
+  return h2(commitment, nfHash);
+}
 
 function hex32(u: unknown): Buffer {
   if (typeof u !== "string") throw new Error("expect hex string");
@@ -32,56 +42,34 @@ function loadJSON<T>(p: string): T {
 }
 
 async function main() {
-  // ---- Load files ----
-  const msPath = path.resolve(__dirname, "../merkle_state.json");
-  const pmPath = path.resolve(__dirname, "../pool_merkle_state.json");
+  const msPath = path.resolve(__dirname, "../../merkle_state.json");
+  const pmPath = path.resolve(__dirname, "../../pool_merkle_state.json");
 
   const merkleState = loadJSON<any>(msPath);
   const poolState = loadJSON<any>(pmPath);
 
-  // ---- Build sets of leaves ----
-  // commitments from top-level leaves
+  const poolRecords: any[] = poolState.records ?? [];
+
+  const poolLeaves: string[] = poolRecords
+    .filter((r: any) => r.commitment && r.nullifier)
+    .map((r: any) => {
+      const commitment = hex32(r.commitment);
+      const nullifier = hex32(r.nullifier);
+      const nfHash = h1(nullifier);
+      const leaf = leafFrom(commitment, nfHash);
+      return "0x" + leaf.toString("hex");
+    });
+
   const commitmentsA: string[] = Array.from(
     new Set([...(merkleState.leaves ?? [])])
   );
 
-  // commitments from notes[].leaf
-  const commitmentsB: string[] = Array.from(
-    new Set(
-      [...(merkleState.notes ?? []).map((n: any) => n.leaf)].filter(Boolean)
-    )
-  );
+  const rootPool = merkleRoot(poolLeaves.length > 0 ? poolLeaves : commitmentsA);
 
-  // commitments from pool records
-  const poolCommitments: string[] = Array.from(
-    new Set(
-      [...(poolState.records ?? []).map((r: any) => r.commitment)].filter(
-        Boolean
-      )
-    )
-  );
-
-  // nullifiers
-  const nullifiers: string[] = Array.from(
-    new Set([...(merkleState.nullifiers ?? [])])
-  );
-
-  // ---- Compute roots ----
-  const rootCommitmentsA = merkleRoot(commitmentsA);
-  const rootCommitmentsB = merkleRoot(commitmentsB);
-  const rootPool = merkleRoot(poolCommitments);
-  const rootNullifiers = merkleRoot(nullifiers);
-
-  // Print hex
   const hex = (b: Buffer) => "0x" + b.toString("hex");
-  console.log("rootCommitmentsA:", hex(rootCommitmentsA));
-  console.log("rootCommitmentsB:", hex(rootCommitmentsB));
-  console.log("rootPool        :", hex(rootPool));
-  console.log("rootNullifiers  :", hex(rootNullifiers));
-
-  // ---- Push one root to on-chain tree (example) ----
-  // Configure provider
-  const rpc = process.env.RPC_URL ?? "http://127.0.0.1:8899";
+  console.log("Pool root (from records):", hex(rootPool));
+  console.log("Number of pool leaves:", poolLeaves.length);
+  const rpc = process.env.RPC_URL ?? process.env.SOLANA_RPC_URL ?? "http://127.0.0.1:8899";
   const connection = new Connection(rpc, { commitment: "confirmed" });
   const secret = JSON.parse(
     fs.readFileSync(
@@ -97,33 +85,35 @@ async function main() {
   });
   anchor.setProvider(provider);
 
-  const program = anchor.workspace.MerkleRegistry as Program<MerkleRegistry>;
+  // Load program
+  const programId = new PublicKey(
+    process.env.INCOGNITO_PROG_ID ?? "4N49EyRoX9p9zoiv1weeeqpaJTGbEHizbzZVgrsrVQeC"
+  );
+  const idlPath = process.env.INCOGNITO_IDL_PATH ??
+    path.join(__dirname, "../../contracts/incognito/target/idl/incognito.json");
+  const idl = JSON.parse(fs.readFileSync(idlPath, "utf8"));
+  const program = new Program(idl, programId, provider);
 
-  // Derive or load your MerkleTree PDA (seed you used at init)
-  // If you need a fresh tree: keep the seed fixed and stored client-side.
-  const seed = Buffer.alloc(32, 1); // <-- replace by your persisted 32B seed
-  const [treePda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("merkle"), seed],
+  const [poolStatePda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_state")],
     program.programId
   );
 
-  // One-time init (idempotent if already exists)
+  console.log("\n=== On-Chain Verification ===");
   try {
-    await program.methods
-      .initTree([...seed] as any, Array.from(rootCommitmentsA) as any)
-      .accounts({ authority: wallet.publicKey } as any)
-      .rpc();
-  } catch (_) {
-    // ignore if already initialized
+    const onChainPoolState = await program.account.poolState.fetch(poolStatePda);
+    const onChainRoot = Buffer.from(onChainPoolState.root as number[]);
+
+    console.log("On-chain root:", hex(onChainRoot));
+    console.log("Computed root: ", hex(rootPool));
+    console.log("Roots match:   ", onChainRoot.equals(rootPool) ? "✓ YES" : "✗ NO");
+    console.log("\nOn-chain leaf count:", onChainPoolState.leafCount.toString());
+    console.log("Local leaf count:   ", poolLeaves.length);
+  } catch (e) {
+    console.error("Failed to fetch on-chain pool state.");
+    console.error("Make sure the pool is initialized with: init_pool instruction");
+    console.error(e);
   }
-
-  // Update to a new root (choose which set is canonical for your tree)
-  await program.methods
-    .updateRoot(Array.from(rootCommitmentsA) as any)
-    .accounts({ tree: treePda, authority: wallet.publicKey } as any)
-    .rpc();
-
-  console.log("Updated on-chain root to:", hex(rootCommitmentsA));
 }
 
 main().catch((e) => {

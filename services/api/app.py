@@ -1,58 +1,105 @@
-# services/api/app.py
+
 from __future__ import annotations
 
-import os
-import tempfile
-from decimal import Decimal, ROUND_DOWN
-from typing import List, Optional, Dict, Any
-import json
-import secrets
-import pathlib
-import subprocess
-import requests
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi import Body
-from datetime import datetime
+import base64
+import base58
 import hashlib
+import json
+import os
+import pathlib
+import secrets
+import subprocess
+import tempfile
+import time
+from datetime import datetime
+from decimal import Decimal, ROUND_DOWN
+from typing import Any, Dict, List, Optional
 
-from services.crypto_core.merkle import MerkleTree, verify_merkle
+import nacl.bindings as nb
+import requests
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from nacl import utils as nacl_utils
+from nacl.secret import SecretBox
+
+from services.crypto_core import stealth as st
+from services.crypto_core.blind_api import (
+    ensure_signer_keypair as _ensure_blind_keys,
+)
 from services.crypto_core.blind_api import load_pub as bs_load_pub, verify as bs_verify
-
-# Assure la présence des clés de blind-signature (sinon les notes émises au handoff sont invalides)
-try:
-    from services.crypto_core.blind_api import ensure_signer_keypair as _ensure_blind_keys
-    _ensure_blind_keys()
-except Exception:
-    pass
+from services.crypto_core.merkle import verify_merkle, MerkleTree as OldMerkleTree
+from services.crypto_core.onchain_pool import (
+    deposit_to_pool_onchain,
+    prepare_deposit_params,
+    withdraw_from_pool_onchain,
+    MerkleTree as PoolMerkleTree,
+    h1,
+    h2,
+    get_pubkey_from_keypair
+)
+from services.crypto_core.wrapper_stealth import (
+    initialize_wrapper_stealth_state,
+    load_wrapper_stealth_state,
+    DEFAULT_STATE_PATH as WRAPPER_STEALTH_STATE_PATH
+)
+from pathlib import Path
 
 from . import cli_adapter as ca
 from . import eventlog as ev
 from .schemas_api import (
-    ConvertReq, ConvertRes,
-    DepositReq, DepositRes,
-    HandoffReq, HandoffRes,
-    MetricRow, MerkleStatus,
-    StealthItem, StealthList,
-    SweepReq, SweepRes,
-    WithdrawReq, WithdrawRes,
-    # marketplace
-    BuyReq, BuyRes,
-    # listings
-    Listing, ListingsPayload, ListingCreateRes, ListingUpdateRes, ListingDeleteRes,
+    BuyReq,
+    BuyRes,
+    ConvertReq,
+    ConvertRes,
+    CsolToNoteReq,
+    CsolToNoteRes,
+    DepositReq,
+    DepositRes,
+    EncryptedBlob,
+    EscrowActionReq,
+    EscrowActionRes,
+    EscrowGetRes,
+    EscrowListRes,
+    EscrowMerkleStatus,
+    EscrowOpenReq,
+    EscrowOpenRes,
+    EscrowRecord,
+    Listing,
+    ListingCreateRes,
+    ListingDeleteRes,
+    ListingUpdateRes,
+    ListingsPayload,
+    ListNotesRes,
+    MarkStealthUsedReq,
+    MarkStealthUsedRes,
+    MessageRow,
+    MessageSendReq,
+    MessageSendRes,
+    MessagesListRes,
+    MessagesMerkleStatus,
+    MerkleStatus,
+    MetricRow,
+    NoteInfo,
     ProfileBlob,
-    ProfileRevealReq, ProfileRevealRes,
+    ProfileRevealReq,
+    ProfileRevealRes,
     ProfileResolveRes,
     ProfileRotateReq,
-    MarkStealthUsedReq, MarkStealthUsedRes,
-    EncryptedBlob,
-    EscrowRecord,
-    EscrowOpenReq, EscrowOpenRes,
-    EscrowActionReq, EscrowActionRes,
-    EscrowGetRes, EscrowListRes, EscrowMerkleStatus,
+    StealthItem,
+    StealthList,
+    SweepReq,
+    SweepRes,
+    WithdrawReq,
+    WithdrawRes,
 )
 
 try:
+    _ensure_blind_keys()
+except Exception:
+    pass
+
+try:
     from . import schemas_api as _schemas
+
     _schemas.ProfileResolveRes.update_forward_refs(**_schemas.__dict__)
     _schemas.ProfileRevealRes.update_forward_refs(**_schemas.__dict__)
 except Exception:
@@ -60,38 +107,63 @@ except Exception:
 
 app = FastAPI(title="Incognito Protocol API", version="0.1.0")
 
-# =========================
-# Paths & config
-# =========================
+@app.on_event("startup")
+async def startup_event():
+    """Initialize wrapper stealth state and escrow platform on startup if needed"""
+    try:
+        load_wrapper_stealth_state(WRAPPER_STEALTH_STATE_PATH)
+        print(" Wrapper stealth state loaded")
+    except FileNotFoundError:
+        wrapper_keyfile = ca.WRAPPER_KEYPAIR
+        if os.path.exists(wrapper_keyfile):
+            wrapper_pubkey = ca.get_pubkey_from_keypair(wrapper_keyfile)
+            initialize_wrapper_stealth_state(
+                wrapper_master_pubkey=wrapper_pubkey,
+                state_path=WRAPPER_STEALTH_STATE_PATH
+            )
+            print(f" Initialized wrapper stealth state at {WRAPPER_STEALTH_STATE_PATH}")
+        else:
+            print(f" Warning: Wrapper keyfile not found at {wrapper_keyfile}")
+
+    try:
+        print("Initializing escrow platform...")
+        ca._ensure_escrow_platform_initialized()
+        print(" Escrow platform ready")
+    except Exception as e:
+        print(f" Warning: Failed to initialize escrow platform: {e}")
+        print("  Escrow features may not work until platform is initialized")
+
 
 REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[2])
 DATA_DIR = os.getenv("DATA_DIR", os.path.join(REPO_ROOT, "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Where we remember the last-seen cluster fingerprint
 CLUSTER_FP_PATH = os.path.join(DATA_DIR, "cluster_fingerprint.json")
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "http://127.0.0.1:8899")
 
-# App-level ledgers / logs (no DB)
 CSOL_LEDGER_PATH = os.path.join(DATA_DIR, "csol_ledger.json")
-CSOL_SUPPLY_FILE = os.path.join(DATA_DIR, "csol_supply.json")  # miroir off-chain de la total supply
+CSOL_SUPPLY_FILE = os.path.join(DATA_DIR, "csol_supply.json")
 SHIPPING_EVENTS_PATH = os.path.join(DATA_DIR, "shipping_events.jsonl")
 SHIPPING_MERKLE_PATH = os.path.join(DATA_DIR, "shipping_merkle.json")
 
-# Profiles (append-only JSONL + Merkle mirror + used one-time stealth list)
 PROFILES_EVENTS = os.path.join(DATA_DIR, "profiles.jsonl")
 PROFILES_MERKLE = os.path.join(DATA_DIR, "profiles_merkle.json")
 USED_STEALTH_PATH = os.path.join(DATA_DIR, "used_stealth.jsonl")
 
+MESSAGES_EVENTS_PATH = os.path.join(DATA_DIR, "messages.jsonl")
+MESSAGES_MERKLE_PATH = os.path.join(DATA_DIR, "messages_merkle.json")
+
+USER_NOTES_PATH = os.path.join(DATA_DIR, "user_notes.json")
+
+NOTES_DIR = os.path.join(REPO_ROOT, "notes")
+
 IPFS_GATEWAY = os.getenv("IPFS_GATEWAY", "http://127.0.0.1:8080/ipfs/")
 
-# Override explicite demandé pour la lecture du solde trésor/pool
 TREASURY_KEYFILE = os.getenv(
     "TREASURY_KEYFILE",
     "/Users/alex/Desktop/incognito-protocol-1/keys/pool.json",
 )
 
-# Ensure base files exist (lazy best-effort)
 for p, default in [
     (CSOL_LEDGER_PATH, "{}"),
     (CSOL_SUPPLY_FILE, '{"total":"0"}'),
@@ -100,16 +172,19 @@ for p, default in [
     (PROFILES_EVENTS, ""),
     (PROFILES_MERKLE, json.dumps({"leaves": [], "root": None, "version": 1})),
     (USED_STEALTH_PATH, ""),
+    (MESSAGES_EVENTS_PATH, ""),
+    (MESSAGES_MERKLE_PATH, json.dumps({"leaves": [], "root": None, "version": 1})),
+    (USER_NOTES_PATH, "{}"),
 ]:
     if not os.path.exists(p):
         try:
             pathlib.Path(p).write_text(default if isinstance(default, str) else json.dumps(default))
         except Exception:
             pass
+
 ESCROW_STATE_PATH = os.path.join(DATA_DIR, "escrow_state.json")
 ESCROW_MERKLE_PATH = os.path.join(DATA_DIR, "escrow_merkle_state.json")
 
-# Ensure they exist
 for p, default in [
     (ESCROW_STATE_PATH, json.dumps({"escrows": [], "nullifiers": []})),
     (ESCROW_MERKLE_PATH, json.dumps({"leaves": [], "root": ""})),
@@ -120,9 +195,6 @@ for p, default in [
         except Exception:
             pass
 
-# =========================
-# Cluster fingerprint & auto-wipe listings on validator reset
-# =========================
 
 AUTO_WIPE = os.getenv("AUTO_WIPE_ON_CLUSTER_CHANGE", "1") == "1"
 
@@ -173,14 +245,13 @@ def _autowipe_on_cluster_change():
     if not AUTO_WIPE:
         return
     cur_genesis = _get_genesis_hash()
-    cur_ident   = _get_identity_pub()  # include validator identity
+    cur_ident = _get_identity_pub()
     if not cur_genesis:
         return
     cur_fp = {"rpc": SOLANA_RPC_URL, "genesis": cur_genesis, "identity": cur_ident}
     prev = _load_fp()
     if prev == cur_fp:
         return
-
     try:
         try:
             ca.listings_reset_all()
@@ -192,14 +263,15 @@ def _autowipe_on_cluster_change():
         _unlink(SHIPPING_MERKLE_PATH)
         _unlink(PROFILES_EVENTS)
         _unlink(PROFILES_MERKLE)
-        _unlink(USED_STEALTH_PATH) 
+        _unlink(USED_STEALTH_PATH)
         lst_path = os.getenv("LISTINGS_STATE_FILE")
         _unlink(lst_path)
-
         pathlib.Path(CSOL_LEDGER_PATH).write_text(json.dumps({}))
         pathlib.Path(CSOL_SUPPLY_FILE).write_text(json.dumps({"total": "0"}))
         pathlib.Path(SHIPPING_EVENTS_PATH).write_text("")
-        pathlib.Path(SHIPPING_MERKLE_PATH).write_text(json.dumps({"leaves": [], "root": None, "version": 1}))
+        pathlib.Path(SHIPPING_MERKLE_PATH).write_text(
+            json.dumps({"leaves": [], "root": None, "version": 1})
+        )
     finally:
         _save_fp(cur_fp)
 
@@ -221,29 +293,31 @@ def _reconcile_listings():
         if not lid or not spk:
             continue
         if not _account_exists(spk):
-            try: ca.listing_delete(owner_pubkey=spk, listing_id_hex=lid)
-            except Exception: pass
+            try:
+                ca.listing_delete(owner_pubkey=spk, listing_id_hex=lid)
+            except Exception:
+                pass
             continue
         try:
             rc, out, err = ca._run_rc(["spl-token", "address", ca.MINT, "--owner", spk, "--verbose"])
             ok = (rc == 0) and ("associated token address:" in (out or "").lower())
             if not ok:
-                try: ca.listing_delete(owner_pubkey=spk, listing_id_hex=lid)
-                except Exception: pass
+                try:
+                    ca.listing_delete(owner_pubkey=spk, listing_id_hex=lid)
+                except Exception:
+                    pass
         except Exception:
-            try: ca.listing_delete(owner_pubkey=spk, listing_id_hex=lid)
-            except Exception: pass
+            try:
+                ca.listing_delete(owner_pubkey=spk, listing_id_hex=lid)
+            except Exception:
+                pass
 
 _autowipe_on_cluster_change()
 _reconcile_listings()
 
-# --- Messaging program (Anchor) ---
 MESSAGES_PID = os.getenv("MESSAGES_PROGRAM_ID", "Msg11111111111111111111111111111111111111111")
-SOLANA_DIR = pathlib.Path(REPO_ROOT) / "contracts" / "solana"
+INCOGNITO_DIR = pathlib.Path(REPO_ROOT) / "contracts" / "incognito"
 
-# =========================
-# Shipping (Encrypted) — Append-only log + Merkle state (NO DB)
-# =========================
 
 def _shipping__ensure_files():
     if not os.path.exists(SHIPPING_EVENTS_PATH):
@@ -253,7 +327,9 @@ def _shipping__ensure_files():
             pass
     if not os.path.exists(SHIPPING_MERKLE_PATH):
         try:
-            pathlib.Path(SHIPPING_MERKLE_PATH).write_text(json.dumps({"leaves": [], "root": None, "version": 1}))
+            pathlib.Path(SHIPPING_MERKLE_PATH).write_text(
+                json.dumps({"leaves": [], "root": None, "version": 1})
+            )
         except Exception:
             pass
 
@@ -302,15 +378,20 @@ def _shipping_leaf_hex(blob: Dict[str, Any]) -> str:
     return h.hexdigest()
 
 def _shipping_build_tree(leaves_hex: List[str]) -> MerkleTree:
-    mt = MerkleTree(leaves_hex if isinstance(leaves_hex, list) else [])
+    mt = OldMerkleTree(leaves_hex if isinstance(leaves_hex, list) else [])
     if not getattr(mt, "layers", None) and getattr(mt, "leaf_bytes", None):
         mt.build_tree()
     return mt
 
-def _shipping_append_event(order_id: str, listing_id: str, buyer_pub: str, seller_pub: str, encrypted_blob: Dict[str, Any]) -> Dict[str, Any]:
+def _shipping_append_event(
+    order_id: str,
+    listing_id: str,
+    buyer_pub: str,
+    seller_pub: str,
+    encrypted_blob: Dict[str, Any],
+) -> Dict[str, Any]:
     _shipping__ensure_files()
     leaf_hex = _shipping_leaf_hex(encrypted_blob)
-
     row = {
         "type": "shipping_blob",
         "ts": datetime.utcnow().isoformat() + "Z",
@@ -333,10 +414,8 @@ def _shipping_append_event(order_id: str, listing_id: str, buyer_pub: str, selle
     root_hex = mt.root().hex()
     st["root"] = root_hex
     _shipping_save_state(st)
-
     idx = len(st["leaves"]) - 1
     proof = mt.get_proof(idx)
-
     return {"leaf": leaf_hex, "root": root_hex, "index": idx, "proof": proof, "order_id": order_id}
 
 def _shipping_find_by_order(order_id: str) -> Optional[Dict[str, Any]]:
@@ -352,10 +431,8 @@ def _shipping_find_by_order(order_id: str) -> Optional[Dict[str, Any]]:
                     target_row = row
     except FileNotFoundError:
         pass
-
     if not target_row:
         return None
-
     st = _shipping_load_state()
     leaves = st.get("leaves", [])
     if not isinstance(leaves, list):
@@ -364,11 +441,9 @@ def _shipping_find_by_order(order_id: str) -> Optional[Dict[str, Any]]:
         idx = leaves.index(target_row["leaf"])
     except ValueError:
         idx = None
-
     mt = _shipping_build_tree(leaves)
     root_hex = mt.root().hex()
     proof = mt.get_proof(idx) if idx is not None else []
-
     return {
         "order_id": order_id,
         "listing_id": target_row.get("listing_id"),
@@ -381,12 +456,138 @@ def _shipping_find_by_order(order_id: str) -> Optional[Dict[str, Any]]:
         "proof": proof,
     }
 
-# =========================
-# Helpers
-# =========================
+
+def _load_user_notes() -> Dict[str, List[Dict[str, Any]]]:
+    """Load notes database (owner_pub -> list of notes)"""
+    try:
+        return json.loads(pathlib.Path(USER_NOTES_PATH).read_text())
+    except Exception:
+        return {}
+
+def _save_user_notes(notes_db: Dict[str, List[Dict[str, Any]]]) -> None:
+    """Save notes database"""
+    try:
+        pathlib.Path(USER_NOTES_PATH).write_text(json.dumps(notes_db, indent=2))
+    except Exception:
+        pass
+
+def _save_note_for_user(
+    owner_pub: str,
+    secret: str,
+    nullifier: str,
+    commitment: str,
+    leaf_index: int,
+    amount_sol: float,
+    tx_signature: str,
+    spent: bool = False
+) -> None:
+    """Save a note for a user"""
+    notes_db = _load_user_notes()
+    if owner_pub not in notes_db:
+        notes_db[owner_pub] = []
+
+    note = {
+        "secret": secret,
+        "nullifier": nullifier,
+        "commitment": commitment,
+        "leaf_index": leaf_index,
+        "amount_sol": str(amount_sol),
+        "tx_signature": tx_signature,
+        "spent": spent
+    }
+
+    notes_db[owner_pub].append(note)
+    _save_user_notes(notes_db)
+
+def _mark_note_spent(owner_pub: str, nullifier: str) -> None:
+    """Mark a note as spent by nullifier"""
+    notes_db = _load_user_notes()
+    if owner_pub in notes_db:
+        for note in notes_db[owner_pub]:
+            if note.get("nullifier") == nullifier:
+                note["spent"] = True
+        _save_user_notes(notes_db)
+
+def _get_user_notes(owner_pub: str, include_spent: bool = False) -> List[Dict[str, Any]]:
+    """Get all notes for a user"""
+    notes_db = _load_user_notes()
+    notes = notes_db.get(owner_pub, [])
+    if not include_spent:
+        notes = [n for n in notes if not n.get("spent", False)]
+    return notes
+
+def _delete_note_file(commitment: str) -> None:
+    """
+    Delete a note file from the /notes directory based on commitment.
+    Files are named like: note_XXXXXXXX_timestamp.json where XXXXXXXX is first 8 chars of commitment hex.
+    """
+    try:
+        import glob
+        commitment_prefix = commitment[:8]
+        pattern = os.path.join(NOTES_DIR, f"note_{commitment_prefix}_*.json")
+        matching_files = glob.glob(pattern)
+
+        for file_path in matching_files:
+            try:
+                with open(file_path, 'r') as f:
+                    note_data = json.load(f)
+                if note_data.get("credentials", {}).get("commitment") == commitment:
+                    os.remove(file_path)
+                    print(f"   Deleted spent note file: {os.path.basename(file_path)}")
+                    return
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"   Warning: Could not delete note file for {commitment[:8]}: {e}")
+
+def _create_change_note_file(
+    secret: str,
+    nullifier: str,
+    commitment: str,
+    leaf_index: int,
+    amount_sol: float,
+    tx_signature: str
+) -> None:
+    """
+    Create a change note file in the /notes directory.
+    Files are named like: change_XXXXXXXX_timestamp.json
+    """
+    try:
+        os.makedirs(NOTES_DIR, exist_ok=True)
+
+        commitment_prefix = commitment[:8]
+        timestamp = int(datetime.now().timestamp())
+        filename = f"change_{commitment_prefix}_{timestamp}.json"
+        filepath = os.path.join(NOTES_DIR, filename)
+
+        note_data = {
+            "version": "1.0",
+            "network": "localnet",
+            "deposit_date": datetime.now().isoformat(),
+            "amount_deposited_sol": amount_sol,
+            "amount_withdrawable_sol": amount_sol,
+            "wrapper_fee_sol": 0.0,
+            "credentials": {
+                "secret": secret,
+                "nullifier": nullifier,
+                "commitment": commitment,
+                "leaf_index": leaf_index
+            },
+            "transaction": {
+                "tx_signature": tx_signature,
+                "note_type": "change"
+            }
+        }
+
+        with open(filepath, 'w') as f:
+            json.dump(note_data, f, indent=2)
+
+        print(f"   Created change note file: {filename}")
+    except Exception as e:
+        print(f"   Warning: Could not create change note file: {e}")
 
 CSOL_DEC = Decimal("0.000000001")
-CHUNK = Decimal("100")  # tranche fixe pour mint/burn
+CHUNK = Decimal("100")
 
 def _fmt(x: Decimal | float | str) -> str:
     return str(Decimal(str(x)).quantize(CSOL_DEC))
@@ -429,7 +630,6 @@ def _csol_sub(pub: str, amt: Decimal | str | float) -> None:
         d[pub] = str(newv)
     _ledger_save(d)
 
-# --- Off-chain mirror of on-chain total supply ---
 def _supply_load() -> Decimal:
     try:
         d = json.loads(pathlib.Path(CSOL_SUPPLY_FILE).read_text())
@@ -445,7 +645,6 @@ def _supply_save_exact(x: Decimal | str | float) -> None:
     except Exception:
         pass
 
-# --- Pending burn (100-lot debt) ---
 PENDING_BURN_FILE = os.path.join(DATA_DIR, "csol_pending_burn.json")
 
 def _pending_burn_load() -> Decimal:
@@ -464,7 +663,6 @@ def _pending_burn_save(x: Decimal | str | float) -> None:
 def _pending_burn_add(x: Decimal | str | float) -> None:
     _pending_burn_save(_pending_burn_load() + _q(x))
 
-# --- Helper: serialize solders.Keypair to a temp JSON keyfile (64-byte array) ---
 def _write_temp_keypair_from_solders(kp) -> str:
     try:
         sk_bytes = kp.to_bytes()
@@ -477,10 +675,6 @@ def _write_temp_keypair_from_solders(kp) -> str:
         json.dump(arr, f)
     return tmp_path
 
-# =========================
-# On-chain token introspection via spl-token
-# =========================
-
 def _spl_out(args: list[str]) -> str:
     p = subprocess.run(args, capture_output=True, text=True, timeout=30)
     if p.returncode != 0:
@@ -488,7 +682,6 @@ def _spl_out(args: list[str]) -> str:
     return p.stdout.strip()
 
 def _csol_supply_onchain() -> Decimal:
-    # "spl-token supply <MINT>"
     out = _spl_out(["spl-token", "supply", ca.MINT])
     return _q(out.split()[0])
 
@@ -496,16 +689,11 @@ def _wrapper_ata() -> str:
     return ca.get_wrapper_ata()
 
 def _wrapper_reserve_onchain() -> Decimal:
-    # "spl-token balance <ATA>" -> "123.000000000"
     try:
         out = _spl_out(["spl-token", "balance", _wrapper_ata()])
         return _q(out.split()[0])
     except Exception:
         return Decimal("0")
-
-# =========================
-# Treasury / supply utils
-# =========================
 
 def ceil_to_100(x: Decimal) -> Decimal:
     x = Decimal(str(x))
@@ -520,82 +708,114 @@ def _resolve_treasury_keyfile() -> str:
 def _resolve_treasury_pub_for_balance() -> str:
     return ca.get_pubkey_from_keypair(_resolve_treasury_keyfile())
 
+def get_sol_vault_pda() -> str:
+    """
+    Derive the SOL_VAULT PDA address using Solana's PDA derivation.
+    The SOL_VAULT is where all deposited SOL is stored.
+    Seed: b"sol_vault"
+    """
+    from solders.pubkey import Pubkey
+
+    program_id_str = os.getenv("INCOGNITO_PROG_ID", "4N49EyRoX9p9zoiv1weeeqpaJTGbEHizbzZVgrsrVQeC")
+    program_id = Pubkey.from_string(program_id_str)
+
+    pda, bump = Pubkey.find_program_address([b"sol_vault"], program_id)
+
+    return str(pda)
+
 def get_treasury_sol_balance() -> Decimal:
-    pool_pub = _resolve_treasury_pub_for_balance()
-    bal = ca.get_sol_balance(pool_pub)
+    """
+    Get the balance of the SOL_VAULT (where all deposited SOL is stored).
+    This is the backing for cSOL supply.
+    """
+    sol_vault_pub = get_sol_vault_pda()
+    bal = ca.get_sol_balance(sol_vault_pub)
     return Decimal(str(bal or "0")).quantize(CSOL_DEC)
 
 def _csol_total_supply_dec() -> Decimal:
-    # vérité = on-chain; le fichier est un miroir
     try:
         s = _csol_supply_onchain()
-        _supply_save_exact(s)  # keep mirror fresh
+        _supply_save_exact(s)
         return s
     except Exception:
-        # fallback: miroir local si CLI indisponible
         return _supply_load()
 
 def _csol_reserve_balance_dec() -> Decimal:
-    # vérité = solde ATA du wrapper
     return _wrapper_reserve_onchain()
 
-# =========================
-# Confidential/public burn helpers
-# =========================
-
 def _apply_pending_balance(mint: str, ata: str, owner_kf: str, fee_payer_kf: str) -> None:
-    # Idempotent
-    _spl_out([
-        "spl-token", "apply-pending-balance", mint,
-        "--address", ata,
-        "--owner", owner_kf,
-        "--fee-payer", fee_payer_kf,
-    ])
+    _spl_out(
+        [
+            "spl-token",
+            "apply-pending-balance",
+            mint,
+            "--address",
+            ata,
+            "--owner",
+            owner_kf,
+            "--fee-payer",
+            fee_payer_kf,
+        ]
+    )
 
-def _withdraw_confidential_tokens(mint: str, ata: str, owner_kf: str, fee_payer_kf: str, amount: Decimal) -> None:
-    _spl_out([
-        "spl-token", "withdraw-confidential-tokens",
-        mint, _fmt(amount),
-        "--address", ata,
-        "--owner", owner_kf,
-        "--fee-payer", fee_payer_kf,
-    ])
+def _withdraw_confidential_tokens(
+    mint: str,
+    ata: str,
+    owner_kf: str,
+    fee_payer_kf: str,
+    amount: Decimal,
+) -> None:
+    _spl_out(
+        [
+            "spl-token",
+            "withdraw-confidential-tokens",
+            mint,
+            _fmt(amount),
+            "--address",
+            ata,
+            "--owner",
+            owner_kf,
+            "--fee-payer",
+            fee_payer_kf,
+        ]
+    )
 
 def _burn_public_tokens_simple(ata: str, owner_kf: str, fee_payer_kf: str, amount: Decimal) -> None:
-    # Exact CLI that worked manually
-    _spl_out([
-        "spl-token", "burn",
-        ata, _fmt(amount),
-        "--owner", owner_kf,
-        "--fee-payer", fee_payer_kf,
-    ])
+    _spl_out(
+        [
+            "spl-token",
+            "burn",
+            ata,
+            _fmt(amount),
+            "--owner",
+            owner_kf,
+            "--fee-payer",
+            fee_payer_kf,
+        ]
+    )
 
 def _burn_chunk(amount: Decimal) -> bool:
     """
     Try a simple public burn first.
     If that fails (likely all balance is confidential), then:
-      apply-pending-balance -> withdraw-confidential-tokens -> burn.
+    apply-pending-balance -> withdraw-confidential-tokens -> burn.
+
     Uses a pool stealth fee payer (temp keyfile).
     """
     mint = ca.MINT
     ata = _wrapper_ata()
     owner_kf = ca.WRAPPER_KEYPAIR
-
     fee_tmp, _ = ca.pick_treasury_fee_payer_tmpfile()
     if not fee_tmp:
         return False
-
     try:
-        # 1) Fast path: public burn
         try:
             _burn_public_tokens_simple(ata, owner_kf, fee_tmp, amount)
             return True
         except Exception:
-            # 2) Confidential path
             try:
                 _apply_pending_balance(mint, ata, owner_kf, fee_tmp)
             except Exception:
-                # ok if nothing to apply
                 pass
             _withdraw_confidential_tokens(mint, ata, owner_kf, fee_tmp, amount)
             _burn_public_tokens_simple(ata, owner_kf, fee_tmp, amount)
@@ -607,10 +827,6 @@ def _burn_chunk(amount: Decimal) -> bool:
             os.remove(fee_tmp)
         except Exception:
             pass
-
-# =========================
-# Pending-burn settlement (on-chain aware)
-# =========================
 
 def _try_settle_pending_burn() -> None:
     pb = _pending_burn_load()
@@ -630,10 +846,6 @@ def _try_settle_pending_burn() -> None:
         _pending_burn_save(pb - settled)
         print(f"[PENDING_BURN] settled {settled}; remaining {pb - settled}")
 
-# =========================
-# Reconciliation (drive supply to target exactly)
-# =========================
-
 def reconcile_csol_supply(assume_delta: Decimal = Decimal("0")) -> Dict[str, Any]:
     """
     Objectif: après l'opération, la supply on-chain == target.
@@ -642,18 +854,13 @@ def reconcile_csol_supply(assume_delta: Decimal = Decimal("0")) -> Dict[str, Any
     """
     T = (get_treasury_sol_balance() + _q(assume_delta)).quantize(CSOL_DEC)
     target = max(Decimal("100"), ceil_to_100(T)).quantize(CSOL_DEC)
-
     S_on = _csol_total_supply_dec()
     gap = (S_on - target).quantize(CSOL_DEC)
-
     print(f"[RECONCILE] treasury={T} supply_onchain={S_on} target={target}")
-
     if gap == 0:
         _supply_save_exact(S_on)
         return {"action": "noop", "treasury": str(T), "target": str(target)}
-
     if gap > 0:
-        # Need to reduce supply by 'gap' -> number of 100-lots:
         chunks_needed = int(gap // CHUNK)
         burned = Decimal("0")
         for _ in range(chunks_needed):
@@ -663,31 +870,29 @@ def reconcile_csol_supply(assume_delta: Decimal = Decimal("0")) -> Dict[str, Any
             burned += CHUNK
         if burned > 0:
             _supply_save_exact(_csol_supply_onchain())
-        remaining = (Decimal(chunks_needed) * CHUNK) - burned
-        if remaining > 0:
-            _pending_burn_add(remaining)
-            print(f"[RECONCILE] partial burn burned={burned} pending_burn+={remaining}")
-            return {"action": "partial_burn", "amount": str(burned), "pending": str(remaining), "treasury": str(T), "target": str(target)}
-        print(f"[RECONCILE] BURN {burned} (100-lots)")
-        return {"action": "burn", "amount": str(burned), "treasury": str(T), "target": str(target)}
-
-    # gap < 0 -> need to mint -gap:
+            remaining = (Decimal(chunks_needed) * CHUNK) - burned
+            if remaining > 0:
+                _pending_burn_add(remaining)
+                print(f"[RECONCILE] partial burn burned={burned} pending_burn+={remaining}")
+                return {
+                    "action": "partial_burn",
+                    "amount": str(burned),
+                    "pending": str(remaining),
+                    "treasury": str(T),
+                    "target": str(target),
+                }
+            print(f"[RECONCILE] BURN {burned} (100-lots)")
+            return {"action": "burn", "amount": str(burned), "treasury": str(T), "target": str(target)}
     chunks_to_mint = int((-gap) // CHUNK)
     amt = _q(chunks_to_mint) * CHUNK
     print(f"[RECONCILE] MINT {amt} to wrapper reserve")
     ca.csol_mint_to_reserve(str(amt))
     _supply_save_exact(_csol_supply_onchain())
-    # Do not settle pending burns here; we want supply to remain at target.
     return {"action": "mint", "amount": str(amt), "treasury": str(T), "target": str(target)}
-
-# =========================
-# Reserve management
-# =========================
 
 def _ensure_reserve_has(amount: Decimal) -> None:
     """
-    Garantir que la réserve possède `amount` cSOL.
-    Mint par tranches de 100 jusqu'à couvrir le besoin.
+    Garantir que la réserve possède amount cSOL. Mint par tranches de 100 jusqu'à couvrir le besoin.
     """
     amount = _q(amount)
     if amount <= 0:
@@ -698,18 +903,13 @@ def _ensure_reserve_has(amount: Decimal) -> None:
         print("[ENSURE_RESERVE] enough reserve, no mint")
         return
     missing = (amount - reserve).quantize(CSOL_DEC)
-    chunks = int((missing + (CHUNK - Decimal("0.000000000"))) // CHUNK)  # ceil to chunk
+    chunks = int((missing + (CHUNK - Decimal("0.000000000"))) // CHUNK)
     if chunks <= 0:
         return
     to_mint = _q(chunks) * CHUNK
     print(f"[ENSURE_RESERVE] minting {to_mint}")
     ca.csol_mint_to_reserve(str(to_mint))
     _supply_save_exact(_csol_supply_onchain())
-    # Note: pas de _try_settle_pending_burn() ici
-
-# =========================
-# Startup normalization (mirror only)
-# =========================
 
 def _normalize_supply_on_startup():
     try:
@@ -717,26 +917,20 @@ def _normalize_supply_on_startup():
         _supply_save_exact(s)
         print(f"[STARTUP] mirrored on-chain supply: {s}")
     except Exception:
-        # keep existing mirror
         pass
 
 _normalize_supply_on_startup()
 
-# =========================
-# Listing helpers (dynamic)
-# =========================
-
 def _load_listing(listing_id: str) -> Dict[str, Any]:
     candidates = []
     try:
-        from clients.cli import incognito_marketplace as mp  # optional at runtime
+        from clients.cli import incognito_marketplace as mp
     except Exception:
-        mp = None  # type: ignore
+        mp = None
     try:
-        from services.api import listings as srv_listings  # optional at runtime
+        from services.api import listings as srv_listings
     except Exception:
-        srv_listings = None  # type: ignore
-
+        srv_listings = None
     if srv_listings:
         candidates += [
             getattr(srv_listings, n, None)
@@ -762,22 +956,15 @@ def _deactivate_listing(listing_id: str) -> None:
     try:
         from services.api import listings as srv_listings
     except Exception:
-        srv_listings = None  # type: ignore
+        srv_listings = None
     try:
         from clients.cli import incognito_marketplace as mp
     except Exception:
-        mp = None  # type: ignore
-
+        mp = None
     if srv_listings:
-        candidates += [
-            getattr(srv_listings, n, None)
-            for n in ("deactivate_listing", "mark_sold", "set_inactive")
-        ]
+        candidates += [getattr(srv_listings, n, None) for n in ("deactivate_listing", "mark_sold", "set_inactive")]
     if mp:
-        candidates += [
-            getattr(mp, n, None)
-            for n in ("deactivate_listing", "mark_sold", "set_inactive")
-        ]
+        candidates += [getattr(mp, n, None) for n in ("deactivate_listing", "mark_sold", "set_inactive")]
     for fn in candidates:
         if callable(fn):
             try:
@@ -787,7 +974,6 @@ def _deactivate_listing(listing_id: str) -> None:
                 continue
     return
 
-# ---------- Admin endpoints (diagnostic) ----------
 @app.get("/admin/treasury")
 def admin_treasury(keyfile: Optional[str] = None):
     kf = keyfile or _resolve_treasury_keyfile()
@@ -799,20 +985,17 @@ def admin_treasury(keyfile: Optional[str] = None):
 def admin_reconcile():
     return reconcile_csol_supply()
 
-# ---------- Metrics ----------
 @app.get("/metrics", response_model=List[MetricRow])
 def metrics():
     rows = ev.metrics_all()
     return [MetricRow(epoch=r[0], issued_count=r[1], spent_count=r[2], updated_at=r[3]) for r in rows]
 
-# ---------- Merkle Status ----------
 @app.get("/merkle/status", response_model=MerkleStatus)
 def merkle_status():
     wst = ca.load_wrapper_state()
     wmt = ca.build_merkle(wst)
     if not wmt.layers and getattr(wmt, "leaf_bytes", None):
         wmt.build_tree()
-
     total = Decimal("0")
     for n in wst.get("notes", []):
         if not n.get("spent", False):
@@ -820,12 +1003,10 @@ def merkle_status():
                 total += Decimal(str(n["amount"]))
             except Exception:
                 pass
-
     pst = ca.load_pool_state()
-    pmt = MerkleTree([r["commitment"] for r in pst.get("records", [])])
+    pmt = OldMerkleTree([r["commitment"] for r in pst.get("records", [])])
     if not pmt.layers and getattr(pmt, "leaf_bytes", None):
         pmt.build_tree()
-
     return MerkleStatus(
         wrapper_leaves=len(wst.get("leaves", [])),
         wrapper_root_hex=wmt.root().hex(),
@@ -835,240 +1016,595 @@ def merkle_status():
         pool_root_hex=pmt.root().hex(),
     )
 
-# ---------- Deposit ----------
+@app.post("/pool-state-reset")
+def pool_state_reset():
+    """
+    Reset local pool state (WARNING: This will clear your local tree!)
+    Only use this if you know what you're doing.
+    """
+    import time
+    import shutil
+
+    pool_merkle_path = Path(REPO_ROOT) / "pool_merkle_state.json"
+    backup_path = Path(REPO_ROOT) / f"pool_merkle_state.backup.{int(time.time())}.json"
+
+    if pool_merkle_path.exists():
+        shutil.copy(pool_merkle_path, backup_path)
+
+        with open(pool_merkle_path, 'w') as f:
+            json.dump({
+                "depth": 20,
+                "leaves": [],
+                "leaf_count": 0
+            }, f, indent=2)
+
+        return {"success": True, "message": f"Local state reset. Backup saved to {backup_path.name}"}
+    else:
+        return {"success": False, "message": "No local state found"}
+
+@app.get("/pool-state-debug")
+def pool_state_debug(cluster: str = "localnet"):
+    """
+    Debug endpoint to compare local vs on-chain pool state
+    """
+    pool_merkle_path = Path(REPO_ROOT) / "pool_merkle_state.json"
+    if not pool_merkle_path.exists():
+        return {"error": "No local pool state found"}
+
+    with open(pool_merkle_path, 'r') as f:
+        local_state = json.load(f)
+
+    tree = PoolMerkleTree(depth=local_state.get("depth", 20))
+    for leaf_hex in local_state.get("leaves", []):
+        tree.insert(bytes.fromhex(leaf_hex))
+
+    local_root = tree.root().hex()
+    local_leaf_count = len(tree.leaves)
+
+    try:
+        from services.crypto_core.onchain_pool import get_onchain_pool_state
+        onchain_state = get_onchain_pool_state(cluster=cluster)
+
+        return {
+            "local": {
+                "root": local_root,
+                "leaf_count": local_leaf_count,
+                "depth": tree.depth
+            },
+            "onchain": onchain_state,
+            "synchronized": local_root == onchain_state["root"] and local_leaf_count == onchain_state["leaf_count"]
+        }
+    except Exception as e:
+        return {
+            "local": {
+                "root": local_root,
+                "leaf_count": local_leaf_count,
+                "depth": tree.depth
+            },
+            "onchain_error": str(e)
+        }
+
 @app.post("/deposit", response_model=DepositRes)
 def deposit(req: DepositReq):
-    pool_pub = _resolve_treasury_pub_for_balance()
-    eph_b58, stealth_pool_addr = ca.generate_stealth_for_recipient(pool_pub)
-    ca.add_pool_stealth_record(pool_pub, stealth_pool_addr, eph_b58, 0)
+    """
+    Deposit SOL to the on-chain incognito pool.
 
-    depositor_pub = ca.get_pubkey_from_keypair(req.depositor_keyfile)
+    This creates a commitment, deposits to the pool, and generates a wrapper stealth
+    address for the 0.05 SOL fee. The depositor receives back the secret/nullifier
+    needed to later withdraw.
+    """
+    amount_lamports = int(req.amount_sol * 1_000_000_000)
 
-    fee_dec = ca.STEALTH_FEE_SOL
-    try:
-        main_part = (req.amount_sol - fee_dec).quantize(Decimal("0.000000001"), rounding=ROUND_DOWN)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid amount format.")
+    if amount_lamports <= 50_000_000:
+        raise HTTPException(
+            status_code=400,
+            detail="Deposit amount must be greater than 0.05 SOL (wrapper fee)"
+        )
 
-    if main_part <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be greater than stealth fee")
-
-    ca.solana_transfer(req.depositor_keyfile, pool_pub, str(main_part))
-    ca.solana_transfer(req.depositor_keyfile, stealth_pool_addr, str(fee_dec))
-
-    st = ca.load_wrapper_state()
-    note = secrets.token_bytes(32).hex()
-    nonce = secrets.token_bytes(16).hex()
-    rec = ca.add_note(st, depositor_pub, str(main_part), note, nonce)
-
-    rec["fee_eph_pub_b58"] = eph_b58
-    rec["fee_counter"] = 0
-    rec["fee_stealth_pubkey"] = stealth_pool_addr
-
-    ca.save_wrapper_state(st)
-
-    root_hex = ca.build_merkle(ca.load_wrapper_state()).root().hex()
-    try:
-        ca.emit("MerkleRootUpdated", root_hex=root_hex)
-    except Exception:
-        pass
-
-    try:
-        reconcile_csol_supply(assume_delta=main_part)
-    except Exception:
-        pass
-
-    return DepositRes(
-        pool_pub=pool_pub,
-        pool_stealth=stealth_pool_addr,
-        eph_pub_b58=eph_b58,
-        amount_main_sol=str(main_part),
-        fee_sol=str(fee_dec),
-        commitment=rec["commitment"],
-        leaf_index=int(rec["index"]),
-        merkle_root=root_hex,
-    )
-
-# ---------- Handoff ----------
-@app.post("/handoff", response_model=HandoffRes)
-def handoff(req: HandoffReq):
-    # Resolve recipient
-    if req.recipient_pub:
-        recip_pub = req.recipient_pub
+    pool_merkle_path = Path(REPO_ROOT) / "pool_merkle_state.json"
+    if pool_merkle_path.exists():
+        with open(pool_merkle_path, 'r') as f:
+            pool_state = json.load(f)
+        tree = PoolMerkleTree(depth=pool_state.get("depth", 20))
+        for leaf_hex in pool_state.get("leaves", []):
+            tree.insert(bytes.fromhex(leaf_hex))
     else:
-        recip_pub = _resolve_username_to_pub(req.recipient_username)  # NEW
+        tree = PoolMerkleTree(depth=20)
 
-    sender_pub = ca.get_pubkey_from_keypair(req.sender_keyfile)
-    st = ca.load_wrapper_state()
-    avail = ca.total_available_for_recipient(st, sender_pub)
-    if Decimal(str(avail)) <= 0:
-        raise HTTPException(status_code=400, detail="No unspent notes")
+    secret = secrets.token_bytes(32)
+    nullifier = secrets.token_bytes(32)
 
-    chosen, total = ca.greedy_coin_select(
-        ca.list_unspent_notes_for_recipient(st, sender_pub), req.amount_sol
+    commitment, nf_hash, merkle_path = prepare_deposit_params(
+        amount_lamports=amount_lamports,
+        secret=secret,
+        nullifier=nullifier,
+        local_merkle_tree=tree
     )
-    if not chosen:
-        raise HTTPException(status_code=400, detail="Coin selection failed")
 
-    mt = ca.build_merkle(st)
-    root_hex = mt.root().hex()
-    pub = bs_load_pub()
+    depositor_keyfile = req.depositor_keyfile
+    if not os.path.isabs(depositor_keyfile):
+        depositor_keyfile = os.path.join(REPO_ROOT, depositor_keyfile)
 
-    inputs_used = []
-    for n in chosen:
-        idx = int(n["index"])
-        if idx < 0:
-            raise HTTPException(status_code=400, detail="Note index invalid; reindex and retry")
-        if not verify_merkle(n["commitment"], mt.get_proof(idx), root_hex):
-            raise HTTPException(status_code=400, detail=f"Merkle verification failed for idx {idx}")
+    if not os.path.exists(depositor_keyfile):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Depositor keyfile not found at {depositor_keyfile}"
+        )
 
-        sig_hex = n.get("blind_sig_hex") or ""
-        try:
-            sig_int = int(sig_hex, 16)
-            ok = bs_verify(bytes.fromhex(n["commitment"]), sig_int, pub)
-        except Exception:
-            ok = False
-        if not ok:
-            raise HTTPException(status_code=400, detail=f"Blind signature invalid for idx {idx}")
+    wrapper_keyfile = ca.WRAPPER_KEYPAIR
+    if not os.path.isabs(wrapper_keyfile):
+        wrapper_keyfile = os.path.join(REPO_ROOT, wrapper_keyfile)
 
-        n["spent"] = True
-        try:
-            nf = ca.make_nullifier(bytes.fromhex(n["note_hex"]))
-            ca.mark_nullifier(st, nf)
-            ca.emit("NoteSpent", nullifier=nf, commitment=n["commitment"])
-        except Exception:
-            pass
+    if not os.path.exists(wrapper_keyfile):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Wrapper keyfile not found at {wrapper_keyfile}"
+        )
 
-        inputs_used.append({"index": idx, "commitment": n["commitment"]})
-
-    # Create recipient output using resolved 'recip_pub'
-    note_hex = secrets.token_bytes(32).hex()
-    nonce_hex = secrets.token_bytes(16).hex()
-    amt_str = ca.fmt_amt(req.amount_sol)
-    commitment = ca.make_commitment(
-        bytes.fromhex(note_hex), amt_str, bytes.fromhex(nonce_hex), recip_pub
-    )
     try:
-        sig = ca.issue_blind_sig_for_commitment_hex(commitment)
-    except Exception:
-        sig = ""
-    ca.add_note_with_precomputed(
-        st, amt_str, commitment, note_hex, nonce_hex, sig, ca.recipient_tag(recip_pub).hex()
+        result = deposit_to_pool_onchain(
+            depositor_keyfile=depositor_keyfile,
+            amount_lamports=amount_lamports,
+            commitment=commitment,
+            nf_hash=nf_hash,
+            merkle_path=merkle_path,
+            wrapper_keyfile=wrapper_keyfile,
+            wrapper_stealth_state_path=WRAPPER_STEALTH_STATE_PATH,
+            cluster=req.cluster
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Deposit failed: {str(e)}")
+
+    leaf = h2(commitment, nf_hash)
+    tree.insert(leaf)
+    leaf_index = len(tree.leaves) - 1
+
+    with open(pool_merkle_path, 'w') as f:
+        json.dump({
+            "depth": tree.depth,
+            "leaves": [leaf.hex() for leaf in tree.leaves],
+            "leaf_count": len(tree.leaves)
+        }, f, indent=2)
+
+    result["secret"] = secret.hex()
+    result["nullifier"] = nullifier.hex()
+    result["commitment"] = commitment.hex()
+
+    depositor_pub = get_pubkey_from_keypair(depositor_keyfile)
+    _save_note_for_user(
+        owner_pub=depositor_pub,
+        secret=secret.hex(),
+        nullifier=nullifier.hex(),
+        commitment=commitment.hex(),
+        leaf_index=leaf_index,
+        amount_sol=req.amount_sol,
+        tx_signature=result["tx_signature"],
+        spent=False
+    )
+    result["leaf_index"] = leaf_index
+
+    return DepositRes(**result)
+
+
+@app.get("/notes/{owner_pub}", response_model=ListNotesRes)
+def list_notes(owner_pub: str):
+    """
+    Get all available notes for a user.
+
+    Returns list of unspent notes with credentials needed for spending.
+    """
+    notes = _get_user_notes(owner_pub, include_spent=False)
+
+    note_infos = []
+    total = Decimal("0")
+
+    for note in notes:
+        note_infos.append(NoteInfo(
+            secret=note["secret"],
+            nullifier=note["nullifier"],
+            commitment=note["commitment"],
+            leaf_index=note["leaf_index"],
+            amount_sol=note["amount_sol"],
+            tx_signature=note["tx_signature"]
+        ))
+        total += Decimal(note["amount_sol"])
+
+    return ListNotesRes(
+        ok=True,
+        notes=note_infos,
+        total_balance=str(total)
     )
 
-    total_dec = Decimal(str(total))
-    change = (total_dec - req.amount_sol).quantize(Decimal("0.000000001"), rounding=ROUND_DOWN)
-    chg_amt = None
-    if change > 0:
-        ca.add_note(st, sender_pub, ca.fmt_amt(change), secrets.token_bytes(32).hex(), secrets.token_bytes(16).hex())
-        chg_amt = ca.fmt_amt(change)
+@app.post("/csol-to-note", response_model=CsolToNoteRes)
+def csol_to_note(req: CsolToNoteReq):
+    """
+    Convert cSOL back to a privacy note.
 
-    ca.save_wrapper_state(st)
-    new_root = ca.build_merkle(st).root().hex()
+    Flow:
+    1. User transfers cSOL to wrapper (confidential transfer)
+    2. Wrapper burns the cSOL (reducing supply)
+    3. Wrapper deposits equivalent SOL to pool (from accumulated SOL from purchases)
+    4. User receives note credentials for the deposit
+
+    This allows sellers to convert their cSOL earnings back to notes for private withdrawals.
+    """
+    user_keyfile = req.user_keyfile
+    if not os.path.isabs(user_keyfile):
+        user_keyfile = os.path.join(REPO_ROOT, user_keyfile)
+
+    if not os.path.exists(user_keyfile):
+        raise HTTPException(
+            status_code=400,
+            detail=f"User keyfile not found at {user_keyfile}"
+        )
+
+    user_pub = get_pubkey_from_keypair(user_keyfile)
+
+    amount_lamports = int(req.amount_sol * 1_000_000_000)
+
+    if amount_lamports <= 50_000_000:
+        raise HTTPException(
+            status_code=400,
+            detail="Conversion amount must be greater than 0.05 SOL (wrapper deposit fee)"
+        )
+
     try:
-        ca.emit("MerkleRootUpdated", root_hex=new_root)
-    except Exception:
-        pass
+        burn_result = ca.csol_user_to_wrapper_and_burn(
+            user_keyfile=user_keyfile,
+            amount_str=_fmt(req.amount_sol)
+        )
+        sig_transfer = burn_result["sig_transfer"]
+        sig_burn = burn_result["sig_burn"]
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"cSOL transfer/burn failed: {str(e)}"
+        )
 
-    return HandoffRes(
-        inputs_used=inputs_used,
-        outputs_created=[{"amount": amt_str, "commitment": commitment, "sig_hex": sig}],
-        change_back_to_sender=chg_amt,
-        new_merkle_root=new_root,
+    pool_merkle_path = Path(REPO_ROOT) / "pool_merkle_state.json"
+    if pool_merkle_path.exists():
+        with open(pool_merkle_path, 'r') as f:
+            pool_state = json.load(f)
+        tree = PoolMerkleTree(depth=pool_state.get("depth", 20))
+        for leaf_hex in pool_state.get("leaves", []):
+            tree.insert(bytes.fromhex(leaf_hex))
+    else:
+        tree = PoolMerkleTree(depth=20)
+
+    secret = secrets.token_bytes(32)
+    nullifier = secrets.token_bytes(32)
+
+    commitment, nf_hash, merkle_path = prepare_deposit_params(
+        amount_lamports=amount_lamports,
+        secret=secret,
+        nullifier=nullifier,
+        local_merkle_tree=tree
     )
 
-# ---------- Withdraw (classic SOL) ----------
+    wrapper_keyfile = ca.WRAPPER_KEYPAIR
+    if not os.path.isabs(wrapper_keyfile):
+        wrapper_keyfile = os.path.join(REPO_ROOT, wrapper_keyfile)
+
+    if not os.path.exists(wrapper_keyfile):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Wrapper keyfile not found at {wrapper_keyfile}"
+        )
+
+    try:
+        result = deposit_to_pool_onchain(
+            depositor_keyfile=wrapper_keyfile,
+            amount_lamports=amount_lamports,
+            commitment=commitment,
+            nf_hash=nf_hash,
+            merkle_path=merkle_path,
+            wrapper_keyfile=wrapper_keyfile,
+            wrapper_stealth_state_path=WRAPPER_STEALTH_STATE_PATH,
+            cluster=req.cluster
+        )
+        sig_deposit = result["tx_signature"]
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Deposit to pool failed: {str(e)}"
+        )
+
+    leaf = h2(commitment, nf_hash)
+    tree.insert(leaf)
+    leaf_index = len(tree.leaves) - 1
+
+    with open(pool_merkle_path, 'w') as f:
+        json.dump({
+            "depth": tree.depth,
+            "leaves": [leaf.hex() for leaf in tree.leaves],
+            "leaf_count": len(tree.leaves)
+        }, f, indent=2)
+
+    _save_note_for_user(
+        owner_pub=user_pub,
+        secret=secret.hex(),
+        nullifier=nullifier.hex(),
+        commitment=commitment.hex(),
+        leaf_index=leaf_index,
+        amount_sol=req.amount_sol,
+        tx_signature=sig_deposit,
+        spent=False
+    )
+
+    try:
+        os.makedirs(NOTES_DIR, exist_ok=True)
+        commitment_hex = commitment.hex()
+        commitment_prefix = commitment_hex[:8]
+        timestamp = int(datetime.now().timestamp())
+        filename = f"note_{commitment_prefix}_{timestamp}.json"
+        filepath = os.path.join(NOTES_DIR, filename)
+
+        note_data = {
+            "version": "1.0",
+            "network": req.cluster,
+            "deposit_date": datetime.now().isoformat(),
+            "amount_deposited_sol": float(req.amount_sol),
+            "amount_withdrawable_sol": float(req.amount_sol),
+            "wrapper_fee_sol": 0.0,
+            "credentials": {
+                "secret": secret.hex(),
+                "nullifier": nullifier.hex(),
+                "commitment": commitment_hex,
+                "leaf_index": leaf_index
+            },
+            "transaction": {
+                "tx_signature": sig_deposit,
+                "note_type": "csol_conversion"
+            }
+        }
+
+        with open(filepath, 'w') as f:
+            json.dump(note_data, f, indent=2)
+
+        print(f"   Created note file: {filename}")
+    except Exception as e:
+        print(f"   Warning: Could not create note file: {e}")
+
+    return CsolToNoteRes(
+        status="ok",
+        tx_signature_transfer=sig_transfer,
+        tx_signature_burn=sig_burn,
+        tx_signature_deposit=sig_deposit,
+        secret=secret.hex(),
+        nullifier=nullifier.hex(),
+        commitment=commitment.hex(),
+        leaf_index=leaf_index,
+        amount_sol=str(req.amount_sol)
+    )
+
 @app.post("/withdraw", response_model=WithdrawRes)
 def withdraw(req: WithdrawReq):
-    user_kf = req.user_keyfile or req.recipient_keyfile
-    if not user_kf:
-        raise HTTPException(status_code=400, detail="user_keyfile is required")
+    """
+    Withdraw SOL from the on-chain incognito pool.
 
-    user_pub = ca.get_pubkey_from_keypair(user_kf)
+    PRIVACY: User provides their own note credentials (secret, nullifier, commitment).
+    No server-side tracking of who owns what. Anyone with valid credentials can withdraw.
+    """
+    recipient_keyfile = req.recipient_keyfile
+    if not os.path.isabs(recipient_keyfile):
+        recipient_keyfile = os.path.join(REPO_ROOT, recipient_keyfile)
 
-    st = ca.load_wrapper_state()
-    available = Decimal(str(ca.total_available_for_recipient(st, user_pub)))
-    if available <= 0:
-        raise HTTPException(status_code=400, detail="No unspent notes available for this user.")
+    if not os.path.exists(recipient_keyfile):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Recipient keyfile not found at {recipient_keyfile}"
+        )
 
-    req_amt = available if req.amount_sol is None else Decimal(str(req.amount_sol))
-    if req_amt <= 0:
-        raise HTTPException(status_code=400, detail="Withdraw amount must be > 0.")
-    if req_amt > available:
-        raise HTTPException(status_code=400, detail="Requested amount exceeds available balance.")
+    amount_lamports = int(req.amount_sol * 1_000_000_000)
+    deposited_amount_lamports = int(req.deposited_amount_sol * 1_000_000_000)
 
-    notes = ca.list_unspent_notes_for_recipient(st, user_pub)
-    chosen, total_selected = ca.greedy_coin_select(notes, req_amt)
-    if not chosen:
-        raise HTTPException(status_code=400, detail="Coin selection failed.")
+    is_partial = amount_lamports < deposited_amount_lamports
+    change_lamports = deposited_amount_lamports - amount_lamports if is_partial else 0
 
-    mt = ca.build_merkle(st)
-    root_hex = mt.root().hex()
-    spent_indices: list[int] = []
+    if is_partial and change_lamports <= 50_000_000:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Change amount ({change_lamports / 1_000_000_000:.2f} SOL) is too small. Remaining balance must be > 0.05 SOL for wrapper fee."
+        )
 
-    for n in chosen:
-        idx = int(n.get("index", -1))
-        if idx < 0:
-            raise HTTPException(status_code=400, detail="Note index invalid; reindex and retry.")
-        proof = mt.get_proof(idx)
-        if not verify_merkle(n["commitment"], proof, root_hex):
-            raise HTTPException(status_code=400, detail=f"Merkle verification failed for idx {idx}.")
-        spent_indices.append(idx)
-
-    for n in chosen:
-        try:
-            nf = ca.make_nullifier(bytes.fromhex(n["note_hex"]))
-            ca.mark_nullifier(st, nf)
-            n["spent"] = True
-            ca.emit("NoteSpent", nullifier=nf, commitment=n["commitment"])
-        except Exception:
-            pass
-
-    change = (Decimal(str(total_selected)) - Decimal(str(req_amt))).quantize(
-        Decimal("0.000000001"), rounding=ROUND_DOWN
-    )
-    if change > 0:
-        note = secrets.token_bytes(32).hex()
-        nonce = secrets.token_bytes(16).hex()
-        ca.add_note(st, user_pub, str(change), note, nonce)
-
-    ca.save_wrapper_state(st)
-    new_root = ca.build_merkle(st).root().hex()
-
-    treasury_kf = _resolve_treasury_keyfile()
     try:
-        sig = ca.solana_transfer(treasury_kf, user_pub, str(req_amt))
+        commitment = bytes.fromhex(req.commitment)
+        nullifier = bytes.fromhex(req.nullifier)
+        secret = bytes.fromhex(req.secret)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid hex input: {e}")
+
+    if len(commitment) != 32 or len(nullifier) != 32 or len(secret) != 32:
+        raise HTTPException(
+            status_code=400,
+            detail="Commitment, nullifier, and secret must be 32 bytes each"
+        )
+
+    pool_merkle_path = Path(REPO_ROOT) / "pool_merkle_state.json"
+    if not pool_merkle_path.exists():
+        raise HTTPException(
+            status_code=500,
+            detail="Pool Merkle state not found. Have you made any deposits?"
+        )
+
+    with open(pool_merkle_path, 'r') as f:
+        pool_state = json.load(f)
+
+    tree = PoolMerkleTree(depth=pool_state.get("depth", 20))
+    for leaf_hex in pool_state.get("leaves", []):
+        tree.insert(bytes.fromhex(leaf_hex))
+
+    leaf_index = req.leaf_index
+
+    if leaf_index >= len(tree.leaves):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid leaf_index {leaf_index}. Local tree only has {len(tree.leaves)} leaves."
+        )
+
+    merkle_path = tree.get_path(leaf_index)
+
+    nf_hash = h1(nullifier)
+    expected_leaf = h2(commitment, nf_hash)
+    actual_leaf = tree.leaves[leaf_index]
+
+    if expected_leaf != actual_leaf:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Commitment/nullifier mismatch at index {leaf_index} in local tree"
+        )
+
+    change_commitment = None
+    change_nf_hash = None
+    change_merkle_path_data = None
+    change_secret = None
+    change_nullifier = None
+
+    if is_partial:
+        print(f"Partial withdrawal detected: preparing change note for {change_lamports / 1_000_000_000:.2f} SOL")
+
+        change_secret = secrets.token_bytes(32)
+        change_nullifier = secrets.token_bytes(32)
+
+        change_commitment, change_nf_hash, change_merkle_path_data = prepare_deposit_params(
+            amount_lamports=change_lamports,
+            secret=change_secret,
+            nullifier=change_nullifier,
+            local_merkle_tree=tree
+        )
+
+    try:
+        result = withdraw_from_pool_onchain(
+            recipient_keyfile=recipient_keyfile,
+            amount_lamports=amount_lamports,
+            commitment=commitment,
+            nullifier=nullifier,
+            leaf_index=leaf_index,
+            merkle_path=merkle_path,
+            change_commitment=change_commitment,
+            change_nf_hash=change_nf_hash,
+            change_merkle_path=change_merkle_path_data,
+            cluster=req.cluster
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"SOL transfer failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Withdrawal failed: {str(e)}")
+
+    recipient_pub = get_pubkey_from_keypair(recipient_keyfile)
+    _mark_note_spent(recipient_pub, req.nullifier)
+
+    change_note_data = None
+    if is_partial and change_commitment is not None:
+        print(f" Partial withdrawal successful! Updating local tree with change note...")
+
+        change_leaf = h2(change_commitment, change_nf_hash)
+        tree.insert(change_leaf)
+        change_leaf_index = len(tree.leaves) - 1
+
+        with open(pool_merkle_path, 'w') as f:
+            json.dump({
+                "depth": tree.depth,
+                "leaves": [leaf.hex() for leaf in tree.leaves],
+                "leaf_count": len(tree.leaves)
+            }, f, indent=2)
+
+        change_note_data = {
+            "secret": change_secret.hex(),
+            "nullifier": change_nullifier.hex(),
+            "commitment": change_commitment.hex(),
+            "leaf_index": change_leaf_index,
+            "amount_sol": change_lamports / 1_000_000_000,
+            "tx_signature": result["tx_signature"]
+        }
+
+        _save_note_for_user(
+            owner_pub=recipient_pub,
+            secret=change_secret.hex(),
+            nullifier=change_nullifier.hex(),
+            commitment=change_commitment.hex(),
+            leaf_index=change_leaf_index,
+            amount_sol=change_lamports / 1_000_000_000,
+            tx_signature=result["tx_signature"],
+            spent=False
+        )
+
+        print(f" Change note created successfully! Leaf index: {change_leaf_index}")
+
+    if change_note_data:
+        result["change_note"] = change_note_data
+
+    return WithdrawRes(**result)
+
+@app.post("/deposit_csol")
+def deposit_csol(
+    depositor_keyfile: str = Body(..., embed=True),
+    amount_sol: float = Body(..., embed=True),
+):
+    """
+    Deposit SOL → cSOL (confidential SOL) without transferring to wrapper.
+    User keeps the cSOL in their account to use for purchases.
+    """
+    if not os.path.exists(depositor_keyfile):
+        raise HTTPException(400, f"Depositor keyfile not found: {depositor_keyfile}")
+
+    depositor_ata = ca.get_ata_for_owner(ca.MINT, depositor_keyfile)
+    fee_tmp, _ = ca.pick_treasury_fee_payer_tmpfile()
+
+    if not fee_tmp:
+        raise HTTPException(400, "No funded treasury stealth key available as fee-payer.")
 
     try:
-        ca.emit("MerkleRootUpdated", root_hex=new_root)
-    except Exception:
-        pass
+        print(f"[DEBUG] Depositing {amount_sol} SOL → cSOL for {depositor_keyfile}")
+        ca._run_rc(
+            [
+                "spl-token",
+                "deposit-confidential-tokens",
+                ca.MINT,
+                _fmt(amount_sol),
+                "--address",
+                depositor_ata,
+                "--owner",
+                depositor_keyfile,
+                "--fee-payer",
+                fee_tmp,
+            ]
+        )
 
-    try:
-        reconcile_csol_supply(assume_delta=-req_amt)
-    except Exception:
-        pass
+        print(f"[DEBUG] Applying pending cSOL balance")
+        ca.spl_apply(depositor_keyfile, fee_tmp)
 
-    return WithdrawRes(
-        ok=True,
-        amount_sol=str(req_amt),
-        recipient_pub=user_pub,
-        tx_signature=sig,
-        spent_note_indices=spent_indices,
-        new_merkle_root=new_root,
-    )
+        balance_result = ca._run(
+            [
+                "spl-token",
+                "balance",
+                ca.MINT,
+                "--owner",
+                depositor_keyfile,
+            ]
+        )
+        balance_sol = float(balance_result.strip()) if balance_result else 0
 
-# ---------- Convert (cSOL → SOL) ----------
+        print(f"[DEBUG]  Deposited {amount_sol} SOL → cSOL. New balance: {balance_sol} cSOL")
+
+        return {
+            "ok": True,
+            "amount_sol": str(amount_sol),
+            "new_balance_sol": str(balance_sol),
+            "depositor_ata": depositor_ata,
+        }
+
+    except Exception as e:
+        print(f" cSOL deposit failed: {str(e)}")
+        raise HTTPException(500, f"cSOL deposit failed: {str(e)}")
+
 @app.post("/convert", response_model=ConvertRes)
 def convert(req: ConvertReq):
     sender_pub = ca.get_pubkey_from_keypair(req.sender_keyfile)
     sender_ata = ca.get_ata_for_owner(ca.MINT, req.sender_keyfile)
-
     fee_tmp, _ = ca.pick_treasury_fee_payer_tmpfile()
     if not fee_tmp:
-        raise HTTPException(status_code=400, detail="No funded treasury stealth key available as fee-payer.")
+        raise HTTPException(
+            status_code=400, detail="No funded treasury stealth key available as fee-payer."
+        )
     try:
         ca._run_rc(
             [
@@ -1085,7 +1621,6 @@ def convert(req: ConvertReq):
             ]
         )
         ca.spl_apply(req.sender_keyfile, fee_tmp)
-
         ca._run(
             [
                 "spl-token",
@@ -1101,18 +1636,15 @@ def convert(req: ConvertReq):
             ]
         )
         ca.spl_apply(ca.WRAPPER_KEYPAIR, fee_tmp)
-
     finally:
         try:
-            os.remove(fee_tmp)  # type: ignore
+            os.remove(fee_tmp)
         except Exception:
             pass
-
     try:
         _csol_sub(sender_pub, Decimal(str(req.amount_sol)))
     except Exception:
         pass
-
     from services.crypto_core.splits import split_bounded
 
     treasury_kf = _resolve_treasury_keyfile()
@@ -1125,25 +1657,20 @@ def convert(req: ConvertReq):
         outputs.append({"amount": ca.fmt_amt(p), "stealth": stealth_addr, "eph_pub_b58": eph})
         ca.solana_transfer(treasury_kf, stealth_addr, ca.fmt_amt(p))
         total_out += p
-
     try:
         ca.emit("CSOLConverted", amount=ca._lamports(_fmt(req.amount_sol)), direction="from_csol")
     except Exception:
         pass
-
     try:
         reconcile_csol_supply(assume_delta=-total_out)
     except Exception:
         pass
-
     return ConvertRes(outputs=outputs)
 
-# ---------- Stealth List ----------
 @app.get("/stealth/{owner_pub}", response_model=StealthList)
 def list_stealth(owner_pub: str, include_balances: bool = True, min_sol: float = 0.01):
     pst = ca.load_pool_state()
     recs = [r for r in pst.get("records", []) if r.get("owner_pubkey") == owner_pub]
-
     items, total = [], Decimal("0")
     for r in recs:
         bal_str = None
@@ -1156,7 +1683,6 @@ def list_stealth(owner_pub: str, include_balances: bool = True, min_sol: float =
                 total += b
             except Exception:
                 pass
-
         items.append(
             StealthItem(
                 stealth_pubkey=r["stealth_pubkey"],
@@ -1165,27 +1691,26 @@ def list_stealth(owner_pub: str, include_balances: bool = True, min_sol: float =
                 balance_sol=bal_str,
             )
         )
+    return StealthList(
+        owner_pub=owner_pub, items=items, total_sol=(ca.fmt_amt(total) if include_balances else None)
+    )
 
-    return StealthList(owner_pub=owner_pub, items=items, total_sol=(ca.fmt_amt(total) if include_balances else None))
-
-# ---------- Sweep ----------
 @app.post("/sweep", response_model=SweepRes)
 def sweep(req: SweepReq):
     pst = ca.load_pool_state()
     recs = [r for r in pst.get("records", []) if r.get("owner_pubkey") == req.owner_pub]
     if not recs:
         raise HTTPException(status_code=400, detail="No stealth records for owner")
-
     SWEEP_BUFFER_SOL = Decimal("0.001")
     candidates = []
     total_balance = Decimal("0")
-
     if req.stealth_pubkeys:
         allowed = set(req.stealth_pubkeys)
         recs = [r for r in recs if r.get("stealth_pubkey") in allowed]
         if not recs:
-            raise HTTPException(status_code=400, detail="None of the requested stealth addresses are owned by this owner")
-
+            raise HTTPException(
+                status_code=400, detail="None of the requested stealth addresses are owned by this owner"
+            )
     for r in recs:
         try:
             b = Decimal(str(ca.get_sol_balance(r["stealth_pubkey"], quiet=True)))
@@ -1193,32 +1718,28 @@ def sweep(req: SweepReq):
             b = Decimal("0")
         if b >= SWEEP_BUFFER_SOL:
             candidates.append({**r, "balance": b})
-            total_balance += b
-
+        total_balance += b
     if total_balance <= 0:
         raise HTTPException(status_code=400, detail="No sweepable balances (all below buffer)")
-
     req_amt = total_balance if req.amount_sol is None else Decimal(req.amount_sol)
     candidates.sort(key=lambda x: x["balance"], reverse=True)
-
     plan, remain = [], req_amt
     for r in candidates:
         if remain <= 0:
             break
-        sendable = (r["balance"] - SWEEP_BUFFER_SOL).quantize(Decimal("0.000000001"), rounding=ROUND_DOWN)
+        sendable = (r["balance"] - SWEEP_BUFFER_SOL).quantize(
+            Decimal("0.000000001"), rounding=ROUND_DOWN
+        )
         if sendable <= 0:
             continue
         amt = min(sendable, remain)
         if amt > 0:
             plan.append((r["stealth_pubkey"], r["eph_pub_b58"], amt, r.get("counter", 0)))
             remain = (remain - amt).quantize(Decimal("0.000000001"), rounding=ROUND_DOWN)
-
     with open(req.secret_keyfile, "r") as f:
         raw_secret = json.load(f)
     rec_sk64 = ca.read_secret_64_from_json_value(raw_secret)
-
     sent_total, txs = Decimal("0"), []
-
     for stealth_addr, eph, amt, counter in plan:
         kp = ca.derive_stealth_from_recipient_secret(rec_sk64, eph, counter)
         tmp_path = _write_temp_keypair_from_solders(kp)
@@ -1231,21 +1752,23 @@ def sweep(req: SweepReq):
                 os.remove(tmp_path)
             except Exception:
                 pass
-
     try:
         ca.emit("SweepDone", owner_pub=req.owner_pub, count=len(plan))
     except Exception:
         pass
-
     return SweepRes(requested=ca.fmt_amt(req_amt), sent_total=ca.fmt_amt(sent_total), txs=txs)
 
-# ---------- Marketplace: Buy ----------
 @app.post("/marketplace/buy", response_model=BuyRes)
 def marketplace_buy(req: BuyReq):
     """
-    Always open an escrow on buy. No instant seller payout.
-    Funds are locked either by (a) debiting buyer's cSOL balance, or
-    (b) spending buyer's notes. Release/Refund happens later via escrow actions.
+    Buy a listing using on-chain pool note with partial withdrawal.
+
+    Flow:
+    1. Validate buyer's note credentials
+    2. Execute partial withdrawal: withdraw listing price to wrapper
+    3. Transfer cSOL from wrapper to seller
+    4. Return change note credentials to buyer (if applicable)
+    5. Open escrow record
     """
     buyer_pub = ca.get_pubkey_from_keypair(req.buyer_keyfile)
     listing = ca.listing_get(req.listing_id)
@@ -1261,88 +1784,160 @@ def marketplace_buy(req: BuyReq):
         )
     ).quantize(CSOL_DEC)
 
-    qty = int(getattr(req, "quantity", 1))
+    qty = int(req.quantity)
     if qty <= 0:
         raise HTTPException(400, "Quantity must be >= 1")
 
     total_price = (unit_price * Decimal(qty)).quantize(CSOL_DEC)
-
     seller_pub = listing.get("seller_pub") or listing.get("seller") or listing.get("owner_pub")
+
     if not seller_pub:
         raise HTTPException(400, "Listing missing seller_pub")
     if seller_pub == buyer_pub:
         raise HTTPException(400, "Cannot buy your own listing")
 
-    payment_pref = (req.payment or "auto").lower()
+    has_note_credentials = (
+        req.commitment and len(req.commitment) > 0 and
+        req.nullifier and len(req.nullifier) > 0 and
+        req.secret and len(req.secret) > 0
+    )
+
+    if has_note_credentials:
+        deposited_amount = Decimal(str(req.deposited_amount_sol or "0")).quantize(CSOL_DEC)
+        WRAPPER_FEE_SOL = Decimal("0.05")
+        withdrawable_amount = (deposited_amount - WRAPPER_FEE_SOL).quantize(CSOL_DEC)
+
+        if withdrawable_amount < total_price:
+            raise HTTPException(
+                400,
+                f"Insufficient note amount: {withdrawable_amount} SOL < {total_price} SOL required"
+            )
+
+        try:
+            amount_lamports = int(total_price * 1_000_000_000)
+            withdrawable_lamports = int(withdrawable_amount * 1_000_000_000)
+
+            commitment = bytes.fromhex(req.commitment)
+            nullifier = bytes.fromhex(req.nullifier)
+            secret = bytes.fromhex(req.secret)
+
+            if len(commitment) != 32 or len(nullifier) != 32 or len(secret) != 32:
+                raise HTTPException(400, "Invalid note credentials: must be 32 bytes each")
+
+            pool_merkle_path = Path(REPO_ROOT) / "pool_merkle_state.json"
+            if not pool_merkle_path.exists():
+                raise HTTPException(500, "Pool Merkle state not found")
+
+            with open(pool_merkle_path, 'r') as f:
+                pool_state = json.load(f)
+
+            from services.crypto_core.onchain_pool import (
+                MerkleTree as PoolMerkleTree,
+                h1, h2,
+            )
+
+            tree = PoolMerkleTree(depth=pool_state.get("depth", 20))
+            for leaf_hex in pool_state.get("leaves", []):
+                tree.insert(bytes.fromhex(leaf_hex))
+
+            if req.leaf_index >= len(tree.leaves):
+                raise HTTPException(400, f"Invalid leaf_index {req.leaf_index}")
+
+            nf_hash = h1(nullifier)
+            expected_leaf = h2(commitment, nf_hash)
+            actual_leaf = tree.leaves[req.leaf_index]
+
+            if expected_leaf != actual_leaf:
+                raise HTTPException(400, "Note credentials don't match on-chain leaf")
+
+        except Exception as e:
+            raise HTTPException(500, f"Note validation failed: {str(e)}")
+
+    change_note_data = None
 
     encrypted_shipping_blob: Optional[Dict[str, Any]] = getattr(req, "encrypted_shipping", None)
     order_id: Optional[str] = None
     if isinstance(encrypted_shipping_blob, dict):
         order_id = secrets.token_hex(16)
 
-    # Try cSOL first if allowed
-    buyer_credits = _csol_get(buyer_pub) if payment_pref in ("auto", "csol") else Decimal("0")
+    escrow_id = secrets.token_hex(16)
+    order_id_u64 = int.from_bytes(bytes.fromhex(escrow_id[:16]), byteorder='little')
 
-    payment_mode = None
-    spent_note_indices: List[int] = []
-    buyer_change: Optional[Dict[str, Any]] = None
+    try:
+        reconcile_result = reconcile_csol_supply()
 
-    if buyer_credits >= total_price:
-        # ----- cSOL-held escrow: debit buyer cSOL now; seller will be credited upon RELEASE -----
-        _csol_sub(buyer_pub, total_price)
-        payment_mode = "csol"
-    else:
-        # ----- Fallback: lock value by spending notes now (seller paid later from reserve upon RELEASE) -----
-        st = ca.load_wrapper_state()
-        avail = Decimal(str(ca.total_available_for_recipient(st, buyer_pub))).quantize(CSOL_DEC)
-        if avail < total_price:
-            raise HTTPException(400, f"Insufficient funds. cSOL insufficient and notes available={avail} < total={total_price}")
 
-        notes = ca.list_unspent_notes_for_recipient(st, buyer_pub)
-        chosen, total_selected = ca.greedy_coin_select(notes, total_price)
-        if not chosen:
-            raise HTTPException(400, "Coin selection failed; consolidate notes")
+        shipping_placeholder = f"listing:{req.listing_id}" if encrypted_shipping_blob else "no_shipping"
 
-        mt = ca.build_merkle(st)
-        root_hex = mt.root().hex()
-        for n in chosen:
-            idx = int(n.get("index", -1))
-            proof = mt.get_proof(idx)
-            if idx < 0 or not verify_merkle(n["commitment"], proof, root_hex):
-                raise HTTPException(400, f"Merkle verification failed for note idx={idx}")
-            spent_note_indices.append(idx)
+        escrow_result = ca.escrow_create_order(
+            buyer_keypair_path=req.buyer_keyfile,
+            amount_sol=_fmt(total_price),
+            order_id=order_id_u64,
+            seller_pub=seller_pub,
+            encrypted_shipping=shipping_placeholder,
+            shipping_nonce=None
+        )
 
-        for n in chosen:
+        escrow_pda = escrow_result.get("escrowPDA")
+        tx_signature = escrow_result.get("tx", "local")
+
+        if not escrow_result.get("success"):
+            raise Exception(f"Escrow creation failed: {escrow_result.get('error')}")
+
+        payment_method = escrow_result.get("paymentMethod")
+        print(f"[DEBUG] Payment method: {payment_method}")
+
+        if payment_method == "note":
             try:
-                nf = ca.make_nullifier(bytes.fromhex(n["note_hex"]))
-                ca.mark_nullifier(st, nf)
-                n["spent"] = True
-                ca.emit("NoteSpent", nullifier=nf, commitment=n["commitment"])
-            except Exception:
-                pass
+                import json as json_lib
+                payment_data_str = escrow_result.get("paymentTx", "{}")
+                payment_data = json_lib.loads(payment_data_str)
+                spent_commitment = payment_data.get("commitment")
 
-        change = (Decimal(str(total_selected)) - total_price).quantize(CSOL_DEC, rounding=ROUND_DOWN)
-        if change > 0:
-            note = secrets.token_bytes(32).hex()
-            nonce = secrets.token_bytes(16).hex()
-            rec = ca.add_note(st, buyer_pub, str(change), note, nonce)
-            buyer_change = {"amount": str(change), "commitment": rec["commitment"], "index": int(rec["index"])}
+                if spent_commitment:
+                    print(f"[DEBUG] Deleting spent note file: {spent_commitment[:8]}...")
+                    _delete_note_file(spent_commitment)
+            except Exception as e:
+                print(f"Warning: Failed to delete spent note file: {e}")
 
-        ca.save_wrapper_state(st)
-        try:
-            ca.emit("MerkleRootUpdated", root_hex=ca.build_merkle(st).root().hex())
-        except Exception:
-            pass
+            try:
+                change_lamports = payment_data.get("change", 0)
+                change_commitment = payment_data.get("change_commitment")
 
-        payment_mode = "sol-backed"
+                print(f"[DEBUG] Change: {change_lamports} lamports, commitment: {change_commitment}")
 
-    # Reduce inventory immediately; listing becomes inactive if qty hits 0
+                if change_lamports > 0 and change_commitment:
+                    from services.crypto_core.pool_notes import find_note_by_commitment
+                    from pathlib import Path
+                    USER_NOTES_PATH = Path(REPO_ROOT) / "data" / "user_notes.json"
+
+                    change_note = find_note_by_commitment(change_commitment, USER_NOTES_PATH)
+                    print(f"[DEBUG] Found change note: {change_note is not None}")
+
+                    if change_note:
+                        print(f"[DEBUG] Creating change note file: {change_commitment[:8]}...")
+                        _create_change_note_file(
+                            secret=change_note.secret,
+                            nullifier=change_note.nullifier,
+                            commitment=change_note.commitment,
+                            leaf_index=change_note.leaf_index,
+                            amount_sol=change_note.amount_lamports / 1_000_000_000,
+                            tx_signature=change_note.tx_signature
+                        )
+                        print(f"[DEBUG]  Change note file created")
+            except Exception as e:
+                print(f"Warning: Failed to create change note file: {e}")
+                import traceback
+                traceback.print_exc()
+
+    except Exception as e:
+        raise HTTPException(500, f"On-chain escrow creation failed: {str(e)}")
+
     try:
         ca.listing_update_quantity(seller_pub, req.listing_id, quantity_delta=-qty)
     except Exception:
         _deactivate_listing(req.listing_id)
 
-    # Optional: append encrypted shipping commitment to the shipping log + Merkle
     shipping_commitment = None
     if isinstance(encrypted_shipping_blob, dict):
         try:
@@ -1357,21 +1952,19 @@ def marketplace_buy(req: BuyReq):
         except Exception:
             shipping_commitment = None
 
-    # ----- Open the ESCROW right here (status=PENDING) -----
-    amount_str = ca.fmt_amt(total_price)
+    amount_str = _fmt(total_price)
     note_hex, nonce_hex, commitment_hex = _mk_escrow_commitment(amount_str, seller_pub)
     leaf_index = _escrow_append_leaf(commitment_hex)
 
     st_esc = _escrow_state()
-    escrow_id = secrets.token_hex(16)
     now = _utcnow_iso()
     escrow_record = {
         "id": escrow_id,
         "buyer_pub": buyer_pub,
         "seller_pub": seller_pub,
         "amount_sol": amount_str,
-        "status": "PENDING",
-        "details_ct": None,  # you could also stuff a tiny encrypted order note here if desired
+        "status": "CREATED",
+        "details_ct": None,
         "listing_id": req.listing_id,
         "quantity": qty,
         "commitment": commitment_hex,
@@ -1380,54 +1973,262 @@ def marketplace_buy(req: BuyReq):
         "nonce_hex": nonce_hex,
         "created_at": now,
         "updated_at": now,
-        # ---- internal helpers for settlement later (kept in raw record; not part of schema) ----
-        "payment_mode": payment_mode,  # "csol" | "sol-backed"
-        "held_csol": str(total_price) if payment_mode == "csol" else "0",
-        "spent_note_indices": spent_note_indices if payment_mode == "sol-backed" else [],
+        "payment_mode": "note",
+        "buyer_note_commitment": req.commitment,
+        "buyer_note_nullifier": req.nullifier,
+        "escrow_pda": escrow_pda,
+        "order_id_u64": order_id_u64,
+        "tx_signature": tx_signature,
+        "encrypted_shipping": encrypted_shipping_blob if encrypted_shipping_blob else None,
     }
     st_esc["escrows"].append(escrow_record)
     _escrow_save(st_esc)
     _escrow_rebuild_root()
 
-    # Emit a consolidated event for observability
     try:
         ca.emit(
             "ListingSold",
             listing_id=req.listing_id,
-            payment=payment_mode,  # now "csol" OR "sol-backed" escrow
+            payment="note",
             price=str(total_price),
             unit_price=str(unit_price),
             quantity=qty,
             buyer=buyer_pub,
             seller=seller_pub,
-            spent_note_indices=(spent_note_indices or None),
-            buyer_change=buyer_change,
+            buyer_note_commitment=req.commitment,
+            change_note=change_note_data,
             order_id=(shipping_commitment or {}).get("order_id") if shipping_commitment else None,
-            shipping_leaf=(shipping_commitment or {}).get("leaf") if shipping_commitment else None,
-            shipping_root=(shipping_commitment or {}).get("root") if shipping_commitment else None,
-            shipping_index=(shipping_commitment or {}).get("index") if shipping_commitment else None,
-            shipping_proof=(shipping_commitment or {}).get("proof") if shipping_commitment else None,
             escrow_id=escrow_id,
         )
     except Exception:
         pass
 
-    # Return legacy buy response (no immediate csol_tx_signature, since funds are escrowed)
     return BuyRes(
         ok=True,
         listing_id=req.listing_id,
-        payment=payment_mode,
+        payment="note",
         price=str(total_price),
         buyer_pub=buyer_pub,
         seller_pub=seller_pub,
-        spent_note_indices=(spent_note_indices or None),
-        buyer_change=buyer_change,
-        new_merkle_root=None,  # buyer change root already emitted above; omit here
-        escrow_id=escrow_id,  
+        tx_signature=tx_signature,
+        change_note=change_note_data,
+        escrow_id=escrow_id,
     )
 
+@app.post("/escrow/accept")
+def escrow_accept(
+    escrow_id: str = Body(..., embed=True),
+    seller_keyfile: str = Body(..., embed=True),
+):
+    """Seller accepts an escrow order."""
+    st_esc = _escrow_state()
+    escrow = _escrow_find(st_esc, escrow_id)
+    if not escrow:
+        raise HTTPException(404, "Escrow not found")
 
-# ------------- Shipping Endpoints (no DB) -------------
+    escrow_pda = escrow.get("escrow_pda")
+    if not escrow_pda:
+        raise HTTPException(400, "Escrow PDA not found - not an on-chain escrow")
+
+    try:
+        result = ca.escrow_accept_order(seller_keyfile, escrow_pda)
+        if not result.get("success"):
+            raise Exception(f"Accept failed: {result.get('error')}")
+
+        escrow["status"] = "ACCEPTED"
+        escrow["updated_at"] = _utcnow_iso()
+        escrow["accept_tx"] = result.get("tx")
+        _escrow_save(st_esc)
+
+        return {"ok": True, "tx": result.get("tx"), "escrow_id": escrow_id}
+    except Exception as e:
+        raise HTTPException(500, f"Escrow accept failed: {str(e)}")
+
+@app.post("/escrow/ship")
+def escrow_ship(
+    escrow_id: str = Body(..., embed=True),
+    seller_keyfile: str = Body(..., embed=True),
+    tracking_number: str = Body(..., embed=True),
+):
+    """Seller marks order as shipped."""
+    st_esc = _escrow_state()
+    escrow = _escrow_find(st_esc, escrow_id)
+    if not escrow:
+        raise HTTPException(404, "Escrow not found")
+
+    escrow_pda = escrow.get("escrow_pda")
+    if not escrow_pda:
+        raise HTTPException(400, "Escrow PDA not found - not an on-chain escrow")
+
+    try:
+        result = ca.escrow_mark_shipped(seller_keyfile, escrow_pda, tracking_number)
+        if not result.get("success"):
+            raise Exception(f"Ship failed: {result.get('error')}")
+
+        escrow["status"] = "SHIPPED"
+        escrow["updated_at"] = _utcnow_iso()
+        escrow["tracking_number"] = tracking_number
+        escrow["ship_tx"] = result.get("tx")
+        _escrow_save(st_esc)
+
+        return {"ok": True, "tx": result.get("tx"), "escrow_id": escrow_id, "tracking_number": tracking_number}
+    except Exception as e:
+        raise HTTPException(500, f"Escrow ship failed: {str(e)}")
+
+@app.post("/escrow/confirm")
+def escrow_confirm(
+    escrow_id: str = Body(..., embed=True),
+    buyer_keyfile: str = Body(..., embed=True),
+):
+    """Buyer confirms delivery."""
+    st_esc = _escrow_state()
+    escrow = _escrow_find(st_esc, escrow_id)
+    if not escrow:
+        raise HTTPException(404, "Escrow not found")
+
+    escrow_pda = escrow.get("escrow_pda")
+    if not escrow_pda:
+        raise HTTPException(400, "Escrow PDA not found - not an on-chain escrow")
+
+    try:
+        result = ca.escrow_confirm_delivery(buyer_keyfile, escrow_pda)
+        if not result.get("success"):
+            raise Exception(f"Confirm failed: {result.get('error')}")
+
+        delivered_at = _utcnow_iso()
+        escrow["status"] = "DELIVERED"
+        escrow["updated_at"] = delivered_at
+        escrow["delivered_at"] = delivered_at
+        escrow["confirm_tx"] = result.get("tx")
+        _escrow_save(st_esc)
+
+        return {"ok": True, "tx": result.get("tx"), "escrow_id": escrow_id}
+    except Exception as e:
+        raise HTTPException(500, f"Escrow confirm failed: {str(e)}")
+
+@app.post("/escrow/buyer_release_early")
+def escrow_buyer_release_early(
+    escrow_id: str = Body(..., embed=True),
+    buyer_keyfile: str = Body(..., embed=True),
+):
+    """
+    Buyer releases funds to seller immediately after confirming delivery.
+    Bypasses the 7-day dispute window when buyer is satisfied.
+
+    This does NOT call the on-chain contract (to avoid deadline check).
+    Instead, it directly triggers the wrapper payment to seller.
+    """
+    st_esc = _escrow_state()
+    escrow = _escrow_find(st_esc, escrow_id)
+    if not escrow:
+        raise HTTPException(404, "Escrow not found")
+
+    if escrow.get("status") != "DELIVERED":
+        raise HTTPException(400, "Order must be delivered before early release")
+
+    buyer_pub = ca.get_pubkey_from_keypair(buyer_keyfile) if os.path.exists(buyer_keyfile) else buyer_keyfile
+    if escrow.get("buyer_pub") != buyer_pub:
+        raise HTTPException(403, "Only the buyer can release funds early")
+
+    escrow_pda = escrow.get("escrow_pda")
+    seller_pub = escrow.get("seller_pub")
+    amount_sol = escrow.get("amount_sol", "0")
+
+    if not seller_pub:
+        raise HTTPException(400, "Seller public key not found")
+
+    try:
+        amount_lamports = int(Decimal(amount_sol) * 1_000_000_000)
+
+        wrapper_keyfile_abs = ca._wrapper_keypair_abs()
+
+        from services.api.cli_adapter import escrow_pay_seller, MINT
+        payment_tx = escrow_pay_seller(
+            wrapper_keyfile=wrapper_keyfile_abs,
+            seller_pubkey=seller_pub,
+            amount_lamports=amount_lamports,
+            mint=MINT,
+        )
+
+        print(f" Early release: Paid seller {seller_pub}: {amount_lamports} lamports (tx: {payment_tx})")
+
+        escrow["status"] = "COMPLETED"
+        escrow["updated_at"] = _utcnow_iso()
+        escrow["finalize_tx"] = payment_tx
+        escrow["early_release"] = True
+        _escrow_save(st_esc)
+
+        return {"ok": True, "tx": payment_tx, "escrow_id": escrow_id, "early_release": True}
+
+    except Exception as e:
+        print(f" Early release failed: {str(e)}")
+        raise HTTPException(500, f"Early release failed: {str(e)}")
+
+@app.post("/escrow/finalize")
+def escrow_finalize(
+    escrow_id: str = Body(..., embed=True),
+):
+    """Finalize order after 7-day dispute window. Releases funds to seller and platform."""
+    st_esc = _escrow_state()
+    escrow = _escrow_find(st_esc, escrow_id)
+    if not escrow:
+        raise HTTPException(404, "Escrow not found")
+
+    escrow_pda = escrow.get("escrow_pda")
+    if not escrow_pda:
+        raise HTTPException(400, "Escrow PDA not found - not an on-chain escrow")
+
+    if escrow.get("status") not in ["DELIVERED", "COMPLETED"]:
+        raise HTTPException(400, "Order must be delivered before finalization")
+
+    try:
+        result = ca.escrow_finalize_order(escrow_pda)
+        if not result.get("success"):
+            error_msg = result.get('error', 'Unknown error')
+            if "DeadlineNotReached" in error_msg:
+                delivered_at = escrow.get("delivered_at")
+                if delivered_at:
+                    from datetime import datetime, timedelta
+                    try:
+                        delivered_time = datetime.fromisoformat(delivered_at.replace('Z', '+00:00'))
+                        finalize_time = delivered_time + timedelta(days=7)
+                        now = datetime.now(delivered_time.tzinfo)
+
+                        if now < finalize_time:
+                            remaining = finalize_time - now
+                            hours_remaining = int(remaining.total_seconds() / 3600)
+                            days_remaining = hours_remaining // 24
+                            hours_in_day = hours_remaining % 24
+
+                            if days_remaining > 0:
+                                time_str = f"{days_remaining} days and {hours_in_day} hours"
+                            else:
+                                time_str = f"{hours_in_day} hours"
+
+                            raise HTTPException(
+                                400,
+                                f"7-day dispute window not expired. Please wait {time_str} before finalizing (available at {finalize_time.strftime('%Y-%m-%d %H:%M UTC')})"
+                            )
+                    except Exception as calc_error:
+                        pass
+
+                raise HTTPException(
+                    400,
+                    "7-day dispute window has not expired yet. Please wait before finalizing."
+                )
+            raise Exception(f"Finalize failed: {error_msg}")
+
+        escrow["status"] = "COMPLETED"
+        escrow["updated_at"] = _utcnow_iso()
+        escrow["finalize_tx"] = result.get("tx")
+        _escrow_save(st_esc)
+
+        return {"ok": True, "tx": result.get("tx"), "escrow_id": escrow_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Escrow finalize failed: {str(e)}")
+
 @app.post("/shipping/put")
 def put_encrypted_shipping(
     order_id: str = Body(..., embed=True),
@@ -1455,15 +2256,36 @@ def get_encrypted_shipping(order_id: str):
         raise HTTPException(status_code=404, detail="Order not found")
     return res
 
-# ============== Listings API ==============
-
 def _ipfs_add_bytes(data: bytes, suffix: str = ".bin") -> str:
+    """
+    Upload bytes to IPFS. Returns ipfs:// URI on success, or None on failure.
+    Includes 5-second timeout to prevent hanging.
+    """
     with tempfile.NamedTemporaryFile("wb", delete=False, suffix=suffix) as f:
         f.write(data)
         tmp = f.name
     try:
-        cid = subprocess.run(["ipfs", "add", "-Q", tmp], capture_output=True, text=True, check=True).stdout.strip()
-        return f"ipfs://{cid}"
+        result = subprocess.run(
+            ["ipfs", "add", "-Q", tmp],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5
+        )
+        if result.returncode == 0:
+            cid = result.stdout.strip()
+            if cid:
+                return f"ipfs://{cid}"
+        return None
+    except subprocess.TimeoutExpired:
+        print(f"IPFS upload timed out after 5 seconds")
+        return None
+    except FileNotFoundError:
+        print(f"IPFS daemon not running or 'ipfs' command not found")
+        return None
+    except Exception as e:
+        print(f"IPFS upload failed: {e}")
+        return None
     finally:
         try:
             os.remove(tmp)
@@ -1491,7 +2313,6 @@ def _normalize_listing(rec: dict) -> dict:
     if isinstance(imgs, str):
         imgs = [x.strip() for x in imgs.split(",") if x.strip()]
     imgs_http = [_as_http_image(u) for u in imgs]
-
     return {
         "id": rec.get("id") or rec.get("listing_id") or rec.get("slug") or rec.get("pk"),
         "title": rec.get("title") or rec.get("name") or f"Listing {rec.get('id')}",
@@ -1537,7 +2358,9 @@ async def create_listing(
             data = await f.read()
             name = (f.filename or "").lower()
             suf = ".png" if name.endswith(".png") else ".jpg" if name.endswith(".jpg") or name.endswith(".jpeg") else ".bin"
-            uris.append(_ipfs_add_bytes(data, suffix=suf))
+            uri = _ipfs_add_bytes(data, suffix=suf)
+            if uri:
+                uris.append(uri)
         except Exception:
             continue
     if image_uris:
@@ -1547,7 +2370,6 @@ async def create_listing(
                 uris.extend([str(u) for u in extra])
         except Exception:
             pass
-
     try:
         created = ca.listing_create(
             owner_pubkey=seller_pub,
@@ -1559,7 +2381,6 @@ async def create_listing(
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Create failed: {e}")
-
     return {"ok": True, "listing": _normalize_listing(created)}
 
 @app.patch("/listings/{listing_id}", response_model=ListingUpdateRes)
@@ -1575,23 +2396,19 @@ async def update_listing(
     image_uris: Optional[str] = Form(None),
 ):
     seller_pub = ca.get_pubkey_from_keypair(seller_keyfile)
-
     rec = ca.listing_get(listing_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Listing not found")
-
     if title is not None or description is not None:
         try:
             rec = ca.listing_update_meta(seller_pub, listing_id, title=title, description=description)
         except Exception:
             pass
-
     if unit_price_sol is not None:
         try:
             rec = ca.listing_update_price(seller_pub, listing_id, unit_price_sol)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Update price failed: {e}")
-
     if quantity_new is not None or quantity_delta is not None:
         try:
             rec = ca.listing_update_quantity(
@@ -1599,14 +2416,15 @@ async def update_listing(
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Update quantity failed: {e}")
-
     new_uris: list[str] = []
     for f in images or []:
         try:
             data = await f.read()
             name = (f.filename or "").lower()
             suf = ".png" if name.endswith(".png") else ".jpg" if name.endswith(".jpg") or name.endswith(".jpeg") else ".bin"
-            new_uris.append(_ipfs_add_bytes(data, suffix=suf))
+            uri = _ipfs_add_bytes(data, suffix=suf)
+            if uri:
+                new_uris.append(uri)
         except Exception:
             continue
     if image_uris:
@@ -1621,7 +2439,6 @@ async def update_listing(
             rec = ca.listing_replace_images(seller_pub, listing_id, new_uris)
         except Exception:
             pass
-
     norm = _normalize_listing(rec)
     return {"ok": True, "listing": norm}
 
@@ -1634,7 +2451,7 @@ def delete_listing(listing_id: str, seller_keyfile: str):
         raise HTTPException(status_code=400, detail=f"Delete failed: {e}")
     return {"ok": True, "removed": int(removed)}
 
-# --- Shipping inbox for seller (uses append-only JSONL helpers) ---
+
 @app.get("/shipping/inbox/{seller_pub}")
 def shipping_inbox(seller_pub: str):
     rows = _shipping_events_read_all()
@@ -1644,22 +2461,21 @@ def shipping_inbox(seller_pub: str):
             continue
         if r.get("seller_pub") != seller_pub:
             continue
-        orders.append({
-            "order_id": r.get("order_id"),
-            "ts": r.get("ts"),
-            "listing_id": r.get("listing_id"),
-            "buyer_pub": r.get("buyer_pub"),
-            "payment": r.get("payment"),
-            "unit_price": r.get("unit_price"),
-            "quantity": r.get("quantity"),
-            "total_price": r.get("total_price")
-        })
+        orders.append(
+            {
+                "order_id": r.get("order_id"),
+                "ts": r.get("ts"),
+                "listing_id": r.get("listing_id"),
+                "buyer_pub": r.get("buyer_pub"),
+                "payment": r.get("payment"),
+                "unit_price": r.get("unit_price"),
+                "quantity": r.get("quantity"),
+                "total_price": r.get("total_price"),
+            }
+        )
     orders.sort(key=lambda x: x.get("ts") or "", reverse=True)
     return {"orders": orders}
 
-# =========================
-# Profiles (append-only JSONL + Merkle mirror)
-# =========================
 
 def _profiles__ensure_files():
     if not os.path.exists(PROFILES_EVENTS):
@@ -1669,7 +2485,9 @@ def _profiles__ensure_files():
             pass
     if not os.path.exists(PROFILES_MERKLE):
         try:
-            pathlib.Path(PROFILES_MERKLE).write_text(json.dumps({"leaves": [], "root": None, "version": 1}))
+            pathlib.Path(PROFILES_MERKLE).write_text(
+                json.dumps({"leaves": [], "root": None, "version": 1})
+            )
         except Exception:
             pass
 
@@ -1709,29 +2527,27 @@ def _profiles_save_state(st: Dict[str, Any]) -> None:
         pass
 
 def _profile_leaf_hex(blob: Dict[str, Any]) -> str:
-    # Reuse crypto-core canonicalization + tagged hash
     return ca.profile_hash_profile_leaf(blob)
 
 def _profiles_build_tree(leaves_hex: List[str]) -> MerkleTree:
-    mt = MerkleTree(leaves_hex if isinstance(leaves_hex, list) else [])
+    mt = OldMerkleTree(leaves_hex if isinstance(leaves_hex, list) else [])
     if not getattr(mt, "layers", None) and getattr(mt, "leaf_bytes", None):
         mt.build_tree()
     return mt
 
 def _profiles_find_latest_by_username(username: str) -> Optional[Dict[str, Any]]:
-    """
-    Return the latest ProfileRegistered row for this username that still exists in current leaves.
-    """
+    """Dernière entrée pour ce username (comparaison insensible à la casse/suffixes)."""
+    uname_norm = _normalize_username(username)
     rows = _profiles_events_read_all()
-    st = _profiles_load_state()
-    leaves = st.get("leaves") or []
+    stt = _profiles_load_state()
+    leaves = stt.get("leaves") or []
     pos = {h: i for i, h in enumerate(leaves)}
     latest = None
     for r in rows:
         if r.get("kind") != "ProfileRegistered":
             continue
         b = r.get("blob") or {}
-        if str(b.get("username", "")) != username:
+        if _normalize_username(str(b.get("username", ""))) != uname_norm:
             continue
         leaf = r.get("leaf") or _profile_leaf_hex(b)
         if leaf in pos:
@@ -1739,43 +2555,52 @@ def _profiles_find_latest_by_username(username: str) -> Optional[Dict[str, Any]]
     return latest
 
 def _profiles_register_blob(blob: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Append a profile leaf (idempotent for identical blob), update Merkle, return proof pack.
-    """
+    """Append a profile leaf (idempotent for identical blob), update Merkle, return proof pack."""
     _profiles__ensure_files()
     leaf_hex = _profile_leaf_hex(blob)
-
-    st = _profiles_load_state()
-    leaves = list(st.get("leaves") or [])
+    stt = _profiles_load_state()
+    leaves = list(stt.get("leaves") or [])
     if leaf_hex not in leaves:
         leaves.append(leaf_hex)
-        st["leaves"] = leaves
-        _profiles_save_state(st)
-
+    stt["leaves"] = leaves
+    _profiles_save_state(stt)
     mt = _profiles_build_tree(leaves)
     root_hex = mt.root().hex()
-    st["root"] = root_hex
-    _profiles_save_state(st)
-
+    stt["root"] = root_hex
+    _profiles_save_state(stt)
     idx = leaves.index(leaf_hex)
     proof = mt.get_proof(idx)
     return {"leaf": leaf_hex, "root": root_hex, "index": idx, "proof": proof}
 
-# ------------- Profiles Endpoints -------------
+
 @app.post("/profiles/reveal", response_model=ProfileRevealRes)
 def profiles_reveal(req: ProfileRevealReq):
-    # Validate owner sig (any of pubs[]) over canonical blob (without 'sig')
     blob = req.blob.dict()
-    pubs = list(blob.get("pubs") or [])
+    pubs_new = list(blob.get("pubs") or [])
     sig_hex = str(blob.get("sig") or "")
-    if not pubs:
+    if not pubs_new:
         raise HTTPException(status_code=400, detail="blob.pubs required")
-    msg = ca.profile_canonical_json_bytes(blob)  # strips 'sig' internally
-    if not sig_hex or not ca.profile_verify_owner_sig(msg, sig_hex, pubs):
-        raise HTTPException(status_code=400, detail="Invalid owner signature for profile blob")
-
+    if not sig_hex:
+        raise HTTPException(status_code=400, detail="blob.sig required")
+    latest = _profiles_find_latest_by_username(blob.get("username", ""))
+    msg = ca.profile_canonical_json_bytes(blob)
+    if latest is None:
+        if not ca.profile_verify_owner_sig(msg, sig_hex, pubs_new):
+            raise HTTPException(status_code=400, detail="Invalid owner signature for new profile")
+        blob["version"] = int(blob.get("version") or 1)
+    else:
+        old_blob = latest.get("blob") or {}
+        old_pubs = list(old_blob.get("pubs") or [])
+        if not old_pubs:
+            raise HTTPException(status_code=500, detail="Corrupt prior profile (no pubs)")
+        if not ca.profile_verify_owner_sig(msg, sig_hex, old_pubs):
+            raise HTTPException(status_code=409, detail="Username already registered by another owner")
+        old_ver = int(old_blob.get("version", 1))
+        new_ver = int(blob.get("version") or (old_ver + 1))
+        if new_ver < old_ver:
+            raise HTTPException(status_code=400, detail="version must be >= current")
+        blob["version"] = new_ver
     pack = _profiles_register_blob(blob)
-
     ev_row = {
         "kind": "ProfileRegistered",
         "ts": datetime.utcnow().isoformat() + "Z",
@@ -1790,70 +2615,35 @@ def profiles_reveal(req: ProfileRevealReq):
         ca.emit("ProfilesMerkleRootUpdated", root_hex=pack["root"])
     except Exception:
         pass
-
-    return ProfileRevealRes(ok=True, leaf=pack["leaf"], index=pack["index"], root=pack["root"], blob=ProfileBlob(**blob))
-
-@app.get("/profiles/resolve/{username}", response_model=ProfileResolveRes)
-def profiles_resolve(username: str):
-    row = _profiles_find_latest_by_username(username)
-    if not row:
-        return ProfileResolveRes(ok=False, username=username)
-
-    st = _profiles_load_state()
-    leaves = st.get("leaves") or []
-    mt = _profiles_build_tree(leaves)
-    root_hex = mt.root().hex()
-    idx = int(row["index"])
-    proof = mt.get_proof(idx)
-    blob = row.get("blob") or {}
-
-    return ProfileResolveRes(
-        ok=True,
-        username=username,
-        leaf=row["leaf"],
-        blob=ProfileBlob(**blob),
-        index=idx,
-        proof=proof,
-        root=root_hex,
+    return ProfileRevealRes(
+        ok=True, leaf=pack["leaf"], index=pack["index"], root=pack["root"], blob=ProfileBlob(**blob)
     )
 
 @app.post("/profiles/rotate", response_model=ProfileRevealRes)
 def profiles_rotate(req: ProfileRotateReq):
-    """
-    Step 1 of rotation: authorization.
-    - Verify 'req.sig' was made by ANY existing owner over {'username','new_pubs','meta'} (canonical).
-    - Return a 'blob' payload with 'sig' set to the canonical-bytes-hex the client must sign
-      using one of the NEW pubs. Client then calls /profiles/reveal with the finalized blob.
-    """
-    username = req.username
-    latest = _profiles_find_latest_by_username(username)
+    """Auth de rotation: vérification sur le payload EXACT fourni (casse incluse). Recherche insensible à la casse."""
+    username_orig = (req.username or "").strip()
+    latest = _profiles_find_latest_by_username(username_orig)
     if not latest:
         raise HTTPException(status_code=404, detail="Existing profile not found; use /profiles/reveal first")
-
     old_blob = latest.get("blob") or {}
     old_pubs = list(old_blob.get("pubs") or [])
     if not old_pubs:
         raise HTTPException(status_code=400, detail="Existing profile has no pubs[]")
-
-    payload = {"username": username, "new_pubs": list(req.new_pubs or []), "meta": req.meta or None}
+    payload = {"username": username_orig, "new_pubs": list(req.new_pubs or []), "meta": req.meta or None}
     if not payload["new_pubs"]:
         raise HTTPException(status_code=400, detail="new_pubs required")
-
     msg = ca.profile_canonical_json_bytes(payload)
     if not ca.profile_verify_owner_sig(msg, req.sig, old_pubs):
         raise HTTPException(status_code=400, detail="Rotation must be signed by an existing owner key")
-
-    # Build the new blob (version bump). Client must sign this (without 'sig') and call /profiles/reveal.
     new_blob = {
-        "username": username,
+        "username": username_orig,
         "pubs": payload["new_pubs"],
         "version": int(old_blob.get("version", 1)) + 1,
         "meta": payload["meta"],
-        "sig": "",  # client will replace with signature over canonical(new_blob_without_sig)
+        "sig": "",
     }
     to_sign = ca.profile_canonical_json_bytes(new_blob).hex()
-
-    # We return 'sig' as the canonical-bytes-hex to be signed (DX hint).
     return ProfileRevealRes(
         ok=True,
         leaf="",
@@ -1875,53 +2665,36 @@ def mark_stealth_used(req: MarkStealthUsedReq):
             f.write(json.dumps(row, separators=(",", ":")) + "\n")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to append to used_stealth.jsonl: {e}")
-
     try:
         ca.emit("StealthMarkedUsed", **row)
     except Exception:
         pass
-
     return MarkStealthUsedRes(ok=True, stealth_pub=req.stealth_pub)
 
-# app.py
 def _normalize_username(alias: str) -> str:
-    """
-    Accept forms like '@alice', 'alice', 'alice.incognito' and return 'alice'.
-    """
     s = (alias or "").strip()
     if s.startswith("@"):
         s = s[1:]
     if s.endswith(".incognito"):
         s = s[: -len(".incognito")]
-    return s
+    return s.lower()
 
 def _resolve_username_to_pub(username: str) -> str:
-    """
-    Use the profiles Merkle mirror to resolve the latest profile and
-    return a primary pubkey. Policy: pick blob.pubs[0].
-    """
-    u = _normalize_username(username)
-    row = _profiles_find_latest_by_username(u)
+    row = _profiles_find_latest_by_username(username)
     if not row:
+        u = _normalize_username(username)
         raise HTTPException(status_code=404, detail=f"Profile '{u}' not found")
     blob = row.get("blob") or {}
     pubs = list(blob.get("pubs") or [])
     if not pubs:
-        raise HTTPException(status_code=400, detail=f"Profile '{u}' has no pubs[]")
-    return pubs[0]  # policy: first pub is the receive key
-
-# =========================
-# Profiles helpers (reverse lookup)
-# =========================
+        raise HTTPException(status_code=400, detail=f"Profile has no pubs[]")
+    return pubs[0]
 
 def _profiles_find_latest_by_pub(pub: str) -> Optional[Dict[str, Any]]:
-    """
-    Return the latest ProfileRegistered row where blob.pubs includes `pub`
-    and the leaf still exists in current leaves.
-    """
+    """Return the latest ProfileRegistered row where blob.pubs includes pub and the leaf still exists in current leaves."""
     rows = _profiles_events_read_all()
-    st = _profiles_load_state()
-    leaves = st.get("leaves") or []
+    stt = _profiles_load_state()
+    leaves = stt.get("leaves") or []
     pos = {h: i for i, h in enumerate(leaves)}
     latest = None
     for r in rows:
@@ -1936,40 +2709,54 @@ def _profiles_find_latest_by_pub(pub: str) -> Optional[Dict[str, Any]]:
             latest = {**r, "index": pos[leaf], "leaf": leaf}
     return latest
 
-# ------------- Profiles: resolve by pub -------------
-from .schemas_api import ProfileResolveByPubRes  # add this import near the others
+
+from .schemas_api import ProfileResolveByPubRes
+
+
+@app.get("/profiles/resolve/{username}", response_model=ProfileResolveRes)
+def profiles_resolve(username: str):
+    """Toujours 200. ok=false si introuvable. Comparaison insensible à la casse via _profiles_find_latest_by_username()."""
+    row = _profiles_find_latest_by_username(username)
+    if not row:
+        return ProfileResolveRes(ok=False, username=username)
+    stt = _profiles_load_state()
+    leaves = stt.get("leaves") or []
+    mt = _profiles_build_tree(leaves)
+    root_hex = mt.root().hex()
+    idx = int(row["index"])
+    proof_raw = mt.get_proof(idx) or []
+    proof_hex = [p.hex() if isinstance(p, (bytes, bytearray)) else str(p) for p in proof_raw]
+    blob = row.get("blob") or {}
+    return ProfileResolveRes(
+        ok=True,
+        username=blob.get("username", username),
+        leaf=row["leaf"],
+        blob=ProfileBlob(**blob),
+        index=idx,
+        proof=proof_hex,
+        root=root_hex,
+    )
 
 @app.get("/profiles/resolve_pub/{pub}", response_model=ProfileResolveByPubRes)
 def profiles_resolve_pub(pub: str):
     row = _profiles_find_latest_by_pub(pub)
     if not row:
         return ProfileResolveByPubRes(ok=False, pub=pub)
-
-    st = _profiles_load_state()
-    leaves = st.get("leaves") or []
+    stt = _profiles_load_state()
+    leaves = stt.get("leaves") or []
     mt = _profiles_build_tree(leaves)
     root_hex = mt.root().hex()
     idx = int(row["index"])
-    proof = mt.get_proof(idx)
+    proof_raw = mt.get_proof(idx) or []
+    proof_hex = [p.hex() if isinstance(p, (bytes, bytearray)) else str(p) for p in proof_raw]
     blob = row.get("blob") or {}
-    username = blob.get("username")
-
     return ProfileResolveByPubRes(
-        ok=True,
-        pub=pub,
-        username=username,
-        leaf=row["leaf"],
-        index=idx,
-        proof=proof,
-        root=root_hex,
+        ok=True, pub=pub, username=blob.get("username"), leaf=row["leaf"], index=idx, root=root_hex, proof=proof_hex
     )
-
-# =========================
-# Escrow (Encrypted + Merkle) helpers
-# =========================
 
 def _utcnow_iso() -> str:
     from datetime import timezone
+
     return datetime.now(timezone.utc).isoformat()
 
 def _json_load(path: str, default: dict) -> dict:
@@ -2002,7 +2789,7 @@ def _escrow_merkle_save(ms: dict) -> None:
 
 def _escrow_rebuild_root() -> str:
     ms = _escrow_merkle()
-    mt = MerkleTree(ms.get("leaves", []))
+    mt = OldMerkleTree(ms.get("leaves", []))
     if not getattr(mt, "layers", None) and getattr(mt, "leaf_bytes", None):
         mt.build_tree()
     root = mt.root().hex() if hasattr(mt.root(), "hex") else (mt.root() or "")
@@ -2025,64 +2812,46 @@ def _escrow_append_leaf(commitment_hex: str) -> int:
     return len(leaves) - 1
 
 def _mk_escrow_commitment(amount_str: str, seller_pub: str):
-    """
-    Uses your existing commitment primitive from cli_adapter (ca.*).
-    """
+    """Uses your existing commitment primitive from cli_adapter (ca.*)."""
     note = secrets.token_bytes(32)
-    nonce = secrets.token_bytes(24)  # long nonce ok (we only store hex)
+    nonce = secrets.token_bytes(24)
     commitment = ca.make_commitment(note, amount_str, nonce, seller_pub)
     return note.hex(), nonce.hex(), commitment
 
 def _escrow_transition(cur: str, action: str, actor_pub: str, buyer_pub: str, seller_pub: str) -> str:
     action = action.upper()
-
-    # Normalize allowed-from states
     if action == "RELEASE":
-        # Only the buyer can release funds to the seller
         if actor_pub != buyer_pub:
             raise HTTPException(403, "Only the buyer can RELEASE funds.")
         if cur not in ("PENDING", "REFUND_REQUESTED", "DISPUTED"):
             raise HTTPException(400, f"Cannot RELEASE from {cur}.")
         return "RELEASED"
-
     if action == "REFUND_REQUEST":
-        # Buyer asks for a refund (no funds move yet)
         if actor_pub != buyer_pub:
             raise HTTPException(403, "Only the buyer can request a refund.")
         if cur != "PENDING":
             raise HTTPException(400, f"Cannot REFUND_REQUEST from {cur}.")
         return "REFUND_REQUESTED"
-
     if action == "REFUND":
-        # Only the seller can issue the refund
         if actor_pub != seller_pub:
             raise HTTPException(403, "Only the seller can REFUND.")
         if cur not in ("PENDING", "REFUND_REQUESTED", "DISPUTED"):
             raise HTTPException(400, f"Cannot REFUND from {cur}.")
         return "REFUNDED"
-
     if action == "DISPUTE":
-        # Either party can raise a dispute while not terminal
         if actor_pub not in (buyer_pub, seller_pub):
             raise HTTPException(403, "Only buyer or seller can DISPUTE.")
         if cur not in ("PENDING", "REFUND_REQUESTED"):
             raise HTTPException(400, f"Cannot DISPUTE from {cur}.")
         return "DISPUTED"
-
     if action == "CANCEL":
-        # Allow either party to cancel while still pending (adjust policy if needed)
         if actor_pub not in (buyer_pub, seller_pub):
             raise HTTPException(403, "Only buyer or seller can CANCEL.")
         if cur != "PENDING":
             raise HTTPException(400, f"Cannot CANCEL from {cur}.")
         return "CANCELLED"
-
     raise HTTPException(400, f"Unknown action {action}")
 
-
-# =========================
-# Escrow (Encrypted + Merkle) endpoints
-# =========================
 
 @app.get("/escrow/merkle/status", response_model=EscrowMerkleStatus)
 def escrow_merkle_status():
@@ -2093,7 +2862,7 @@ def escrow_merkle_status():
 @app.get("/escrow/list", response_model=EscrowListRes)
 def escrow_list(
     party_pub: Optional[str] = None,
-    role: Optional[str] = None,         # "buyer" | "seller"
+    role: Optional[str] = None,
     status: Optional[str] = None,
 ):
     st = _escrow_state()
@@ -2112,19 +2881,25 @@ def escrow_debug_state():
     """Return raw escrow state for diagnostics."""
     return _escrow_state()
 
+@app.get("/escrow/{escrow_id}")
+def escrow_get(escrow_id: str):
+    """Get escrow details."""
+    st_esc = _escrow_state()
+    escrow = _escrow_find(st_esc, escrow_id)
+    if not escrow:
+        raise HTTPException(404, "Escrow not found")
+    return {"ok": True, "escrow": escrow}
+
 @app.post("/escrow", response_model=EscrowOpenRes)
 def escrow_open(req: EscrowOpenReq):
-    # amount as string with your canonical quantization
     amount_str = str(Decimal(str(req.amount_sol)).quantize(CSOL_DEC))
     note_hex, nonce_hex, commitment_hex = _mk_escrow_commitment(amount_str, req.seller_pub)
     leaf_index = _escrow_append_leaf(commitment_hex)
-
     st = _escrow_state()
     escrow_id = secrets.token_hex(16)
     now = _utcnow_iso()
     record = {
         "id": escrow_id,
-        # In your app you often use keyfile to resolve pub; keep consistent with buyer identity you pass in
         "buyer_pub": ca.get_pubkey_from_keypair(req.buyer_keyfile) if os.path.exists(req.buyer_keyfile) else req.buyer_keyfile,
         "seller_pub": req.seller_pub,
         "amount_sol": amount_str,
@@ -2134,7 +2909,7 @@ def escrow_open(req: EscrowOpenReq):
         "quantity": int(req.quantity) if req.quantity else None,
         "commitment": commitment_hex,
         "leaf_index": int(leaf_index),
-        "note_hex": note_hex,   # kept server-side to derive nullifier on terminal states
+        "note_hex": note_hex,
         "nonce_hex": nonce_hex,
         "created_at": now,
         "updated_at": now,
@@ -2150,20 +2925,13 @@ def escrow_action(escrow_id: str, req: EscrowActionReq):
     e = _escrow_find(st, escrow_id)
     if not e:
         raise HTTPException(404, "Escrow not found")
-
-    # Resolve actor to pubkey (keyfile path or raw pubkey)
     actor_pub = (
         ca.get_pubkey_from_keypair(req.actor_keyfile)
         if os.path.exists(req.actor_keyfile)
         else req.actor_keyfile
     )
+    new_status = _escrow_transition(e["status"], req.action, actor_pub, e["buyer_pub"], e["seller_pub"])
 
-    # Enforce role-based transition
-    new_status = _escrow_transition(
-        e["status"], req.action, actor_pub, e["buyer_pub"], e["seller_pub"]
-    )
-
-    # Settlement logic (unchanged)...
     buyer_pub = e["buyer_pub"]
     seller_pub = e["seller_pub"]
     amt = Decimal(str(e["amount_sol"])).quantize(CSOL_DEC)
@@ -2175,9 +2943,10 @@ def escrow_action(escrow_id: str, req: EscrowActionReq):
         else:
             _ensure_reserve_has(amt)
             csol_sig = ca.csol_transfer_from_reserve(seller_pub, str(amt))
-            try: ca.emit("EscrowReleasedPayout", escrow_id=escrow_id, csol_sig=csol_sig, amount=str(amt))
-            except Exception: pass
-
+            try:
+                ca.emit("EscrowReleasedPayout", escrow_id=escrow_id, csol_sig=csol_sig, amount=str(amt))
+            except Exception:
+                pass
     elif new_status in ("REFUNDED", "CANCELLED"):
         if payment_mode == "csol":
             _csol_add(buyer_pub, amt)
@@ -2187,22 +2956,546 @@ def escrow_action(escrow_id: str, req: EscrowActionReq):
             nonce = secrets.token_bytes(16).hex()
             ca.add_note(stw, buyer_pub, ca.fmt_amt(amt), note, nonce)
             ca.save_wrapper_state(stw)
-            try: ca.emit("MerkleRootUpdated", root_hex=ca.build_merkle(stw).root().hex())
-            except Exception: pass
+            try:
+                ca.emit("MerkleRootUpdated", root_hex=ca.build_merkle(stw).root().hex())
+            except Exception:
+                pass
 
-    # Update record
     e["status"] = new_status
     e["updated_at"] = _utcnow_iso()
     if req.note_ct:
         e.setdefault("action_notes", []).append(req.note_ct.dict())
-
     if new_status in ("RELEASED", "REFUNDED", "CANCELLED"):
         try:
             nf = ca.make_nullifier(bytes.fromhex(e["note_hex"]))
             st.setdefault("nullifiers", []).append(nf)
         except Exception:
             pass
-
     _escrow_save(st)
     _escrow_rebuild_root()
     return EscrowActionRes(escrow=EscrowRecord(**e))
+
+def _messages__ensure_files():
+    if not os.path.exists(MESSAGES_EVENTS_PATH):
+        try:
+            pathlib.Path(MESSAGES_EVENTS_PATH).write_text("")
+        except Exception:
+            pass
+    if not os.path.exists(MESSAGES_MERKLE_PATH):
+        try:
+            pathlib.Path(MESSAGES_MERKLE_PATH).write_text(
+                json.dumps({"leaves": [], "root": None, "version": 1})
+            )
+        except Exception:
+            pass
+
+def _messages_events_append(row: dict) -> None:
+    """Append a message event to the encrypted database"""
+    try:
+        json_str = json.dumps(row, separators=(",", ":"))
+        encrypted_line = _encrypt_db_line(json_str)
+
+        with open(MESSAGES_EVENTS_PATH, "a", encoding="utf-8") as f:
+            f.write(encrypted_line + "\n")
+    except Exception:
+        pass
+
+def _messages_events_read_all() -> list[dict]:
+    """Read all message events from the encrypted database (with backward compatibility)"""
+    out = []
+    try:
+        with open(MESSAGES_EVENTS_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+
+                decrypted = _decrypt_db_line(s)
+                if decrypted:
+                    try:
+                        out.append(json.loads(decrypted))
+                        continue
+                    except Exception:
+                        pass
+
+                try:
+                    out.append(json.loads(s))
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+    return out
+
+def _messages_load_state() -> Dict[str, Any]:
+    _messages__ensure_files()
+    try:
+        return json.loads(pathlib.Path(MESSAGES_MERKLE_PATH).read_text())
+    except Exception:
+        return {"leaves": [], "root": None, "version": 1}
+
+def _messages_save_state(sta: Dict[str, Any]) -> None:
+    try:
+        pathlib.Path(MESSAGES_MERKLE_PATH).write_text(json.dumps(sta))
+    except Exception:
+        pass
+
+def _messages_leaf_hex(blob: Dict[str, Any]) -> str:
+    h = hashlib.sha256()
+    h.update(b"msg|")
+    h.update(json.dumps(blob, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    return h.hexdigest()
+
+def _messages_build_tree(leaves_hex: List[str]) -> MerkleTree:
+    mt = OldMerkleTree(leaves_hex if isinstance(leaves_hex, list) else [])
+    if not getattr(mt, "layers", None) and getattr(mt, "leaf_bytes", None):
+        mt.build_tree()
+    return mt
+
+def _messages_append_and_prove(row_blob: Dict[str, Any]) -> Dict[str, Any]:
+    _messages__ensure_files()
+    stt = _messages_load_state()
+    leaves = list(stt.get("leaves") or [])
+    leaf = _messages_leaf_hex(row_blob)
+    leaves.append(leaf)
+    stt["leaves"] = leaves
+    mt = _messages_build_tree(leaves)
+    root = mt.root().hex()
+    stt["root"] = root
+    _messages_save_state(stt)
+    idx = len(leaves) - 1
+    proof = mt.get_proof(idx)
+    ev = {"ts": datetime.utcnow().isoformat() + "Z", "leaf": leaf, "blob": row_blob}
+    _messages_events_append(ev)
+    return {"leaf": leaf, "root": root, "index": idx, "proof": proof}
+
+def _get_message_db_encryption_key() -> bytes:
+    """
+    Get or create a 32-byte encryption key for encrypting the messages database at rest.
+
+    Priority order:
+    1. MESSAGES_DB_KEY environment variable (hex string)
+    2. Derive from INCOGNITO_AUTHORITY keypair if available
+    3. Generate and persist a new key in .messages_db_key file
+
+    Returns 32 bytes for use with SecretBox
+    """
+    env_key = os.getenv("MESSAGES_DB_KEY")
+    if env_key:
+        try:
+            key_bytes = bytes.fromhex(env_key)
+            if len(key_bytes) == 32:
+                return key_bytes
+        except Exception:
+            pass
+
+    authority_path = os.getenv("INCOGNITO_AUTHORITY")
+    if authority_path and os.path.exists(authority_path):
+        try:
+            with open(authority_path, 'r') as f:
+                kp_data = json.load(f)
+            seed = bytes(kp_data[:32])
+            key = hashlib.sha256(seed + b"|messages-db-encryption-v1").digest()
+            return key
+        except Exception:
+            pass
+
+    key_file = os.path.join(DATA_DIR, ".messages_db_key")
+    if os.path.exists(key_file):
+        try:
+            with open(key_file, 'rb') as f:
+                key = f.read()
+            if len(key) == 32:
+                return key
+        except Exception:
+            pass
+
+    new_key = secrets.token_bytes(32)
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(key_file, 'wb') as f:
+            f.write(new_key)
+        os.chmod(key_file, 0o600)
+    except Exception:
+        pass
+
+    return new_key
+
+def _encrypt_db_line(plaintext_json: str) -> str:
+    """Encrypt a single line of the database (JSON string) for storage"""
+    key = _get_message_db_encryption_key()
+    box = SecretBox(key)
+    nonce = nacl_utils.random(24)
+    ct = box.encrypt(plaintext_json.encode('utf-8'), nonce)
+    return base64.b64encode(ct).decode('ascii')
+
+def _decrypt_db_line(encrypted_b64: str) -> Optional[str]:
+    """Decrypt a single line of the database"""
+    try:
+        key = _get_message_db_encryption_key()
+        box = SecretBox(key)
+        ct = base64.b64decode(encrypted_b64)
+        pt = box.decrypt(ct)
+        return pt.decode('utf-8')
+    except Exception:
+        return None
+
+def _verify_ed25519_signature(message: str, signature_b58: str, pubkey_b58: str) -> bool:
+    """
+    Verify an Ed25519 signature.
+
+    Args:
+        message: The message that was signed (UTF-8 string)
+        signature_b58: Base58-encoded signature (64 bytes)
+        pubkey_b58: Base58-encoded public key (32 bytes)
+
+    Returns:
+        True if signature is valid, False otherwise
+    """
+    try:
+        import base58
+        from nacl.signing import VerifyKey
+        from nacl.exceptions import BadSignatureError
+
+        msg_bytes = message.encode('utf-8')
+        sig_bytes = base58.b58decode(signature_b58)
+        pub_bytes = base58.b58decode(pubkey_b58)
+
+        if len(sig_bytes) != 64:
+            return False
+        if len(pub_bytes) != 32:
+            return False
+
+        verify_key = VerifyKey(pub_bytes)
+        verify_key.verify(msg_bytes, sig_bytes)
+        return True
+    except (BadSignatureError, Exception):
+        return False
+
+def _check_timestamp_freshness(timestamp: int, max_age_seconds: int = 60) -> bool:
+    """Check if a timestamp is within acceptable range of current time"""
+    import time
+    now = int(time.time())
+    age = abs(now - timestamp)
+    return age <= max_age_seconds
+
+
+def _hkdf_sha256(shared: bytes, info: Dict[str, Any]) -> bytes:
+    info_bytes = json.dumps(info, sort_keys=True, separators=(",", ":")).encode()
+    prk = hashlib.sha256(shared + b"|incognito-msg").digest()
+    okm = hashlib.sha256(prk + info_bytes).digest()
+    return okm
+
+def _compute_message_hmac(shared: bytes, ciphertext_hex: str) -> str:
+    """Compute HMAC-SHA256 of ciphertext using shared secret for message authentication"""
+    import hmac
+    ct_bytes = bytes.fromhex(ciphertext_hex)
+    mac = hmac.new(shared, ct_bytes, hashlib.sha256).digest()
+    return mac.hex()
+
+def _verify_message_hmac(shared: bytes, ciphertext_hex: str, hmac_hex: str) -> bool:
+    """Verify HMAC signature on message ciphertext"""
+    import hmac
+    expected = _compute_message_hmac(shared, ciphertext_hex)
+    return hmac.compare_digest(expected, hmac_hex)
+
+def _encrypt_with_shared(shared: bytes, plaintext: bytes) -> tuple[str, str]:
+    key = _hkdf_sha256(shared, {"v": 1, "algo": "x25519+xsalsa20poly1305"})
+    nonce = nacl_utils.random(24)
+    ct = SecretBox(key).encrypt(plaintext, nonce)
+    return nonce.hex(), ct[24:].hex()
+
+def _decrypt_with_shared(shared: bytes, nonce_hex: str, ct_hex: str) -> bytes:
+    key = _hkdf_sha256(shared, {"v": 1, "algo": "x25519+xsalsa20poly1305"})
+    box = SecretBox(key)
+    nonce = bytes.fromhex(nonce_hex)
+    ct = bytes.fromhex(ct_hex)
+    return box.decrypt(nonce + ct)
+
+
+def _send_memo_transfer(sender_keyfile: str, to_pub: str, memo_text: str) -> Optional[str]:
+    try:
+        rc, out, err = ca._run_rc(
+            [
+                "solana",
+                "transfer",
+                to_pub,
+                "0",
+                "--allow-unfunded-recipient",
+                "--from",
+                sender_keyfile,
+                "--with-memo",
+                memo_text,
+                "--url",
+                os.getenv("SOLANA_RPC_URL", "http://127.0.0.1:8899"),
+                "--fee-payer",
+                sender_keyfile,
+                "--no-wait",
+            ]
+        )
+        if rc != 0:
+            return None
+        return (out or "").strip().splitlines()[-1].strip()
+    except Exception:
+        return None
+
+
+from .schemas_api import (
+    MessageRow,
+    MessageSendReq,
+    MessageSendRes,
+    MessagesListRes,
+    MessagesMerkleStatus,
+    MessageInboxReq,
+    MessageSentReq,
+)
+
+@app.get("/messages/merkle/status", response_model=MessagesMerkleStatus)
+def messages_merkle_status():
+    ms = _messages_load_state()
+    mt = _messages_build_tree(ms.get("leaves", []))
+    root = mt.root().hex() if hasattr(mt.root(), "hex") else (mt.root() or "")
+    return MessagesMerkleStatus(message_leaves=len(ms.get("leaves", [])), message_root_hex=root)
+
+def _resolve_recipient_pub_or_username(
+    recipient_pub: Optional[str], recipient_username: Optional[str]
+) -> str:
+    if recipient_pub:
+        return recipient_pub
+    return _resolve_username_to_pub(recipient_username or "")
+
+@app.post("/messages/send", response_model=MessageSendRes)
+def messages_send(req: MessageSendReq):
+    if not os.path.exists(req.sender_keyfile):
+        raise HTTPException(status_code=400, detail=f"sender_keyfile not found: {req.sender_keyfile}")
+    sender_pub_ed = ca.get_pubkey_from_keypair(req.sender_keyfile)
+    recip_pub_ed = _resolve_recipient_pub_or_username(req.recipient_pub, req.recipient_username)
+
+
+    with open(req.sender_keyfile, 'r') as f:
+        sender_kp_data = json.load(f)
+    sender_sk64 = bytes(sender_kp_data[:64])
+    sender_ed_pub32 = bytes(sender_kp_data[32:64])
+
+    recip_ed_pub32 = base58.b58decode(recip_pub_ed)
+
+    from services.crypto_core.messages import shared_secret_from_ed25519
+    shared = shared_secret_from_ed25519(sender_sk64, recip_ed_pub32)
+
+    try:
+        pt = base64.b64decode(req.plaintext_b64)
+    except Exception:
+        raise HTTPException(400, "Invalid base64")
+    if len(pt) > 16 * 1024:
+        raise HTTPException(413, "message too large")
+    nonce_hex, ct_hex = _encrypt_with_shared(shared, pt)
+
+    hmac_hex = _compute_message_hmac(shared, ct_hex)
+
+    memo_sig = None
+    if req.attach_onchain_memo:
+        memo_payload = b"\x02" + sender_ed_pub32 + bytes.fromhex(nonce_hex) + bytes.fromhex(ct_hex)
+        memo_b64 = base64.b64encode(memo_payload).decode()
+        memo_sig = _send_memo_transfer(req.sender_keyfile, recip_pub_ed, memo_b64)
+
+    row_blob = {
+        "from_pub": sender_pub_ed,
+        "to_pub": recip_pub_ed,
+        "algo": "x25519_static+xsalsa20poly1305",
+        "nonce_hex": nonce_hex,
+        "ciphertext_hex": ct_hex,
+        "hmac_hex": hmac_hex,
+        "memo_sig": memo_sig,
+        "eph_pub_b58": None,
+    }
+    proof = _messages_append_and_prove(row_blob)
+    try:
+        ca.emit("MessageStored", **{**row_blob, **{k: proof[k] for k in ("leaf", "index", "root")}})
+    except Exception:
+        pass
+    return MessageSendRes(
+        ok=True,
+        message=MessageRow(
+            ts=datetime.utcnow().isoformat() + "Z",
+            from_pub=sender_pub_ed,
+            to_pub=recip_pub_ed,
+            algo="x25519_static+xsalsa20poly1305",
+            nonce_hex=nonce_hex,
+            ciphertext_hex=ct_hex,
+            hmac_hex=hmac_hex,
+            memo_sig=memo_sig,
+            eph_pub_b58=None,
+            leaf=proof["leaf"],
+            index=int(proof["index"]),
+            root=proof["root"],
+        ),
+    )
+
+@app.post("/messages/inbox", response_model=MessagesListRes)
+def messages_inbox_authenticated(req: MessageInboxReq):
+    """
+    Get inbox messages (AUTHENTICATED).
+    Requires signature proving ownership of owner_pub keypair.
+    """
+    if not _check_timestamp_freshness(req.timestamp, max_age_seconds=60):
+        raise HTTPException(status_code=401, detail="Request timestamp expired (must be within 60s of server time)")
+
+    message = f"inbox:{req.owner_pub}:{req.timestamp}"
+    if not _verify_ed25519_signature(message, req.signature, req.owner_pub):
+        raise HTTPException(status_code=403, detail="Invalid signature - authentication failed")
+
+    rows = _messages_events_read_all()
+    items = []
+    root = _messages_load_state().get("root") or ""
+    for r in rows:
+        b = r.get("blob") or {}
+        if b.get("to_pub") != req.owner_pub:
+            continue
+        if req.peer_pub and b.get("from_pub") != req.peer_pub:
+            continue
+        items.append(
+            MessageRow(
+                ts=r.get("ts"),
+                from_pub=b.get("from_pub"),
+                to_pub=b.get("to_pub"),
+                algo=b.get("algo"),
+                nonce_hex=b.get("nonce_hex"),
+                ciphertext_hex=b.get("ciphertext_hex"),
+                hmac_hex=b.get("hmac_hex"),
+                memo_sig=b.get("memo_sig"),
+                eph_pub_b58=b.get("eph_pub_b58"),
+                leaf=r.get("leaf"),
+                index=-1,
+                root=root,
+            )
+        )
+    items.sort(key=lambda x: x.ts, reverse=True)
+    return MessagesListRes(items=items)
+
+@app.get("/messages/inbox/{owner_pub}", response_model=MessagesListRes, deprecated=True)
+def messages_inbox_legacy(owner_pub: str, peer_pub: Optional[str] = None):
+    """
+    Get inbox messages (DEPRECATED - use POST /messages/inbox with authentication).
+    This endpoint is kept for backward compatibility but will be removed in a future version.
+    """
+    rows = _messages_events_read_all()
+    items = []
+    root = _messages_load_state().get("root") or ""
+    for r in rows:
+        b = r.get("blob") or {}
+        if b.get("to_pub") != owner_pub:
+            continue
+        if peer_pub and b.get("from_pub") != peer_pub:
+            continue
+        items.append(
+            MessageRow(
+                ts=r.get("ts"),
+                from_pub=b.get("from_pub"),
+                to_pub=b.get("to_pub"),
+                algo=b.get("algo"),
+                nonce_hex=b.get("nonce_hex"),
+                ciphertext_hex=b.get("ciphertext_hex"),
+                hmac_hex=b.get("hmac_hex"),
+                memo_sig=b.get("memo_sig"),
+                eph_pub_b58=b.get("eph_pub_b58"),
+                leaf=r.get("leaf"),
+                index=-1,
+                root=root,
+            )
+        )
+    items.sort(key=lambda x: x.ts, reverse=True)
+    return MessagesListRes(items=items)
+
+@app.post("/messages/sent", response_model=MessagesListRes)
+def messages_sent_authenticated(req: MessageSentReq):
+    """
+    Get sent messages (AUTHENTICATED).
+    Requires signature proving ownership of owner_pub keypair.
+    """
+    if not _check_timestamp_freshness(req.timestamp, max_age_seconds=60):
+        raise HTTPException(status_code=401, detail="Request timestamp expired (must be within 60s of server time)")
+
+    message = f"sent:{req.owner_pub}:{req.timestamp}"
+    if not _verify_ed25519_signature(message, req.signature, req.owner_pub):
+        raise HTTPException(status_code=403, detail="Invalid signature - authentication failed")
+
+    rows = _messages_events_read_all()
+    items = []
+    root = _messages_load_state().get("root") or ""
+    for r in rows:
+        b = r.get("blob") or {}
+        if b.get("from_pub") != req.owner_pub:
+            continue
+        if req.peer_pub and b.get("to_pub") != req.peer_pub:
+            continue
+        items.append(
+            MessageRow(
+                ts=r.get("ts"),
+                from_pub=b.get("from_pub"),
+                to_pub=b.get("to_pub"),
+                algo=b.get("algo"),
+                nonce_hex=b.get("nonce_hex"),
+                ciphertext_hex=b.get("ciphertext_hex"),
+                hmac_hex=b.get("hmac_hex"),
+                memo_sig=b.get("memo_sig"),
+                eph_pub_b58=b.get("eph_pub_b58"),
+                leaf=r.get("leaf"),
+                index=-1,
+                root=root,
+            )
+        )
+    items.sort(key=lambda x: x.ts, reverse=True)
+    return MessagesListRes(items=items)
+
+@app.get("/messages/sent/{owner_pub}", response_model=MessagesListRes, deprecated=True)
+def messages_sent_legacy(owner_pub: str, peer_pub: Optional[str] = None):
+    """
+    Get sent messages (DEPRECATED - use POST /messages/sent with authentication).
+    This endpoint is kept for backward compatibility but will be removed in a future version.
+    """
+    rows = _messages_events_read_all()
+    items = []
+    root = _messages_load_state().get("root") or ""
+    for r in rows:
+        b = r.get("blob") or {}
+        if b.get("from_pub") != owner_pub:
+            continue
+        if peer_pub and b.get("to_pub") != peer_pub:
+            continue
+        items.append(
+            MessageRow(
+                ts=r.get("ts"),
+                from_pub=b.get("from_pub"),
+                to_pub=b.get("to_pub"),
+                algo=b.get("algo"),
+                nonce_hex=b.get("nonce_hex"),
+                ciphertext_hex=b.get("ciphertext_hex"),
+                hmac_hex=b.get("hmac_hex"),
+                memo_sig=b.get("memo_sig"),
+                eph_pub_b58=b.get("eph_pub_b58"),
+                leaf=r.get("leaf"),
+                index=-1,
+                root=root,
+            )
+        )
+    items.sort(key=lambda x: x.ts, reverse=True)
+    return MessagesListRes(items=items)
+
+
+
+@app.get("/escrow/status")
+def get_escrow_status():
+    """Check if escrow platform is initialized and ready"""
+    try:
+        ca._ensure_escrow_platform_initialized()
+        return {
+            "status": "ready",
+            "initialized": True,
+            "program_id": ca.ESCROW_PROGRAM_ID,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "initialized": False,
+            "error": str(e),
+            "program_id": ca.ESCROW_PROGRAM_ID,
+        }

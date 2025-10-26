@@ -1,4 +1,3 @@
-# crypto_core/merkle.py
 from __future__ import annotations
 from typing import List, Tuple, Optional
 from .commitments import sha256

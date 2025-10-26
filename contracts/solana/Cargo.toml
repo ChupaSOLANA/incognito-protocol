@@ -1,7 +1,0 @@
-[workspace]
-members = [
-  "programs/merkle_registry",
-]
-
-[profile.release]
-overflow-checks = true
