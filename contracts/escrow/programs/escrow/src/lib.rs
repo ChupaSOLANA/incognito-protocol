@@ -7,6 +7,11 @@ const COMP_DEF_OFFSET_VERIFY_AMOUNT: u32 = comp_def_offset("verify_escrow_amount
 const COMP_DEF_OFFSET_CALC_STAKE: u32 = comp_def_offset("calculate_seller_stake");
 const COMP_DEF_OFFSET_CALC_FEE: u32 = comp_def_offset("calculate_platform_fee");
 const COMP_DEF_OFFSET_CALC_REFUND: u32 = comp_def_offset("calculate_refund_amount");
+const COMP_DEF_OFFSET_CALC_COMPLETION: u32 = comp_def_offset("calculate_completion_distribution");
+const COMP_DEF_OFFSET_CALC_BUYER_WIN: u32 = comp_def_offset("calculate_buyer_dispute_win");
+const COMP_DEF_OFFSET_CALC_SELLER_WIN: u32 = comp_def_offset("calculate_seller_dispute_win");
+const COMP_DEF_OFFSET_VERIFY_BALANCE: u32 = comp_def_offset("verify_sufficient_balance");
+const COMP_DEF_OFFSET_CHECK_TIMEOUT: u32 = comp_def_offset("check_timeout");
 
 const CSOL_DECIMALS: u8 = 9;
 
@@ -22,6 +27,51 @@ pub mod escrow {
     }
 
     pub fn init_reputation_calc_comp_def(ctx: Context<InitReputationCalcCompDef>) -> Result<()> {
+        init_comp_def(ctx.accounts, true, 0, None, None)?;
+        Ok(())
+    }
+
+    pub fn init_verify_amount_comp_def(ctx: Context<InitVerifyAmountCompDef>) -> Result<()> {
+        init_comp_def(ctx.accounts, true, 0, None, None)?;
+        Ok(())
+    }
+
+    pub fn init_calc_stake_comp_def(ctx: Context<InitCalcStakeCompDef>) -> Result<()> {
+        init_comp_def(ctx.accounts, true, 0, None, None)?;
+        Ok(())
+    }
+
+    pub fn init_calc_fee_comp_def(ctx: Context<InitCalcFeeCompDef>) -> Result<()> {
+        init_comp_def(ctx.accounts, true, 0, None, None)?;
+        Ok(())
+    }
+
+    pub fn init_calc_refund_comp_def(ctx: Context<InitCalcRefundCompDef>) -> Result<()> {
+        init_comp_def(ctx.accounts, true, 0, None, None)?;
+        Ok(())
+    }
+
+    pub fn init_calc_completion_comp_def(ctx: Context<InitCalcCompletionCompDef>) -> Result<()> {
+        init_comp_def(ctx.accounts, true, 0, None, None)?;
+        Ok(())
+    }
+
+    pub fn init_calc_buyer_win_comp_def(ctx: Context<InitCalcBuyerWinCompDef>) -> Result<()> {
+        init_comp_def(ctx.accounts, true, 0, None, None)?;
+        Ok(())
+    }
+
+    pub fn init_calc_seller_win_comp_def(ctx: Context<InitCalcSellerWinCompDef>) -> Result<()> {
+        init_comp_def(ctx.accounts, true, 0, None, None)?;
+        Ok(())
+    }
+
+    pub fn init_verify_balance_comp_def(ctx: Context<InitVerifyBalanceCompDef>) -> Result<()> {
+        init_comp_def(ctx.accounts, true, 0, None, None)?;
+        Ok(())
+    }
+
+    pub fn init_check_timeout_comp_def(ctx: Context<InitCheckTimeoutCompDef>) -> Result<()> {
         init_comp_def(ctx.accounts, true, 0, None, None)?;
         Ok(())
     }
@@ -626,6 +676,343 @@ pub mod escrow {
 
         Ok(())
     }
+
+    pub fn verify_escrow_amount_private(
+        ctx: Context<VerifyEscrowAmount>,
+        computation_offset: u64,
+        encrypted_amount: [u8; 32],
+        encrypted_min_amount: [u8; 32],
+        pub_key: [u8; 32],
+        nonce: u128,
+    ) -> Result<()> {
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+
+        let args = vec![
+            Argument::ArcisPubkey(pub_key),
+            Argument::PlaintextU128(nonce),
+            Argument::EncryptedU64(encrypted_amount),
+            Argument::EncryptedU64(encrypted_min_amount),
+        ];
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            None,
+            vec![VerifyEscrowAmountCallback::callback_ix(&[])],
+        )?;
+
+        Ok(())
+    }
+
+    #[arcium_callback(encrypted_ix = "verify_escrow_amount")]
+    pub fn verify_escrow_amount_callback(
+        ctx: Context<VerifyEscrowAmountCallback>,
+        output: ComputationOutputs<VerifyEscrowAmountOutput>,
+    ) -> Result<()> {
+        let result = match output {
+            ComputationOutputs::Success(VerifyEscrowAmountOutput { field_0 }) => field_0,
+            _ => return Err(ErrorCode::AbortedComputation.into()),
+        };
+
+        emit!(AmountVerifiedEvent {
+            encrypted_amount: result.field_0.ciphertexts[0],
+            nonce: result.field_0.nonce.to_le_bytes(),
+            is_valid: result.field_1,
+        });
+
+        Ok(())
+    }
+
+    pub fn calculate_seller_stake_private(
+        ctx: Context<CalculateSellerStake>,
+        computation_offset: u64,
+        encrypted_order_amount: [u8; 32],
+        encrypted_stake_percentage_bps: [u8; 32],
+        pub_key: [u8; 32],
+        nonce: u128,
+    ) -> Result<()> {
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+
+        let args = vec![
+            Argument::ArcisPubkey(pub_key),
+            Argument::PlaintextU128(nonce),
+            Argument::EncryptedU64(encrypted_order_amount),
+            Argument::EncryptedU64(encrypted_stake_percentage_bps),
+        ];
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            None,
+            vec![CalculateSellerStakeCallback::callback_ix(&[])],
+        )?;
+
+        Ok(())
+    }
+
+    #[arcium_callback(encrypted_ix = "calculate_seller_stake")]
+    pub fn calculate_seller_stake_callback(
+        ctx: Context<CalculateSellerStakeCallback>,
+        output: ComputationOutputs<CalculateSellerStakeOutput>,
+    ) -> Result<()> {
+        let encrypted_stake = match output {
+            ComputationOutputs::Success(CalculateSellerStakeOutput { field_0 }) => field_0,
+            _ => return Err(ErrorCode::AbortedComputation.into()),
+        };
+
+        emit!(SellerStakeCalculatedEvent {
+            encrypted_stake: encrypted_stake.ciphertexts[0],
+            nonce: encrypted_stake.nonce.to_le_bytes(),
+        });
+
+        Ok(())
+    }
+
+    pub fn calculate_platform_fee_private(
+        ctx: Context<CalculatePlatformFee>,
+        computation_offset: u64,
+        encrypted_order_amount: [u8; 32],
+        encrypted_fee_percentage_bps: [u8; 32],
+        pub_key: [u8; 32],
+        nonce: u128,
+    ) -> Result<()> {
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+
+        let args = vec![
+            Argument::ArcisPubkey(pub_key),
+            Argument::PlaintextU128(nonce),
+            Argument::EncryptedU64(encrypted_order_amount),
+            Argument::EncryptedU64(encrypted_fee_percentage_bps),
+        ];
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            None,
+            vec![CalculatePlatformFeeCallback::callback_ix(&[])],
+        )?;
+
+        Ok(())
+    }
+
+    #[arcium_callback(encrypted_ix = "calculate_platform_fee")]
+    pub fn calculate_platform_fee_callback(
+        ctx: Context<CalculatePlatformFeeCallback>,
+        output: ComputationOutputs<CalculatePlatformFeeOutput>,
+    ) -> Result<()> {
+        let encrypted_fee = match output {
+            ComputationOutputs::Success(CalculatePlatformFeeOutput { field_0 }) => field_0,
+            _ => return Err(ErrorCode::AbortedComputation.into()),
+        };
+
+        emit!(PlatformFeeCalculatedEvent {
+            encrypted_fee: encrypted_fee.ciphertexts[0],
+            nonce: encrypted_fee.nonce.to_le_bytes(),
+        });
+
+        Ok(())
+    }
+
+    pub fn calculate_refund_amount_private(
+        ctx: Context<CalculateRefundAmount>,
+        computation_offset: u64,
+        encrypted_order_amount: [u8; 32],
+        encrypted_seller_stake: [u8; 32],
+        include_penalty: bool,
+        pub_key: [u8; 32],
+        nonce: u128,
+    ) -> Result<()> {
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+
+        let args = vec![
+            Argument::ArcisPubkey(pub_key),
+            Argument::PlaintextU128(nonce),
+            Argument::EncryptedU64(encrypted_order_amount),
+            Argument::EncryptedU64(encrypted_seller_stake),
+            Argument::PlaintextBool(include_penalty),
+        ];
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            None,
+            vec![CalculateRefundAmountCallback::callback_ix(&[])],
+        )?;
+
+        Ok(())
+    }
+
+    #[arcium_callback(encrypted_ix = "calculate_refund_amount")]
+    pub fn calculate_refund_amount_callback(
+        ctx: Context<CalculateRefundAmountCallback>,
+        output: ComputationOutputs<CalculateRefundAmountOutput>,
+    ) -> Result<()> {
+        let encrypted_refund = match output {
+            ComputationOutputs::Success(CalculateRefundAmountOutput { field_0 }) => field_0,
+            _ => return Err(ErrorCode::AbortedComputation.into()),
+        };
+
+        emit!(RefundAmountCalculatedEvent {
+            encrypted_refund: encrypted_refund.ciphertexts[0],
+            nonce: encrypted_refund.nonce.to_le_bytes(),
+        });
+
+        Ok(())
+    }
+
+    pub fn calculate_completion_distribution_private(
+        ctx: Context<CalculateCompletionDistribution>,
+        computation_offset: u64,
+        encrypted_order_amount: [u8; 32],
+        encrypted_seller_stake: [u8; 32],
+        encrypted_platform_fee: [u8; 32],
+        pub_key: [u8; 32],
+        nonce: u128,
+    ) -> Result<()> {
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+
+        let args = vec![
+            Argument::ArcisPubkey(pub_key),
+            Argument::PlaintextU128(nonce),
+            Argument::EncryptedU64(encrypted_order_amount),
+            Argument::EncryptedU64(encrypted_seller_stake),
+            Argument::EncryptedU64(encrypted_platform_fee),
+        ];
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            None,
+            vec![CalculateCompletionDistributionCallback::callback_ix(&[])],
+        )?;
+
+        Ok(())
+    }
+
+    #[arcium_callback(encrypted_ix = "calculate_completion_distribution")]
+    pub fn calculate_completion_distribution_callback(
+        ctx: Context<CalculateCompletionDistributionCallback>,
+        output: ComputationOutputs<CalculateCompletionDistributionOutput>,
+    ) -> Result<()> {
+        let encrypted_distribution = match output {
+            ComputationOutputs::Success(CalculateCompletionDistributionOutput { field_0 }) => field_0,
+            _ => return Err(ErrorCode::AbortedComputation.into()),
+        };
+
+        emit!(CompletionDistributionCalculatedEvent {
+            encrypted_to_seller: encrypted_distribution.ciphertexts[0],
+            encrypted_to_platform: encrypted_distribution.ciphertexts[1],
+            encrypted_to_buyer: encrypted_distribution.ciphertexts[2],
+            nonce: encrypted_distribution.nonce.to_le_bytes(),
+        });
+
+        Ok(())
+    }
+
+    pub fn calculate_buyer_dispute_win_private(
+        ctx: Context<CalculateBuyerDisputeWin>,
+        computation_offset: u64,
+        encrypted_order_amount: [u8; 32],
+        encrypted_seller_stake: [u8; 32],
+        encrypted_platform_fee: [u8; 32],
+        pub_key: [u8; 32],
+        nonce: u128,
+    ) -> Result<()> {
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+
+        let args = vec![
+            Argument::ArcisPubkey(pub_key),
+            Argument::PlaintextU128(nonce),
+            Argument::EncryptedU64(encrypted_order_amount),
+            Argument::EncryptedU64(encrypted_seller_stake),
+            Argument::EncryptedU64(encrypted_platform_fee),
+        ];
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            None,
+            vec![CalculateBuyerDisputeWinCallback::callback_ix(&[])],
+        )?;
+
+        Ok(())
+    }
+
+    #[arcium_callback(encrypted_ix = "calculate_buyer_dispute_win")]
+    pub fn calculate_buyer_dispute_win_callback(
+        ctx: Context<CalculateBuyerDisputeWinCallback>,
+        output: ComputationOutputs<CalculateBuyerDisputeWinOutput>,
+    ) -> Result<()> {
+        let encrypted_distribution = match output {
+            ComputationOutputs::Success(CalculateBuyerDisputeWinOutput { field_0 }) => field_0,
+            _ => return Err(ErrorCode::AbortedComputation.into()),
+        };
+
+        emit!(BuyerDisputeWinDistributionEvent {
+            encrypted_to_seller: encrypted_distribution.ciphertexts[0],
+            encrypted_to_platform: encrypted_distribution.ciphertexts[1],
+            encrypted_to_buyer: encrypted_distribution.ciphertexts[2],
+            nonce: encrypted_distribution.nonce.to_le_bytes(),
+        });
+
+        Ok(())
+    }
+
+    pub fn calculate_seller_dispute_win_private(
+        ctx: Context<CalculateSellerDisputeWin>,
+        computation_offset: u64,
+        encrypted_order_amount: [u8; 32],
+        encrypted_seller_stake: [u8; 32],
+        encrypted_platform_fee: [u8; 32],
+        pub_key: [u8; 32],
+        nonce: u128,
+    ) -> Result<()> {
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+
+        let args = vec![
+            Argument::ArcisPubkey(pub_key),
+            Argument::PlaintextU128(nonce),
+            Argument::EncryptedU64(encrypted_order_amount),
+            Argument::EncryptedU64(encrypted_seller_stake),
+            Argument::EncryptedU64(encrypted_platform_fee),
+        ];
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            None,
+            vec![CalculateSellerDisputeWinCallback::callback_ix(&[])],
+        )?;
+
+        Ok(())
+    }
+
+    #[arcium_callback(encrypted_ix = "calculate_seller_dispute_win")]
+    pub fn calculate_seller_dispute_win_callback(
+        ctx: Context<CalculateSellerDisputeWinCallback>,
+        output: ComputationOutputs<CalculateSellerDisputeWinOutput>,
+    ) -> Result<()> {
+        let encrypted_distribution = match output {
+            ComputationOutputs::Success(CalculateSellerDisputeWinOutput { field_0 }) => field_0,
+            _ => return Err(ErrorCode::AbortedComputation.into()),
+        };
+
+        emit!(SellerDisputeWinDistributionEvent {
+            encrypted_to_seller: encrypted_distribution.ciphertexts[0],
+            encrypted_to_platform: encrypted_distribution.ciphertexts[1],
+            encrypted_to_buyer: encrypted_distribution.ciphertexts[2],
+            nonce: encrypted_distribution.nonce.to_le_bytes(),
+        });
+
+        Ok(())
+    }
 }
 
 #[account]
@@ -826,8 +1213,10 @@ pub struct FinalizeOrder<'info> {
     #[account(mut)]
     pub escrow: Account<'info, Escrow>,
 
+    /// CHECK: Buyer pubkey verified against escrow.buyer
     pub buyer: UncheckedAccount<'info>,
 
+    /// CHECK: Seller pubkey verified against escrow.seller
     pub seller: UncheckedAccount<'info>,
 
     #[account(mut)]
@@ -847,8 +1236,10 @@ pub struct BuyerFinalizeEarly<'info> {
 
     pub buyer_signer: Signer<'info>,
 
+    /// CHECK: Buyer pubkey verified against escrow.buyer
     pub buyer: UncheckedAccount<'info>,
 
+    /// CHECK: Seller pubkey verified against escrow.seller
     pub seller: UncheckedAccount<'info>,
 
     #[account(mut)]
@@ -866,8 +1257,10 @@ pub struct AutoComplete<'info> {
     #[account(mut)]
     pub escrow: Account<'info, Escrow>,
 
+    /// CHECK: Buyer pubkey verified against escrow.buyer
     pub buyer: UncheckedAccount<'info>,
 
+    /// CHECK: Seller pubkey verified against escrow.seller
     pub seller: UncheckedAccount<'info>,
 
     #[account(mut)]
@@ -885,6 +1278,7 @@ pub struct ProcessAcceptanceTimeout<'info> {
     #[account(mut)]
     pub escrow: Account<'info, Escrow>,
 
+    /// CHECK: Buyer pubkey verified against escrow.buyer
     pub buyer: UncheckedAccount<'info>,
 
     #[account(seeds = [b"config"], bump = config.bump)]
@@ -896,8 +1290,10 @@ pub struct ProcessShippingTimeout<'info> {
     #[account(mut)]
     pub escrow: Account<'info, Escrow>,
 
+    /// CHECK: Buyer pubkey verified against escrow.buyer
     pub buyer: UncheckedAccount<'info>,
 
+    /// CHECK: Seller pubkey verified against escrow.seller
     pub seller: UncheckedAccount<'info>,
 
     #[account(mut)]
@@ -928,8 +1324,10 @@ pub struct ResolveDispute<'info> {
     #[account(mut)]
     pub escrow: Account<'info, Escrow>,
 
+    /// CHECK: Buyer pubkey verified against escrow.buyer
     pub buyer: UncheckedAccount<'info>,
 
+    /// CHECK: Seller pubkey verified against escrow.seller
     pub seller: UncheckedAccount<'info>,
 
     #[account(mut)]
@@ -976,16 +1374,19 @@ pub struct CalculateReputationPrivate<'info> {
         address = derive_mxe_pda!()
     )]
     pub mxe_account: Account<'info, MXEAccount>,
+    /// CHECK: Mempool account managed by Arcium program
     #[account(
         mut,
         address = derive_mempool_pda!()
     )]
     pub mempool_account: UncheckedAccount<'info>,
+    /// CHECK: Execution pool account managed by Arcium program
     #[account(
         mut,
         address = derive_execpool_pda!()
     )]
     pub executing_pool: UncheckedAccount<'info>,
+    /// CHECK: Computation account managed by Arcium program
     #[account(
         mut,
         address = derive_comp_pda!(computation_offset)
@@ -1021,6 +1422,7 @@ pub struct CalculateReputationScoreCallback<'info> {
         address = derive_comp_def_pda!(COMP_DEF_OFFSET_CALC_REPUTATION)
     )]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    /// CHECK: Instructions sysvar account
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
     pub instructions_sysvar: AccountInfo<'info>,
 }
@@ -1035,6 +1437,7 @@ pub struct InitEncryptShippingCompDef<'info> {
         address = derive_mxe_pda!()
     )]
     pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
     #[account(mut)]
     pub comp_def_account: UncheckedAccount<'info>,
     pub arcium_program: Program<'info, Arcium>,
@@ -1051,10 +1454,432 @@ pub struct InitReputationCalcCompDef<'info> {
         address = derive_mxe_pda!()
     )]
     pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
     #[account(mut)]
     pub comp_def_account: UncheckedAccount<'info>,
     pub arcium_program: Program<'info, Arcium>,
     pub system_program: Program<'info, System>,
+}
+
+#[init_computation_definition_accounts("verify_escrow_amount", payer)]
+#[derive(Accounts)]
+pub struct InitVerifyAmountCompDef<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
+    #[account(mut)]
+    pub comp_def_account: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+#[init_computation_definition_accounts("calculate_seller_stake", payer)]
+#[derive(Accounts)]
+pub struct InitCalcStakeCompDef<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
+    #[account(mut)]
+    pub comp_def_account: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+#[init_computation_definition_accounts("calculate_platform_fee", payer)]
+#[derive(Accounts)]
+pub struct InitCalcFeeCompDef<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
+    #[account(mut)]
+    pub comp_def_account: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+#[init_computation_definition_accounts("calculate_refund_amount", payer)]
+#[derive(Accounts)]
+pub struct InitCalcRefundCompDef<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
+    #[account(mut)]
+    pub comp_def_account: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+#[init_computation_definition_accounts("calculate_completion_distribution", payer)]
+#[derive(Accounts)]
+pub struct InitCalcCompletionCompDef<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
+    #[account(mut)]
+    pub comp_def_account: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+#[init_computation_definition_accounts("calculate_buyer_dispute_win", payer)]
+#[derive(Accounts)]
+pub struct InitCalcBuyerWinCompDef<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
+    #[account(mut)]
+    pub comp_def_account: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+#[init_computation_definition_accounts("calculate_seller_dispute_win", payer)]
+#[derive(Accounts)]
+pub struct InitCalcSellerWinCompDef<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
+    #[account(mut)]
+    pub comp_def_account: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+#[init_computation_definition_accounts("verify_sufficient_balance", payer)]
+#[derive(Accounts)]
+pub struct InitVerifyBalanceCompDef<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
+    #[account(mut)]
+    pub comp_def_account: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+#[init_computation_definition_accounts("check_timeout", payer)]
+#[derive(Accounts)]
+pub struct InitCheckTimeoutCompDef<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
+    #[account(mut)]
+    pub comp_def_account: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+// Queue computation account structs
+#[queue_computation_accounts("verify_escrow_amount", payer)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64)]
+pub struct VerifyEscrowAmount<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(init_if_needed, space = 9, payer = payer, seeds = [&SIGN_PDA_SEED], bump, address = derive_sign_pda!())]
+    pub sign_pda_account: Account<'info, SignerAccount>,
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Account<'info, MXEAccount>,
+    /// CHECK: Mempool account managed by Arcium program
+    #[account(mut, address = derive_mempool_pda!())]
+    pub mempool_account: UncheckedAccount<'info>,
+    /// CHECK: Execution pool account managed by Arcium program
+    #[account(mut, address = derive_execpool_pda!())]
+    pub executing_pool: UncheckedAccount<'info>,
+    /// CHECK: Computation account managed by Arcium program
+    #[account(mut, address = derive_comp_pda!(computation_offset))]
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_VERIFY_AMOUNT))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(mut, address = derive_cluster_pda!(mxe_account))]
+    pub cluster_account: Account<'info, Cluster>,
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    pub pool_account: Account<'info, FeePool>,
+    #[account(address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    pub clock_account: Account<'info, ClockAccount>,
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+}
+
+#[callback_accounts("verify_escrow_amount")]
+#[derive(Accounts)]
+pub struct VerifyEscrowAmountCallback<'info> {
+    pub arcium_program: Program<'info, Arcium>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_VERIFY_AMOUNT))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    /// CHECK: Instructions sysvar account
+    #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
+    pub instructions_sysvar: AccountInfo<'info>,
+}
+
+#[queue_computation_accounts("calculate_seller_stake", payer)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64)]
+pub struct CalculateSellerStake<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(init_if_needed, space = 9, payer = payer, seeds = [&SIGN_PDA_SEED], bump, address = derive_sign_pda!())]
+    pub sign_pda_account: Account<'info, SignerAccount>,
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Account<'info, MXEAccount>,
+    /// CHECK: Mempool account managed by Arcium program
+    #[account(mut, address = derive_mempool_pda!())]
+    pub mempool_account: UncheckedAccount<'info>,
+    /// CHECK: Execution pool account managed by Arcium program
+    #[account(mut, address = derive_execpool_pda!())]
+    pub executing_pool: UncheckedAccount<'info>,
+    /// CHECK: Computation account managed by Arcium program
+    #[account(mut, address = derive_comp_pda!(computation_offset))]
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_CALC_STAKE))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(mut, address = derive_cluster_pda!(mxe_account))]
+    pub cluster_account: Account<'info, Cluster>,
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    pub pool_account: Account<'info, FeePool>,
+    #[account(address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    pub clock_account: Account<'info, ClockAccount>,
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+}
+
+#[callback_accounts("calculate_seller_stake")]
+#[derive(Accounts)]
+pub struct CalculateSellerStakeCallback<'info> {
+    pub arcium_program: Program<'info, Arcium>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_CALC_STAKE))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    /// CHECK: Instructions sysvar account
+    #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
+    pub instructions_sysvar: AccountInfo<'info>,
+}
+
+#[queue_computation_accounts("calculate_platform_fee", payer)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64)]
+pub struct CalculatePlatformFee<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(init_if_needed, space = 9, payer = payer, seeds = [&SIGN_PDA_SEED], bump, address = derive_sign_pda!())]
+    pub sign_pda_account: Account<'info, SignerAccount>,
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Account<'info, MXEAccount>,
+    /// CHECK: Mempool account managed by Arcium program
+    #[account(mut, address = derive_mempool_pda!())]
+    pub mempool_account: UncheckedAccount<'info>,
+    /// CHECK: Execution pool account managed by Arcium program
+    #[account(mut, address = derive_execpool_pda!())]
+    pub executing_pool: UncheckedAccount<'info>,
+    /// CHECK: Computation account managed by Arcium program
+    #[account(mut, address = derive_comp_pda!(computation_offset))]
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_CALC_FEE))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(mut, address = derive_cluster_pda!(mxe_account))]
+    pub cluster_account: Account<'info, Cluster>,
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    pub pool_account: Account<'info, FeePool>,
+    #[account(address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    pub clock_account: Account<'info, ClockAccount>,
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+}
+
+#[callback_accounts("calculate_platform_fee")]
+#[derive(Accounts)]
+pub struct CalculatePlatformFeeCallback<'info> {
+    pub arcium_program: Program<'info, Arcium>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_CALC_FEE))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    /// CHECK: Instructions sysvar account
+    #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
+    pub instructions_sysvar: AccountInfo<'info>,
+}
+
+#[queue_computation_accounts("calculate_refund_amount", payer)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64)]
+pub struct CalculateRefundAmount<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(init_if_needed, space = 9, payer = payer, seeds = [&SIGN_PDA_SEED], bump, address = derive_sign_pda!())]
+    pub sign_pda_account: Account<'info, SignerAccount>,
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Account<'info, MXEAccount>,
+    /// CHECK: Mempool account managed by Arcium program
+    #[account(mut, address = derive_mempool_pda!())]
+    pub mempool_account: UncheckedAccount<'info>,
+    /// CHECK: Execution pool account managed by Arcium program
+    #[account(mut, address = derive_execpool_pda!())]
+    pub executing_pool: UncheckedAccount<'info>,
+    /// CHECK: Computation account managed by Arcium program
+    #[account(mut, address = derive_comp_pda!(computation_offset))]
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_CALC_REFUND))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(mut, address = derive_cluster_pda!(mxe_account))]
+    pub cluster_account: Account<'info, Cluster>,
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    pub pool_account: Account<'info, FeePool>,
+    #[account(address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    pub clock_account: Account<'info, ClockAccount>,
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+}
+
+#[callback_accounts("calculate_refund_amount")]
+#[derive(Accounts)]
+pub struct CalculateRefundAmountCallback<'info> {
+    pub arcium_program: Program<'info, Arcium>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_CALC_REFUND))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    /// CHECK: Instructions sysvar account
+    #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
+    pub instructions_sysvar: AccountInfo<'info>,
+}
+
+#[queue_computation_accounts("calculate_completion_distribution", payer)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64)]
+pub struct CalculateCompletionDistribution<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(init_if_needed, space = 9, payer = payer, seeds = [&SIGN_PDA_SEED], bump, address = derive_sign_pda!())]
+    pub sign_pda_account: Account<'info, SignerAccount>,
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Account<'info, MXEAccount>,
+    /// CHECK: Mempool account managed by Arcium program
+    #[account(mut, address = derive_mempool_pda!())]
+    pub mempool_account: UncheckedAccount<'info>,
+    /// CHECK: Execution pool account managed by Arcium program
+    #[account(mut, address = derive_execpool_pda!())]
+    pub executing_pool: UncheckedAccount<'info>,
+    /// CHECK: Computation account managed by Arcium program
+    #[account(mut, address = derive_comp_pda!(computation_offset))]
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_CALC_COMPLETION))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(mut, address = derive_cluster_pda!(mxe_account))]
+    pub cluster_account: Account<'info, Cluster>,
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    pub pool_account: Account<'info, FeePool>,
+    #[account(address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    pub clock_account: Account<'info, ClockAccount>,
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+}
+
+#[callback_accounts("calculate_completion_distribution")]
+#[derive(Accounts)]
+pub struct CalculateCompletionDistributionCallback<'info> {
+    pub arcium_program: Program<'info, Arcium>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_CALC_COMPLETION))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    /// CHECK: Instructions sysvar account
+    #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
+    pub instructions_sysvar: AccountInfo<'info>,
+}
+
+#[queue_computation_accounts("calculate_buyer_dispute_win", payer)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64)]
+pub struct CalculateBuyerDisputeWin<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(init_if_needed, space = 9, payer = payer, seeds = [&SIGN_PDA_SEED], bump, address = derive_sign_pda!())]
+    pub sign_pda_account: Account<'info, SignerAccount>,
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Account<'info, MXEAccount>,
+    /// CHECK: Mempool account managed by Arcium program
+    #[account(mut, address = derive_mempool_pda!())]
+    pub mempool_account: UncheckedAccount<'info>,
+    /// CHECK: Execution pool account managed by Arcium program
+    #[account(mut, address = derive_execpool_pda!())]
+    pub executing_pool: UncheckedAccount<'info>,
+    /// CHECK: Computation account managed by Arcium program
+    #[account(mut, address = derive_comp_pda!(computation_offset))]
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_CALC_BUYER_WIN))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(mut, address = derive_cluster_pda!(mxe_account))]
+    pub cluster_account: Account<'info, Cluster>,
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    pub pool_account: Account<'info, FeePool>,
+    #[account(address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    pub clock_account: Account<'info, ClockAccount>,
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+}
+
+#[callback_accounts("calculate_buyer_dispute_win")]
+#[derive(Accounts)]
+pub struct CalculateBuyerDisputeWinCallback<'info> {
+    pub arcium_program: Program<'info, Arcium>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_CALC_BUYER_WIN))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    /// CHECK: Instructions sysvar account
+    #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
+    pub instructions_sysvar: AccountInfo<'info>,
+}
+
+#[queue_computation_accounts("calculate_seller_dispute_win", payer)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64)]
+pub struct CalculateSellerDisputeWin<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(init_if_needed, space = 9, payer = payer, seeds = [&SIGN_PDA_SEED], bump, address = derive_sign_pda!())]
+    pub sign_pda_account: Account<'info, SignerAccount>,
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Account<'info, MXEAccount>,
+    /// CHECK: Mempool account managed by Arcium program
+    #[account(mut, address = derive_mempool_pda!())]
+    pub mempool_account: UncheckedAccount<'info>,
+    /// CHECK: Execution pool account managed by Arcium program
+    #[account(mut, address = derive_execpool_pda!())]
+    pub executing_pool: UncheckedAccount<'info>,
+    /// CHECK: Computation account managed by Arcium program
+    #[account(mut, address = derive_comp_pda!(computation_offset))]
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_CALC_SELLER_WIN))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(mut, address = derive_cluster_pda!(mxe_account))]
+    pub cluster_account: Account<'info, Cluster>,
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    pub pool_account: Account<'info, FeePool>,
+    #[account(address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    pub clock_account: Account<'info, ClockAccount>,
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+}
+
+#[callback_accounts("calculate_seller_dispute_win")]
+#[derive(Accounts)]
+pub struct CalculateSellerDisputeWinCallback<'info> {
+    pub arcium_program: Program<'info, Arcium>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_CALC_SELLER_WIN))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    /// CHECK: Instructions sysvar account
+    #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
+    pub instructions_sysvar: AccountInfo<'info>,
 }
 
 #[event]
@@ -1130,6 +1955,55 @@ pub struct PrivateReputationUpdateNeeded {
     pub buyer: Pubkey,
     pub seller: Pubkey,
     pub msg: String,
+}
+
+#[event]
+pub struct AmountVerifiedEvent {
+    pub encrypted_amount: [u8; 32],
+    pub nonce: [u8; 16],
+    pub is_valid: bool,
+}
+
+#[event]
+pub struct SellerStakeCalculatedEvent {
+    pub encrypted_stake: [u8; 32],
+    pub nonce: [u8; 16],
+}
+
+#[event]
+pub struct PlatformFeeCalculatedEvent {
+    pub encrypted_fee: [u8; 32],
+    pub nonce: [u8; 16],
+}
+
+#[event]
+pub struct RefundAmountCalculatedEvent {
+    pub encrypted_refund: [u8; 32],
+    pub nonce: [u8; 16],
+}
+
+#[event]
+pub struct CompletionDistributionCalculatedEvent {
+    pub encrypted_to_seller: [u8; 32],
+    pub encrypted_to_platform: [u8; 32],
+    pub encrypted_to_buyer: [u8; 32],
+    pub nonce: [u8; 16],
+}
+
+#[event]
+pub struct BuyerDisputeWinDistributionEvent {
+    pub encrypted_to_seller: [u8; 32],
+    pub encrypted_to_platform: [u8; 32],
+    pub encrypted_to_buyer: [u8; 32],
+    pub nonce: [u8; 16],
+}
+
+#[event]
+pub struct SellerDisputeWinDistributionEvent {
+    pub encrypted_to_seller: [u8; 32],
+    pub encrypted_to_platform: [u8; 32],
+    pub encrypted_to_buyer: [u8; 32],
+    pub nonce: [u8; 16],
 }
 
 fn update_reputation_score(rep: &mut UserReputation) {

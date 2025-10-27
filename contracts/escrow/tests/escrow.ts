@@ -338,6 +338,39 @@ describe("Escrow", () => {
     );
   }
 
+  // Helper function: Encrypt a u64 value for MPC computation (REAL ENCRYPTION)
+  function encryptU64(value: number, nonce: Uint8Array): Uint8Array {
+    if (!cipher) {
+      throw new Error("MPC cipher not initialized");
+    }
+
+    // Convert u64 to bytes (little-endian)
+    const buffer = Buffer.alloc(8);
+    buffer.writeBigUInt64LE(BigInt(value), 0);
+
+    // Encrypt using RescueCipher from Arcium
+    const encrypted = cipher.encrypt(buffer, nonce);
+
+    // Pad to 32 bytes as required by MPC
+    const padded = Buffer.alloc(32);
+    encrypted.copy(padded);
+
+    return new Uint8Array(padded);
+  }
+
+  // Helper function: Decrypt a u64 value from MPC result
+  function decryptU64(encryptedValue: Uint8Array, nonce: Uint8Array): number {
+    if (!cipher) {
+      throw new Error("MPC cipher not initialized");
+    }
+
+    // Decrypt using RescueCipher
+    const decrypted = cipher.decrypt(Buffer.from(encryptedValue), nonce);
+
+    // Convert bytes back to u64 (little-endian)
+    return Number(decrypted.readBigUInt64LE(0));
+  }
+
   // Helper to get common escrow accounts
   const getEscrowAccounts = (escrowPDA: PublicKey) => {
     const escrowAta = getAssociatedTokenAddressSync(
