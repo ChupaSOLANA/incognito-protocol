@@ -941,13 +941,8 @@ def _ensure_escrow_platform_initialized():
 
     LOG.info("Checking escrow platform initialization...")
 
-    anchor_env = {
-        "ANCHOR_PROVIDER_URL": os.getenv("ANCHOR_PROVIDER_URL", "http://127.0.0.1:8899"),
-        "ANCHOR_WALLET": os.getenv("ANCHOR_WALLET") or _wrapper_keypair_abs(),
-        "MINT": MINT,
-        "WRAPPER_KEYPAIR": _wrapper_keypair_abs(),
-        "TREASURY_KEYPAIR": os.getenv("TREASURY_KEYPAIR") or _abs_keypair_path(TREASURY_KEYPAIR),
-    }
+    anchor_env = _get_anchor_env()
+    anchor_env["TREASURY_KEYPAIR"] = os.getenv("TREASURY_KEYPAIR") or _abs_keypair_path(TREASURY_KEYPAIR)
 
     LOG.info(f"Initializing with ANCHOR_PROVIDER_URL={anchor_env['ANCHOR_PROVIDER_URL']}")
     LOG.info(f"Using wrapper keypair: {anchor_env['WRAPPER_KEYPAIR']}")
@@ -978,16 +973,20 @@ def _ensure_escrow_platform_initialized():
         LOG.error(f"Failed to initialize escrow platform: {e}", exc_info=True)
         raise CLIAdapterError(f"Escrow platform initialization failed: {e}")
 
-def _call_escrow_client(command: str, args: List[str]) -> dict:
-    """Call TypeScript escrow client and return JSON result."""
-    cmd = ["yarn", "node", "-r", "ts-node/register/transpile-only", str(ESCROW_CLIENT_SCRIPT), command] + args
-
-    anchor_env = {
+def _get_anchor_env() -> dict:
+    """Get environment variables for Anchor/Solana commands."""
+    return {
         "ANCHOR_PROVIDER_URL": os.getenv("ANCHOR_PROVIDER_URL", "http://127.0.0.1:8899"),
         "ANCHOR_WALLET": os.getenv("ANCHOR_WALLET") or _wrapper_keypair_abs(),
         "MINT": MINT,
         "WRAPPER_KEYPAIR": _wrapper_keypair_abs(),
     }
+
+def _call_escrow_client(command: str, args: List[str]) -> dict:
+    """Call TypeScript escrow client and return JSON result."""
+    cmd = ["yarn", "node", "-r", "ts-node/register/transpile-only", str(ESCROW_CLIENT_SCRIPT), command] + args
+
+    anchor_env = _get_anchor_env()
 
     try:
         output = _run(cmd, cwd=str(ESCROW_CONTRACT_DIR), env=anchor_env)
@@ -1088,6 +1087,46 @@ def escrow_accept_order(seller_keypair_path: str, escrow_pda: str) -> dict:
     """
     return _call_escrow_client("accept_order", [_abs_keypair_path(seller_keypair_path), escrow_pda])
 
+def escrow_accept_order_mpc(seller_keypair_path: str, escrow_pda: str, computation_offset: int = None) -> dict:
+    """
+    Seller accepts an escrow order with MPC seller stake calculation.
+
+    This uses the MPC-enhanced client to:
+    1. Accept the order (update state)
+    2. Queue MPC computation for seller stake calculation
+
+    Args:
+        seller_keypair_path: Path to seller's keypair file (relative to repo root)
+        escrow_pda: Escrow PDA address
+        computation_offset: Optional computation offset (auto-generated if None)
+
+    Returns:
+        {"success": true, "acceptTx": "...", "stakeTx": "...", "message": "..."}
+    """
+    if computation_offset is None:
+        import time
+        computation_offset = int(time.time() * 1000)
+
+    seller_keyfile_abs = _abs_keypair_path(seller_keypair_path)
+
+    # Call the MPC-enhanced client
+    cmd = [
+        "yarn", "node", "-r", "ts-node/register/transpile-only",
+        str(ESCROW_CONTRACT_DIR / "scripts" / "escrow_client_mpc.ts"),
+        "accept_order_mpc",
+        seller_keyfile_abs,
+        escrow_pda,
+        str(computation_offset)
+    ]
+
+    try:
+        output = _run(cmd, cwd=str(ESCROW_CONTRACT_DIR), env=_get_anchor_env())
+        return json.loads(output)
+    except json.JSONDecodeError as e:
+        raise CLIAdapterError(f"Failed to parse MPC escrow client output: {e}\nOutput: {output}")
+    except Exception as e:
+        raise CLIAdapterError(f"MPC escrow client failed: {e}")
+
 def escrow_mark_shipped(seller_keypair_path: str, escrow_pda: str, tracking_number: str) -> dict:
     """
     Seller marks order as shipped with tracking number.
@@ -1114,6 +1153,104 @@ def escrow_confirm_delivery(buyer_keypair_path: str, escrow_pda: str) -> dict:
         {"success": true, "tx": "signature"}
     """
     return _call_escrow_client("confirm_delivery", [_abs_keypair_path(buyer_keypair_path), escrow_pda])
+
+def escrow_finalize_order_mpc(escrow_pda: str, computation_offset: int = None) -> dict:
+    """
+    Finalize order with MPC fund distribution calculation.
+
+    This uses the MPC-enhanced client to:
+    1. Finalize the order (update state)
+    2. Queue MPC computation for fund distribution calculation
+
+    Args:
+        escrow_pda: Escrow PDA address
+        computation_offset: Optional computation offset (auto-generated if None)
+
+    Returns:
+        {"success": true, "finalizeTx": "...", "distributionTx": "...", "message": "..."}
+    """
+    if computation_offset is None:
+        import time
+        computation_offset = int(time.time() * 1000)
+
+    # Call the MPC-enhanced client
+    cmd = [
+        "yarn", "node", "-r", "ts-node/register/transpile-only",
+        str(ESCROW_CONTRACT_DIR / "scripts" / "escrow_client_mpc.ts"),
+        "finalize_order_mpc",
+        escrow_pda,
+        str(computation_offset)
+    ]
+
+    try:
+        output = _run(cmd, cwd=str(ESCROW_CONTRACT_DIR), env=_get_anchor_env())
+        return json.loads(output)
+    except json.JSONDecodeError as e:
+        raise CLIAdapterError(f"Failed to parse MPC escrow client output: {e}\nOutput: {output}")
+    except Exception as e:
+        raise CLIAdapterError(f"MPC escrow client failed: {e}")
+
+def escrow_calculate_seller_stake_mpc(escrow_pda: str, computation_offset: int = None) -> dict:
+    """
+    Calculate seller stake using MPC (for testing/debugging).
+
+    Args:
+        escrow_pda: Escrow PDA address
+        computation_offset: Optional computation offset (auto-generated if None)
+
+    Returns:
+        {"success": true, "tx": "...", "message": "...", "computationOffset": "..."}
+    """
+    if computation_offset is None:
+        import time
+        computation_offset = int(time.time() * 1000)
+
+    cmd = [
+        "yarn", "node", "-r", "ts-node/register/transpile-only",
+        str(ESCROW_CONTRACT_DIR / "scripts" / "escrow_client_mpc.ts"),
+        "calculate_stake",
+        escrow_pda,
+        str(computation_offset)
+    ]
+
+    try:
+        output = _run(cmd, cwd=str(ESCROW_CONTRACT_DIR), env=_get_anchor_env())
+        return json.loads(output)
+    except json.JSONDecodeError as e:
+        raise CLIAdapterError(f"Failed to parse MPC escrow client output: {e}\nOutput: {output}")
+    except Exception as e:
+        raise CLIAdapterError(f"MPC escrow client failed: {e}")
+
+def escrow_calculate_platform_fee_mpc(escrow_pda: str, computation_offset: int = None) -> dict:
+    """
+    Calculate platform fee using MPC (for testing/debugging).
+
+    Args:
+        escrow_pda: Escrow PDA address
+        computation_offset: Optional computation offset (auto-generated if None)
+
+    Returns:
+        {"success": true, "tx": "...", "message": "...", "computationOffset": "..."}
+    """
+    if computation_offset is None:
+        import time
+        computation_offset = int(time.time() * 1000)
+
+    cmd = [
+        "yarn", "node", "-r", "ts-node/register/transpile-only",
+        str(ESCROW_CONTRACT_DIR / "scripts" / "escrow_client_mpc.ts"),
+        "calculate_fee",
+        escrow_pda,
+        str(computation_offset)
+    ]
+
+    try:
+        output = _run(cmd, cwd=str(ESCROW_CONTRACT_DIR), env=_get_anchor_env())
+        return json.loads(output)
+    except json.JSONDecodeError as e:
+        raise CLIAdapterError(f"Failed to parse MPC escrow client output: {e}\nOutput: {output}")
+    except Exception as e:
+        raise CLIAdapterError(f"MPC escrow client failed: {e}")
 
 def escrow_finalize_order(escrow_pda: str) -> dict:
     """

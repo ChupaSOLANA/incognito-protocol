@@ -676,7 +676,8 @@ def _write_temp_keypair_from_solders(kp) -> str:
     return tmp_path
 
 def _spl_out(args: list[str]) -> str:
-    p = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    # Increased timeout for blockchain transactions (especially with MPC)
+    p = subprocess.run(args, capture_output=True, text=True, timeout=120)
     if p.returncode != 0:
         raise RuntimeError(p.stderr.strip() or "spl-token failed")
     return p.stdout.strip()
@@ -1598,14 +1599,49 @@ def deposit_csol(
 
 @app.post("/convert", response_model=ConvertRes)
 def convert(req: ConvertReq):
-    sender_pub = ca.get_pubkey_from_keypair(req.sender_keyfile)
-    sender_ata = ca.get_ata_for_owner(ca.MINT, req.sender_keyfile)
+    """
+    Convert cSOL back to a privacy note for withdrawal.
+
+    Flow:
+    1. User sends cSOL confidentially to wrapper
+    2. Wrapper creates a new note for the user
+    3. User can later withdraw SOL from vault using the note
+
+    This maintains the accounting: cSOL supply increases, note is created,
+    and reconcile_csol_supply() will sync vault/supply when needed.
+    """
+    user_keyfile = req.sender_keyfile
+    if not os.path.isabs(user_keyfile):
+        user_keyfile = os.path.join(REPO_ROOT, user_keyfile)
+
+    if not os.path.exists(user_keyfile):
+        raise HTTPException(
+            status_code=400,
+            detail=f"User keyfile not found at {user_keyfile}"
+        )
+
+    user_pub = get_pubkey_from_keypair(user_keyfile)
+    amount_lamports = int(req.amount_sol * 1_000_000_000)
+
+    if amount_lamports <= 50_000_000:
+        raise HTTPException(
+            status_code=400,
+            detail="Conversion amount must be greater than 0.05 SOL (wrapper deposit fee)"
+        )
+
+    # Step 1: Transfer cSOL confidentially to wrapper
+    sender_ata = ca.get_ata_for_owner(ca.MINT, user_keyfile)
+    wrapper_ata = ca.get_wrapper_ata()
     fee_tmp, _ = ca.pick_treasury_fee_payer_tmpfile()
+
     if not fee_tmp:
         raise HTTPException(
-            status_code=400, detail="No funded treasury stealth key available as fee-payer."
+            status_code=400,
+            detail="No funded treasury stealth key available as fee-payer."
         )
+
     try:
+        # Deposit tokens to confidential balance
         ca._run_rc(
             [
                 "spl-token",
@@ -1615,57 +1651,172 @@ def convert(req: ConvertReq):
                 "--address",
                 sender_ata,
                 "--owner",
-                req.sender_keyfile,
+                user_keyfile,
                 "--fee-payer",
                 fee_tmp,
             ]
         )
-        ca.spl_apply(req.sender_keyfile, fee_tmp)
+        ca.spl_apply(user_keyfile, fee_tmp)
+
+        # Transfer confidentially to wrapper
         ca._run(
             [
                 "spl-token",
                 "transfer",
                 ca.MINT,
                 _fmt(req.amount_sol),
-                ca.get_wrapper_ata(),
+                wrapper_ata,
                 "--owner",
-                req.sender_keyfile,
+                user_keyfile,
                 "--confidential",
                 "--fee-payer",
                 fee_tmp,
             ]
         )
         ca.spl_apply(ca.WRAPPER_KEYPAIR, fee_tmp)
+        sig_transfer = "confidential_transfer"  # We don't capture the actual sig in this flow
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"cSOL confidential transfer failed: {str(e)}"
+        )
     finally:
         try:
             os.remove(fee_tmp)
         except Exception:
             pass
-    try:
-        _csol_sub(sender_pub, Decimal(str(req.amount_sol)))
-    except Exception:
-        pass
-    from services.crypto_core.splits import split_bounded
 
-    treasury_kf = _resolve_treasury_keyfile()
-    parts = split_bounded(Decimal(req.amount_sol), max(1, int(req.n_outputs)), low=0.5, high=1.5)
-    outputs = []
-    total_out = Decimal("0")
-    for p in parts:
-        eph, stealth_addr = ca.generate_stealth_for_recipient(sender_pub)
-        ca.add_pool_stealth_record(sender_pub, stealth_addr, eph, 0)
-        outputs.append({"amount": ca.fmt_amt(p), "stealth": stealth_addr, "eph_pub_b58": eph})
-        ca.solana_transfer(treasury_kf, stealth_addr, ca.fmt_amt(p))
-        total_out += p
+    # Update user's cSOL balance tracking
     try:
-        ca.emit("CSOLConverted", amount=ca._lamports(_fmt(req.amount_sol)), direction="from_csol")
+        _csol_sub(user_pub, Decimal(str(req.amount_sol)))
     except Exception:
         pass
+
+    # Step 2: Create note for user to withdraw later
+    pool_merkle_path = Path(REPO_ROOT) / "pool_merkle_state.json"
+    if pool_merkle_path.exists():
+        with open(pool_merkle_path, 'r') as f:
+            pool_state = json.load(f)
+        tree = PoolMerkleTree(depth=pool_state.get("depth", 20))
+        for leaf_hex in pool_state.get("leaves", []):
+            tree.insert(bytes.fromhex(leaf_hex))
+    else:
+        tree = PoolMerkleTree(depth=20)
+
+    secret = secrets.token_bytes(32)
+    nullifier = secrets.token_bytes(32)
+
+    commitment, nf_hash, merkle_path = prepare_deposit_params(
+        amount_lamports=amount_lamports,
+        secret=secret,
+        nullifier=nullifier,
+        local_merkle_tree=tree
+    )
+
+    wrapper_keyfile = ca.WRAPPER_KEYPAIR
+    if not os.path.isabs(wrapper_keyfile):
+        wrapper_keyfile = os.path.join(REPO_ROOT, wrapper_keyfile)
+
+    if not os.path.exists(wrapper_keyfile):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Wrapper keyfile not found at {wrapper_keyfile}"
+        )
+
+    # Wrapper deposits to pool on behalf of user (creating the note)
     try:
-        reconcile_csol_supply(assume_delta=-total_out)
+        result = deposit_to_pool_onchain(
+            depositor_keyfile=wrapper_keyfile,
+            amount_lamports=amount_lamports,
+            commitment=commitment,
+            nf_hash=nf_hash,
+            merkle_path=merkle_path,
+            wrapper_keyfile=wrapper_keyfile,
+            wrapper_stealth_state_path=WRAPPER_STEALTH_STATE_PATH,
+            cluster=req.cluster
+        )
+        sig_deposit = result["tx_signature"]
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Deposit to pool failed: {str(e)}"
+        )
+
+    # Update Merkle tree
+    leaf = h2(commitment, nf_hash)
+    tree.insert(leaf)
+    leaf_index = len(tree.leaves) - 1
+
+    with open(pool_merkle_path, 'w') as f:
+        json.dump({
+            "depth": tree.depth,
+            "leaves": [leaf.hex() for leaf in tree.leaves],
+            "leaf_count": len(tree.leaves)
+        }, f, indent=2)
+
+    # Save note for user
+    _save_note_for_user(
+        owner_pub=user_pub,
+        secret=secret.hex(),
+        nullifier=nullifier.hex(),
+        commitment=commitment.hex(),
+        leaf_index=leaf_index,
+        amount_sol=req.amount_sol,
+        tx_signature=sig_deposit,
+        spent=False
+    )
+
+    # Create note file
+    try:
+        os.makedirs(NOTES_DIR, exist_ok=True)
+        commitment_hex = commitment.hex()
+        commitment_prefix = commitment_hex[:8]
+        timestamp = int(datetime.now().timestamp())
+        filename = f"note_{commitment_prefix}_{timestamp}.json"
+        filepath = os.path.join(NOTES_DIR, filename)
+
+        note_data = {
+            "version": "1.0",
+            "network": req.cluster,
+            "deposit_date": datetime.now().isoformat(),
+            "amount_deposited_sol": float(req.amount_sol),
+            "amount_withdrawable_sol": float(req.amount_sol),
+            "wrapper_fee_sol": 0.0,
+            "credentials": {
+                "secret": secret.hex(),
+                "nullifier": nullifier.hex(),
+                "commitment": commitment_hex,
+                "leaf_index": leaf_index
+            },
+            "transaction": {
+                "tx_signature": sig_deposit,
+                "note_type": "csol_conversion"
+            }
+        }
+
+        with open(filepath, 'w') as f:
+            json.dump(note_data, f, indent=2)
+
+        print(f"   Created note file: {filename}")
+    except Exception as e:
+        print(f"   Warning: Could not create note file: {e}")
+
+    # Emit event
+    try:
+        ca.emit("CSOLConverted", amount=amount_lamports, direction="from_csol")
     except Exception:
         pass
-    return ConvertRes(outputs=outputs)
+
+    return ConvertRes(
+        status="ok",
+        tx_signature_transfer=sig_transfer,
+        tx_signature_deposit=sig_deposit,
+        secret=secret.hex(),
+        nullifier=nullifier.hex(),
+        commitment=commitment.hex(),
+        leaf_index=leaf_index,
+        amount_sol=str(req.amount_sol)
+    )
 
 @app.get("/stealth/{owner_pub}", response_model=StealthList)
 def list_stealth(owner_pub: str, include_balances: bool = True, min_sol: float = 0.01):
@@ -2031,17 +2182,64 @@ def escrow_accept(
         raise HTTPException(400, "Escrow PDA not found - not an on-chain escrow")
 
     try:
-        result = ca.escrow_accept_order(seller_keyfile, escrow_pda)
-        if not result.get("success"):
-            raise Exception(f"Accept failed: {result.get('error')}")
+        # Try MPC version first (with encryption), fallback to regular accept if MPC not available
+        import time
+        computation_offset = int(time.time() * 1000)
 
-        escrow["status"] = "ACCEPTED"
-        escrow["updated_at"] = _utcnow_iso()
-        escrow["accept_tx"] = result.get("tx")
-        _escrow_save(st_esc)
+        print(f"[DEBUG] Accepting escrow {escrow_id}")
+        print(f"[DEBUG] Seller keyfile: {seller_keyfile}")
+        print(f"[DEBUG] Escrow PDA: {escrow_pda}")
 
-        return {"ok": True, "tx": result.get("tx"), "escrow_id": escrow_id}
+        try:
+            # Try MPC version (requires Arcium network)
+            print(f"[DEBUG] Attempting MPC accept with computation offset: {computation_offset}")
+            result = ca.escrow_accept_order_mpc(seller_keyfile, escrow_pda, computation_offset)
+            print(f"[DEBUG] MPC result: {result}")
+
+            if not result.get("success"):
+                raise Exception(f"MPC accept failed: {result.get('error')}")
+
+            escrow["status"] = "ACCEPTED"
+            escrow["updated_at"] = _utcnow_iso()
+            escrow["accept_tx"] = result.get("acceptTx")
+            escrow["stake_mpc_tx"] = result.get("stakeTx")
+            _escrow_save(st_esc)
+
+            return {
+                "ok": True,
+                "accept_tx": result.get("acceptTx"),
+                "stake_mpc_tx": result.get("stakeTx"),
+                "escrow_id": escrow_id,
+                "method": "mpc"
+            }
+
+        except Exception as mpc_error:
+            # MPC failed (likely Arcium not available on localnet), fallback to regular accept
+            print(f"[WARN] MPC accept failed, falling back to regular accept: {str(mpc_error)}")
+
+            result = ca.escrow_accept_order(seller_keyfile, escrow_pda)
+            print(f"[DEBUG] Regular accept result: {result}")
+
+            if not result.get("success"):
+                raise Exception(f"Accept failed: {result.get('error')}")
+
+            escrow["status"] = "ACCEPTED"
+            escrow["updated_at"] = _utcnow_iso()
+            escrow["accept_tx"] = result.get("tx")
+            _escrow_save(st_esc)
+
+            return {
+                "ok": True,
+                "accept_tx": result.get("tx"),
+                "escrow_id": escrow_id,
+                "method": "regular"
+            }
+
     except Exception as e:
+        import traceback
+        print(f"[ERROR] Escrow accept failed: {str(e)}")
+        print(f"[ERROR] Full traceback:")
+        traceback.print_exc()
         raise HTTPException(500, f"Escrow accept failed: {str(e)}")
 
 @app.post("/escrow/ship")
@@ -2182,7 +2380,10 @@ def escrow_finalize(
         raise HTTPException(400, "Order must be delivered before finalization")
 
     try:
-        result = ca.escrow_finalize_order(escrow_pda)
+        # Use MPC version for fund distribution calculation
+        import time
+        computation_offset = int(time.time() * 1000)
+        result = ca.escrow_finalize_order_mpc(escrow_pda, computation_offset)
         if not result.get("success"):
             error_msg = result.get('error', 'Unknown error')
             if "DeadlineNotReached" in error_msg:
@@ -2220,10 +2421,16 @@ def escrow_finalize(
 
         escrow["status"] = "COMPLETED"
         escrow["updated_at"] = _utcnow_iso()
-        escrow["finalize_tx"] = result.get("tx")
+        escrow["finalize_tx"] = result.get("finalizeTx")
+        escrow["distribution_mpc_tx"] = result.get("distributionTx")  # Store MPC computation TX
         _escrow_save(st_esc)
 
-        return {"ok": True, "tx": result.get("tx"), "escrow_id": escrow_id}
+        return {
+            "ok": True,
+            "finalize_tx": result.get("finalizeTx"),
+            "distribution_mpc_tx": result.get("distributionTx"),
+            "escrow_id": escrow_id
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -3499,3 +3706,42 @@ def get_escrow_status():
             "error": str(e),
             "program_id": ca.ESCROW_PROGRAM_ID,
         }
+
+@app.get("/keypairs")
+def get_keypairs():
+    """Load and return public keys and secret keys for userA, userB, userC"""
+    keys_dir = Path(__file__).parent.parent.parent / "keys"
+    result = {}
+
+    for user in ["userA", "userB", "userC"]:
+        key_file = str(keys_dir / f"{user}.json")
+        if os.path.exists(key_file):
+            pub = get_pubkey_from_keypair(key_file)
+            if pub:
+                with open(key_file, "r") as f:
+                    secret_key = json.load(f)
+                result[user] = {
+                    "publicKey": pub,
+                    "secretKey": secret_key
+                }
+
+    return result
+
+@app.get("/list-keypairs")
+def list_keypairs():
+    """List all available keypair files in the keys directory"""
+    keys_dir = Path(__file__).parent.parent.parent / "keys"
+    keypairs = []
+
+    if not keys_dir.exists():
+        return {"keypairs": []}
+
+    for key_file in keys_dir.glob("*.json"):
+        pub = get_pubkey_from_keypair(str(key_file))
+        if pub:
+            keypairs.append({
+                "filename": key_file.name,
+                "public_key": pub
+            })
+
+    return {"keypairs": keypairs}

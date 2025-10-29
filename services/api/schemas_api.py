@@ -79,10 +79,16 @@ class ListNotesRes(Ok):
 class ConvertReq(_DecimalAsStr):
     sender_keyfile: str = Field(..., description="Keyfile of the cSOL owner.")
     amount_sol: condecimal(gt=0) = Field(..., description="Amount to convert (SOL).")
-    n_outputs: conint(ge=1) = Field(3, description="Number of stealth outputs to self.")
+    cluster: str = Field(default="localnet", description="Solana cluster: localnet/devnet/mainnet-beta")
 
 class ConvertRes(Ok):
-    outputs: List[dict]
+    tx_signature_transfer: str = Field(..., description="Transaction signature for cSOL confidential transfer to wrapper")
+    tx_signature_deposit: str = Field(..., description="Transaction signature for note creation")
+    secret: str = Field(..., description="Secret for new note (hex)")
+    nullifier: str = Field(..., description="Nullifier for new note (hex)")
+    commitment: str = Field(..., description="Commitment for new note (hex)")
+    leaf_index: int = Field(..., description="Index of new note in Merkle tree")
+    amount_sol: str = Field(..., description="Amount in the new note (SOL)")
 
 class CsolToNoteReq(_DecimalAsStr):
     """

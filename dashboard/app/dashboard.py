@@ -276,10 +276,10 @@ def _escrow_action_buttons_buyer(row: Dict[str, Any], actor: str) -> None:
                 if st.button(" Release Funds Now", key=f"esc_early_{eid}", type="primary", use_container_width=True):
                     c, r = escrow_buyer_release_early(eid, actor)
                     if c == 200:
-                        st.toast(" Funds released to seller!", icon="")
+                        st.toast("✅ Funds released to seller!", icon="✅")
                     else:
                         error_msg = r.get("detail", str(r)) if isinstance(r, dict) else str(r)
-                        st.toast(f"Failed: {error_msg}", icon="")
+                        st.toast(f"❌ Failed: {error_msg}", icon="❌")
                     safe_rerun()
 
             with col2:
@@ -287,10 +287,10 @@ def _escrow_action_buttons_buyer(row: Dict[str, Any], actor: str) -> None:
                     if st.button("Finalize (7d passed)", key=f"esc_fin_{eid}", use_container_width=True):
                         c, r = escrow_finalize_order(eid)
                         if c == 200:
-                            st.toast("Order finalized ")
+                            st.toast("✅ Order finalized!", icon="✅")
                         else:
                             error_msg = r.get("detail", str(r)) if isinstance(r, dict) else str(r)
-                            st.toast(f"Failed: {error_msg}", icon="")
+                            st.toast(f"❌ Failed: {error_msg}", icon="❌")
                         safe_rerun()
                 else:
                     st.button("Finalize (7d passed)", key=f"esc_fin_{eid}", disabled=True, use_container_width=True)
@@ -365,10 +365,10 @@ def _escrow_action_buttons_seller(row: Dict[str, Any], actor: str) -> None:
             if st.button("Finalize Now", key=f"esc_fin_{eid}", use_container_width=True):
                 c, r = escrow_finalize_order(eid)
                 if c == 200:
-                    st.toast("Order finalized ")
+                    st.toast("✅ Order finalized!", icon="✅")
                 else:
                     error_msg = r.get("detail", str(r)) if isinstance(r, dict) else str(r)
-                    st.toast(f"Failed: {error_msg}", icon="")
+                    st.toast(f"❌ Failed: {error_msg}", icon="❌")
                 safe_rerun()
         elif status == "COMPLETED":
             st.success("Order completed ")
@@ -451,7 +451,8 @@ def api_get(path: str, **params) -> Tuple[int, dict]:
 def api_post(path: str, payload: dict) -> Tuple[int, dict]:
     headers = {"content-type": "application/json"}
     try:
-        r = requests.post(f"{API_URL}{path}", json=payload, headers=headers, timeout=30)
+        # Increased timeout for blockchain transactions (deposit, escrow, etc.)
+        r = requests.post(f"{API_URL}{path}", json=payload, headers=headers, timeout=120)
         try:
             body = r.json()
         except Exception:
@@ -680,6 +681,16 @@ def available_wrapper_for(pub: str) -> Optional[Decimal]:
     return _fallback_available_from_state(pub)
 
 
+@st.cache_data(ttl=10)
+def get_my_listings(seller_pub: str):
+    """Cached call to get seller's listings"""
+    return api_get("/listings", seller_pub=seller_pub, mine="true")
+
+@st.cache_data(ttl=10)
+def get_all_listings():
+    """Cached call to get all active listings"""
+    return api_get("/listings")
+
 @st.cache_data(ttl=15)
 def get_stealth(owner_pub: str, include_balances: bool = True, min_sol: float = 0.01) -> dict:
     c, d = api_get(
@@ -786,6 +797,130 @@ def _hkdf_msg_key(shared: bytes) -> bytes:
     prk = hashlib.sha256(shared + b"|incognito-msg").digest()
     return hashlib.sha256(prk + info).digest()
 
+def get_unique_conversations(active_pub: str, active_key: str) -> List[Dict[str, Any]]:
+    """
+    Get list of unique conversations from inbox + sent messages.
+    Returns list of {username, pubkey, unread_count, last_ts, last_message_preview}
+    """
+    conversations = {}
+
+    # Get inbox messages
+    inbox_code, inbox_data = messages_inbox(active_pub, active_key)
+    if inbox_code == 200:
+        for msg in inbox_data.get("items", []):
+            peer_pub = msg.get("from_pub")
+            if peer_pub and peer_pub != active_pub:
+                if peer_pub not in conversations:
+                    username = resolve_username_for(peer_pub)
+                    if username:
+                        conversations[peer_pub] = {
+                            "username": username,
+                            "pubkey": peer_pub,
+                            "unread_count": 0,
+                            "last_ts": msg.get("ts", ""),
+                            "last_message_preview": ""
+                        }
+
+                # Update last message and unread count
+                if peer_pub in conversations:
+                    conversations[peer_pub]["unread_count"] += 1
+                    if msg.get("ts", "") > conversations[peer_pub]["last_ts"]:
+                        conversations[peer_pub]["last_ts"] = msg.get("ts", "")
+                        try:
+                            preview = decrypt_message_item_with_keyfile(msg, active_key)
+                            conversations[peer_pub]["last_message_preview"] = preview[:50] + "..." if len(preview) > 50 else preview
+                        except:
+                            conversations[peer_pub]["last_message_preview"] = "[encrypted]"
+
+    # Get sent messages
+    sent_code, sent_data = messages_sent(active_pub, active_key)
+    if sent_code == 200:
+        for msg in sent_data.get("items", []):
+            peer_pub = msg.get("to_pub")
+            if peer_pub and peer_pub != active_pub:
+                if peer_pub not in conversations:
+                    username = resolve_username_for(peer_pub)
+                    if username:
+                        conversations[peer_pub] = {
+                            "username": username,
+                            "pubkey": peer_pub,
+                            "unread_count": 0,
+                            "last_ts": msg.get("ts", ""),
+                            "last_message_preview": ""
+                        }
+
+                # Update last message (sent messages don't count as unread)
+                if peer_pub in conversations:
+                    if msg.get("ts", "") > conversations[peer_pub]["last_ts"]:
+                        conversations[peer_pub]["last_ts"] = msg.get("ts", "")
+                        try:
+                            preview = decrypt_message_item_with_keyfile(msg, active_key)
+                            conversations[peer_pub]["last_message_preview"] = "You: " + (preview[:50] + "..." if len(preview) > 50 else preview)
+                        except:
+                            conversations[peer_pub]["last_message_preview"] = "You: [message]"
+
+    # Sort by most recent
+    result = list(conversations.values())
+    result.sort(key=lambda x: x["last_ts"], reverse=True)
+    return result
+
+
+def get_conversation_messages(active_pub: str, active_key: str, peer_username: str) -> List[Dict[str, Any]]:
+    """
+    Get all messages (inbox + sent) with a specific user, sorted chronologically.
+    Returns list of {text, from_me, ts, raw}
+    """
+    peer_pub = resolve_pub_for_username(peer_username)
+    if not peer_pub:
+        return []
+
+    all_messages = []
+
+    # Get received messages from this peer
+    inbox_code, inbox_data = messages_inbox(active_pub, active_key, peer_pub=peer_pub)
+    if inbox_code == 200:
+        for msg in inbox_data.get("items", []):
+            try:
+                text = decrypt_message_item_with_keyfile(msg, active_key)
+                all_messages.append({
+                    "text": text,
+                    "from_me": False,
+                    "ts": msg.get("ts", ""),
+                    "raw": msg
+                })
+            except Exception as e:
+                all_messages.append({
+                    "text": f"[Failed to decrypt: {e}]",
+                    "from_me": False,
+                    "ts": msg.get("ts", ""),
+                    "raw": msg
+                })
+
+    # Get sent messages to this peer
+    sent_code, sent_data = messages_sent(active_pub, active_key, peer_pub=peer_pub)
+    if sent_code == 200:
+        for msg in sent_data.get("items", []):
+            try:
+                text = decrypt_message_item_with_keyfile(msg, active_key)
+                all_messages.append({
+                    "text": text,
+                    "from_me": True,
+                    "ts": msg.get("ts", ""),
+                    "raw": msg
+                })
+            except Exception as e:
+                all_messages.append({
+                    "text": f"[Failed to decrypt: {e}]",
+                    "from_me": True,
+                    "ts": msg.get("ts", ""),
+                    "raw": msg
+                })
+
+    # Sort by timestamp
+    all_messages.sort(key=lambda x: x["ts"])
+    return all_messages
+
+
 def decrypt_message_item_with_keyfile(msg: dict, keyfile_path: str) -> str:
     """
     msg: item from /messages/inbox or /messages/sent
@@ -863,6 +998,74 @@ if not st.session_state["active_pub"]:
 active_key = st.session_state["active_keyfile"]
 active_pub = st.session_state["active_pub"]
 
+# ============================================================
+# PROFILE GATEKEEPER - Must create profile before using app
+# ============================================================
+has_profile = profile_exists_for_pub(active_pub)
+
+if not has_profile:
+    st.title("🔒 Welcome to Incognito Protocol")
+    st.markdown("""
+    ### Create Your Profile
+
+    Before you can use the marketplace and messaging, you need to create a profile.
+
+    **Benefits:**
+    - ✅ Buy and sell items securely
+    - ✅ Send end-to-end encrypted messages
+    - ✅ Build your reputation score
+    - ✅ Connect with other users
+    """)
+
+    st.divider()
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        username_input = st.text_input(
+            "Choose a username",
+            help="3-20 characters: lowercase letters, numbers, and underscores only",
+            placeholder="username123"
+        )
+
+        if username_input:
+            normalized = normalize_username(username_input)
+            if USERNAME_RE.match(normalized):
+                st.success(f"✓ Username available: @{normalized}")
+            else:
+                st.error("❌ Invalid username. Use 3-20 characters (a-z, 0-9, _)")
+
+    with col2:
+        st.info(f"**Your address:**\n\n`{active_pub[:16]}...`")
+
+    st.divider()
+
+    if st.button("🚀 Create Profile", type="primary", use_container_width=True, disabled=not username_input):
+        normalized = normalize_username(username_input)
+        if not USERNAME_RE.match(normalized):
+            st.error("Invalid username format")
+        else:
+            with st.spinner("Creating profile..."):
+                code, res = profiles_reveal(
+                    username=normalized,
+                    pubs=[active_pub],
+                    meta={"created_at": datetime.now().isoformat()},
+                    user_keyfile=active_key
+                )
+
+                if code == 200:
+                    st.success(f"✅ Profile created successfully! Welcome, @{normalized}")
+                    st.info("👉 Please refresh the page to access the full dashboard")
+                    # Clear the cache so profile check works on rerun
+                    profile_exists_for_pub.clear()
+                    resolve_username_for.clear()
+                else:
+                    st.error(f"❌ Failed to create profile: {res}")
+
+    st.stop()  # Don't show rest of dashboard until profile is created
+
+# ============================================================
+
 st.markdown(f"### Active user: {os.path.basename(active_key)} · **{active_pub}**")
 bal = get_sol_balance(active_pub)
 text = "•••" if st.session_state["blur_amounts"] and bal is not None else (fmt_amt(bal) if bal is not None else "n/a")
@@ -870,21 +1073,40 @@ st.metric("SOL balance", text)
 
 st.divider()
 
-tab_deposit, tab_withdraw, tab_convert, tab_stealthsweep, tab_listings, tab_orders, tab_profile, tab_profiles_lookup, tab_messages = st.tabs(
-    [
-        "Deposit",
-        "Withdraw",
-        "Convert",
-        "Stealth & Sweep",
-        "Listings",
-        "Orders / Shipping",
-        "My Profile",
-        "Lookup Profiles",
-        "Messages",
-    ]
-)
+# Use custom tabs with session state to preserve active tab across reruns
+if 'active_tab' not in st.session_state:
+    st.session_state['active_tab'] = 0  # Default to first tab
 
-with tab_deposit:
+tab_names = [
+    "Deposit",
+    "Withdraw",
+    "Convert",
+    "Stealth & Sweep",
+    "Listings",
+    "Orders / Shipping",
+    "My Profile",
+    "Messages",
+]
+
+# Create tab buttons
+cols = st.columns(len(tab_names))
+for idx, (col, tab_name) in enumerate(zip(cols, tab_names)):
+    with col:
+        if st.button(
+            tab_name,
+            key=f"tab_btn_{idx}",
+            type="primary" if st.session_state['active_tab'] == idx else "secondary",
+            use_container_width=True
+        ):
+            st.session_state['active_tab'] = idx
+            st.rerun()
+
+st.divider()
+
+# Get active tab name
+active_tab = tab_names[st.session_state['active_tab']]
+
+if active_tab == "Deposit":
     st.subheader("Shielded Deposit → Note to self + Pool/Stealth splits")
     st.caption(f"Recipient is locked to active user: **{short(active_pub, 8)}**")
 
@@ -975,7 +1197,7 @@ with tab_deposit:
             flash("Deposit failed ", "error")
             st.error(res)
 
-with tab_withdraw:
+elif active_tab == "Withdraw":
     st.subheader("Withdraw (from Privacy Pool → you)")
 
     st.info(" Select or upload your credential file to withdraw funds")
@@ -1168,36 +1390,38 @@ with tab_withdraw:
                     flash("Withdraw failed ", "error")
                     st.error(res)
 
-with tab_convert:
-    st.subheader("Convert cSOL → SOL (to self stealth)")
-    st.caption("Note: burning on convert is disabled on the server.")
+elif active_tab == "Convert":
+    st.subheader("Convert cSOL → Privacy Note")
+    st.caption("Convert your cSOL back to a privacy note for withdrawal. Minimum: 0.05 SOL (wrapper deposit fee)")
 
-    amt_c = st.text_input("Amount (cSOL)", value="4", key="convert_amt")
-    nout_c = st.number_input(
-        "Number of stealth outputs",
-        value=3,
-        min_value=1,
-        step=1,
-        key="convert_n",
+    amt_c = st.number_input(
+        "Amount (SOL)",
+        value=1.0,
+        min_value=0.06,
+        step=0.1,
+        key="convert_amt",
+        help="Amount must be greater than 0.05 SOL to cover wrapper deposit fee"
     )
 
-    if st.button("Convert", type="primary"):
-        prev_sol = get_sol_balance(active_pub)
-        prev_stealth = _read_stealth_total(active_pub)
+    if st.button("Convert cSOL to Privacy Note", type="primary", use_container_width=True):
+        payload = {"sender_keyfile": active_key, "amount_sol": float(amt_c)}
 
-        payload = {"sender_keyfile": active_key, "amount_sol": amt_c.strip(), "n_outputs": int(nout_c)}
-
-        flash("Submitting convert…")
-        with st.spinner("Sending convert…"):
+        flash("Converting cSOL to privacy note…")
+        with st.spinner("Processing conversion…"):
             c, res = api_post("/convert", payload)
             if c == 200:
-                st.success("Convert confirmed ")
-                wait_for_state_update(active_pub, prev_sol, prev_stealth)
+                st.success(f"✅ Converted {amt_c} cSOL to privacy note!", icon="✅")
+                st.info("💡 Your note has been created. You can now withdraw SOL using the note.")
+                time.sleep(1)
+                safe_rerun()
             else:
-                flash("Convert failed ", "error")
-                st.error(res)
+                error_msg = res.get("detail", str(res)) if isinstance(res, dict) else str(res)
+                st.toast(f"❌ Convert failed: {error_msg}", icon="❌")
+                st.error(error_msg)
+                if "insufficient" in error_msg.lower() or "balance" in error_msg.lower():
+                    st.warning("💡 Tip: You may not have enough cSOL balance. Try applying your pending balance first or use a smaller amount.")
 
-with tab_stealthsweep:
+elif active_tab == "Stealth & Sweep":
     st.subheader(f"Stealth addresses & Sweep (≥ {MIN_STEALTH_SOL} SOL)")
 
     stealth_data = get_stealth(active_pub, True, MIN_STEALTH_SOL)
@@ -1325,59 +1549,78 @@ with tab_stealthsweep:
     else:
         st.warning("Stealth info not available from API.")
 
-with tab_listings:
+elif active_tab == "Listings":
     st.subheader("Marketplace Listings")
 
-    with st.expander("Create a new listing", expanded=True):
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            title_new = st.text_input("Title", value="My awesome item")
-            desc_new = st.text_area("Description", value="", height=100)
-        with c2:
-            qty_new = st.number_input("Quantity", min_value=0, value=1, step=1)
-            price_new = st.text_input("Unit price (SOL)", value="0.50")
+    # Add "Sell an Item" button at the top
+    col1, col2 = st.columns([6, 1])
+    with col2:
+        if st.button("📦 Sell an Item", type="primary", use_container_width=True):
+            st.session_state['show_create_listing'] = True
 
-        imgs = st.file_uploader("Images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-        urls_text = st.text_area("Or paste image URIs (ipfs://… or https://…) one per line", value="")
+    # Show create listing form if button clicked
+    if st.session_state.get('show_create_listing', False):
+        with st.expander("✨ Create a New Listing", expanded=True):
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                title_new = st.text_input("Title", value="", placeholder="e.g., Limited Edition Sneakers")
+                desc_new = st.text_area("Description", value="", height=100, placeholder="Describe your item...")
+            with c2:
+                qty_new = st.number_input("Quantity", min_value=1, value=1, step=1)
+                price_new = st.text_input("Unit price (SOL)", value="", placeholder="e.g., 2.5")
 
-        if st.button("Create listing", type="primary"):
-            if not title_new.strip():
-                st.error("Title is required.")
-            else:
-                files: List[Tuple[str, tuple]] = []
-                for f in imgs or []:
-                    try:
-                        content = f.getvalue()
-                        mime = "image/png" if f.name.lower().endswith(".png") else "image/jpeg"
-                        files.append(("images", (f.name, content, mime)))
-                    except Exception:
-                        pass
+            imgs = st.file_uploader("Images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+            urls_text = st.text_area("Or paste image URIs (ipfs://… or https://…) one per line", value="")
 
-                extra_uris = [u.strip() for u in urls_text.splitlines() if u.strip()]
-
-                form = {
-                    "seller_keyfile": active_key,
-                    "title": title_new.strip(),
-                    "description": desc_new.strip(),
-                    "unit_price_sol": price_new.strip(),
-                    "quantity": str(int(qty_new)),
-                    "image_uris": json.dumps(extra_uris) if extra_uris else "",
-                }
-
-                flash("Submitting create…")
-                with st.spinner("Creating listing…"):
-                    code_c, res_c = api_post_files("/listings", form, files)
-                    if code_c == 200:
-                        st.success("Listing created ")
-                        safe_rerun()
+            col_create, col_cancel = st.columns([1, 1])
+            with col_create:
+                if st.button("Create Listing", type="primary", use_container_width=True):
+                    if not title_new.strip():
+                        st.error("Title is required.")
+                    elif not price_new.strip():
+                        st.error("Price is required.")
                     else:
-                        flash("Create failed ", "error")
-                        st.error(res_c)
+                        files: List[Tuple[str, tuple]] = []
+                        for f in imgs or []:
+                            try:
+                                content = f.getvalue()
+                                mime = "image/png" if f.name.lower().endswith(".png") else "image/jpeg"
+                                files.append(("images", (f.name, content, mime)))
+                            except Exception:
+                                pass
 
-    st.divider()
+                        extra_uris = [u.strip() for u in urls_text.splitlines() if u.strip()]
 
-    st.markdown("### My listings")
-    code_mine, data_mine = api_get("/listings", seller_pub=active_pub, mine="true")
+                        form = {
+                            "seller_keyfile": active_key,
+                            "title": title_new.strip(),
+                            "description": desc_new.strip(),
+                            "unit_price_sol": price_new.strip(),
+                            "quantity": str(int(qty_new)),
+                            "image_uris": json.dumps(extra_uris) if extra_uris else "",
+                        }
+
+                        flash("Submitting create…")
+                        with st.spinner("Creating listing…"):
+                            code_c, res_c = api_post_files("/listings", form, files)
+                            if code_c == 200:
+                                st.success("✅ Listing created successfully!")
+                                st.session_state['show_create_listing'] = False
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                flash("Create failed ", "error")
+                                st.error(res_c)
+
+            with col_cancel:
+                if st.button("Cancel", use_container_width=True):
+                    st.session_state['show_create_listing'] = False
+                    st.rerun()
+
+        st.divider()
+
+    st.markdown("### My Listings")
+    code_mine, data_mine = get_my_listings(active_pub)
     if code_mine != 200:
         st.error(data_mine)
     else:
@@ -1460,137 +1703,168 @@ with tab_listings:
 
     st.divider()
 
-    st.markdown("### Active listings")
-    code_l, data_l = api_get("/listings")
+    st.markdown("### 🛍️ Browse Marketplace")
+    code_l, data_l = get_all_listings()
     if code_l != 200:
         st.error(data_l)
     else:
         items = data_l.get("items", []) if isinstance(data_l, dict) else []
         if not items:
-            st.info("No listings available.")
+            st.info("No listings available yet. Be the first to sell!")
         else:
+            # Fetch notes once for all listings (performance optimization)
+            notes_code, notes_data = api_get(f"/notes/{active_pub}")
+            has_notes = notes_code == 200 and notes_data.get("notes")
+            notes_balance_sol = float(notes_data.get("total_balance", 0)) if has_notes else 0
+
             for it in items:
                 with st.container(border=True):
-                    cols = st.columns([4, 2, 3, 2, 2])
+                    cols = st.columns([3, 2, 2, 1, 1])  # Simplified columns
+
+                    listing_id = it.get('id')
+                    _seller_pub = it.get("seller_pub", "")
+                    _seller_name = resolve_username_for(_seller_pub)
+                    is_own_listing = _seller_pub == active_pub
 
                     with cols[0]:
-                        st.markdown(f"**{it.get('title') or it.get('id')}**")
-                        st.caption(f"ID: {it.get('id')}")
-                        st.caption(it.get("description") or "")
+                        st.markdown(f"**{it.get('title') or listing_id}**")
+                        st.caption(it.get("description") or "No description")
                         imgs = it.get("images") or []
                         thumbs = [ipfs_to_http(u) for u in imgs[:3]]
                         if thumbs:
-                            st.image(thumbs, caption=[""] * len(thumbs), width=120)
+                            st.image(thumbs, caption=[""] * len(thumbs), width=150)
 
                     with cols[1]:
-                        st.metric("Unit price (SOL)", fmt_amt(it.get("unit_price_sol", "0")))
+                        st.metric("Price", f"{fmt_amt(it.get('unit_price_sol', '0'))} SOL")
+                        st.caption(f"Qty: {it.get('quantity', 0)}")
 
                     with cols[2]:
                         st.caption("Seller")
-                        _seller_pub = it.get("seller_pub", "")
-                        _seller_name = resolve_username_for(_seller_pub)
-                        st.write(f"@{_seller_name}" if _seller_name else short(_seller_pub, 8))
+                        st.write(f"**@{_seller_name}**" if _seller_name else short(_seller_pub, 8))
+
+                        # Contact Seller button
+                        if _seller_name and not is_own_listing:
+                            if st.button("💬 Contact", key=f"contact_{listing_id}", use_container_width=True):
+                                st.session_state['active_tab'] = 7
+                                st.session_state['selected_conversation'] = _seller_name
+                                st.session_state['switch_to_messages'] = True
+                                st.rerun()
 
                     with cols[3]:
-                        qty_to_buy = st.number_input(
-                            "Qty",
-                            min_value=1,
-                            value=1,
-                            step=1,
-                            key=f"qtybuy_{it['id']}",
-                        )
-
-                        st.caption("Shipping (optional)")
-                        use_encrypted = st.checkbox(
-                            "Encrypt shipping for seller only",
-                            value=True,
-                            key=f"encship_{it['id']}",
-                            help="Encrypts your shipping info using the seller's pubkey. Only the seller can decrypt.",
-                        )
-                        name_v = st.text_input("Name", key=f"ship_name_{it['id']}", value="Alice")
-                        addr_v = st.text_input("Address", key=f"ship_addr_{it['id']}", value="1 Privacy St")
-                        city_v = st.text_input("City", key=f"ship_city_{it['id']}", value="Paris")
-                        zip_v = st.text_input("ZIP/Postal", key=f"ship_zip_{it['id']}", value="75001")
-                        country_v = st.text_input("Country", key=f"ship_country_{it['id']}", value="FR")
-                        phone_v = st.text_input("Phone", key=f"ship_phone_{it['id']}", value="+33 1 23 45 67 89")
-
-                    with cols[4]:
-                        st.caption("Payment Method")
-
-                        notes_code, notes_data = api_get(f"/notes/{active_pub}")
-                        has_notes = notes_code == 200 and notes_data.get("notes")
-
-                        listing_price = float(it.get("unit_price_sol", 0)) * qty_to_buy
-
-
-                        st.info(" Payment: cSOL (if available) or Notes")
-
-                        if has_notes:
-                            notes_balance_sol = float(notes_data.get("total_balance", 0))
-                            st.info(f" Notes available: {notes_balance_sol:.4f} SOL")
-
-                        payment_method = "Auto (cSOL first, then notes)"
-                        selected_note = None
-
-                        if has_notes:
-                            use_note = st.checkbox(
-                                "Pay with specific note",
-                                value=False,
-                                key=f"use_note_{it.get('id')}",
-                                help="If unchecked, will try cSOL first, then automatically use notes if needed"
+                        if is_own_listing:
+                            st.info("Your listing")
+                        else:
+                            qty_to_buy = st.number_input(
+                                "Quantity",
+                                min_value=1,
+                                value=1,
+                                step=1,
+                                key=f"qtybuy_{listing_id}",
                             )
 
-                            if use_note:
-                                available_notes = notes_data["notes"]
-                                note_options = []
-                                for i, note in enumerate(available_notes):
-                                    amount = float(note["amount_sol"])
-                                    note_options.append(f"Note {i+1}: {amount:.4f} SOL")
+                    with cols[4]:
+                        if not is_own_listing:
+                            # Buy button triggers purchase modal
+                            if st.button("🛒 Buy", key=f"buy_{listing_id}", type="primary", use_container_width=True):
+                                st.session_state[f'show_buy_modal_{listing_id}'] = True
+                                st.rerun()
 
-                                selected_note_idx = st.selectbox(
-                                    "Choose note",
-                                    range(len(note_options)),
-                                    format_func=lambda x: note_options[x],
-                                    key=f"note_select_{it.get('id')}"
+                    # Show purchase modal if Buy button clicked
+                    if st.session_state.get(f'show_buy_modal_{listing_id}', False):
+                        st.markdown("---")
+                        st.markdown("### 💳 Complete Your Purchase")
+
+                        with st.form(f"purchase_form_{listing_id}"):
+                            st.markdown(f"**Item:** {it.get('title')}")
+                            qty_to_buy = st.session_state.get(f"qtybuy_{listing_id}", 1)
+                            listing_price = float(it.get("unit_price_sol", 0)) * qty_to_buy
+                            st.markdown(f"**Total:** {listing_price:.4f} SOL")
+
+                            st.markdown("#### 📦 Shipping Information")
+                            use_encrypted = st.checkbox(
+                                "🔒 Encrypt shipping info (recommended)",
+                                value=True,
+                                help="Only the seller can decrypt your address"
+                            )
+                            name_v = st.text_input("Name", placeholder="John Doe")
+                            addr_v = st.text_input("Address", placeholder="123 Main St")
+                            city_v = st.text_input("City", placeholder="New York")
+                            zip_v = st.text_input("ZIP/Postal", placeholder="10001")
+                            country_v = st.text_input("Country", placeholder="USA")
+                            phone_v = st.text_input("Phone (optional)", placeholder="+1 234 567 8900")
+
+                            st.markdown("#### 💰 Payment Method")
+                            payment_method = "Auto (cSOL first, then notes)"
+                            selected_note = None
+
+                            if has_notes:
+                                st.info(f"📝 Notes available: {notes_balance_sol:.4f} SOL")
+                                use_note = st.checkbox(
+                                    "Pay with specific privacy note",
+                                    value=False,
+                                    help="For maximum privacy, use a privacy note"
                                 )
 
-                                selected_note = available_notes[selected_note_idx]
-                                note_amount = float(selected_note["amount_sol"])
+                                if use_note:
+                                    available_notes = notes_data["notes"]
+                                    note_options = []
+                                    for i, note in enumerate(available_notes):
+                                        amount = float(note["amount_sol"])
+                                        note_options.append(f"Note {i+1}: {amount:.4f} SOL")
 
-                                if note_amount < listing_price:
-                                    st.error(f" Insufficient: Note has {note_amount:.4f} SOL, need {listing_price:.4f} SOL")
+                                    selected_note_idx = st.selectbox(
+                                        "Choose note",
+                                        range(len(note_options)),
+                                        format_func=lambda x: note_options[x],
+                                    )
+
+                                    selected_note = available_notes[selected_note_idx]
+                                    note_amount = float(selected_note["amount_sol"])
+
+                                    if note_amount < listing_price:
+                                        st.error(f"⚠️ Insufficient: Note has {note_amount:.4f} SOL, need {listing_price:.4f} SOL")
+                                    else:
+                                        change = note_amount - listing_price
+                                        if change > 0:
+                                            st.success(f"✅ Change: {change:.4f} SOL (new note will be created)")
+                                        payment_method = "Notes"
+
+                            col_submit, col_cancel = st.columns([1, 1])
+                            with col_submit:
+                                submit_purchase = st.form_submit_button("✅ Confirm Purchase", type="primary", use_container_width=True)
+                            with col_cancel:
+                                cancel_purchase = st.form_submit_button("Cancel", use_container_width=True)
+
+                            if cancel_purchase:
+                                st.session_state[f'show_buy_modal_{listing_id}'] = False
+                                st.rerun()
+
+                            if submit_purchase:
+                                prev_sol = get_sol_balance(active_pub)
+                                prev_stealth = _read_stealth_total(active_pub)
+
+                                payload: Dict[str, Any] = {
+                                    "buyer_keyfile": active_key,
+                                    "listing_id": str(listing_id),
+                                    "quantity": int(qty_to_buy),
+                                }
+
+                                if selected_note:
+                                    note_amount = float(selected_note["amount_sol"])
+                                    payload.update({
+                                        "secret": selected_note["secret"],
+                                        "nullifier": selected_note["nullifier"],
+                                        "commitment": selected_note["commitment"],
+                                        "leaf_index": int(selected_note["leaf_index"]),
+                                        "deposited_amount_sol": note_amount,
+                                    })
                                 else:
-                                    change = note_amount - listing_price
-                                    if change > 0:
-                                        st.success(f" Change: {change:.4f} SOL (new note will be created)")
-                                    payment_method = "Notes"
-
-                        if st.button("Buy", key=f"buy_{it.get('id')}"):
-                            prev_sol = get_sol_balance(active_pub)
-                            prev_stealth = _read_stealth_total(active_pub)
-
-                            payload: Dict[str, Any] = {
-                                "buyer_keyfile": active_key,
-                                "listing_id": str(it.get("id")),
-                                "quantity": int(qty_to_buy),
-                            }
-
-                            if selected_note:
-                                note_amount = float(selected_note["amount_sol"])
-                                payload.update({
-                                    "secret": selected_note["secret"],
-                                    "nullifier": selected_note["nullifier"],
-                                    "commitment": selected_note["commitment"],
-                                    "leaf_index": int(selected_note["leaf_index"]),
-                                    "deposited_amount_sol": note_amount,
-                                })
-                            else:
-                                payload.update({
-                                    "secret": "",
-                                    "nullifier": "",
-                                    "commitment": "",
-                                    "leaf_index": 0,
-                                })
+                                    payload.update({
+                                        "secret": "",
+                                        "nullifier": "",
+                                        "commitment": "",
+                                        "leaf_index": 0,
+                                    })
 
                             if use_encrypted:
                                 try:
@@ -1611,20 +1885,23 @@ with tab_listings:
                                 except Exception as e:
                                     st.error(f"Failed to generate encrypted shipping: {e}")
 
-                            flash("Submitting buy…")
-                            with st.spinner("Placing order…"):
-                                c, res = api_post("/marketplace/buy", payload)
-                                if c == 200:
-                                    st.success("Purchase confirmed ")
-                                    if res.get("change_note"):
-                                        change_note = res["change_note"]
-                                        st.info(f" Change note created: {change_note['amount_sol']:.4f} SOL (leaf {change_note['leaf_index']})")
-                                    wait_for_state_update(active_pub, prev_sol, None)
-                                else:
-                                    flash("Purchase failed ", "error")
-                                    st.error(res)
+                                flash("Submitting buy…")
+                                with st.spinner("Placing order…"):
+                                    c, res = api_post("/marketplace/buy", payload)
+                                    if c == 200:
+                                        st.success("✅ Purchase successful!")
+                                        if res.get("change_note"):
+                                            change_note = res["change_note"]
+                                            st.info(f"📝 Change note created: {change_note['amount_sol']:.4f} SOL (leaf {change_note['leaf_index']})")
+                                        wait_for_state_update(active_pub, prev_sol, None)
+                                        st.session_state[f'show_buy_modal_{listing_id}'] = False
+                                        time.sleep(1)
+                                        st.rerun()
+                                    else:
+                                        flash("Purchase failed ", "error")
+                                        st.error(res)
 
-with tab_orders:
+elif active_tab == "Orders / Shipping":
     st.subheader("My Orders / Shipping Info")
     st.caption("Encrypted shipping details sent by buyers for your sold listings.")
 
@@ -1753,7 +2030,7 @@ with tab_orders:
     except Exception as e:
         st.error(f"Failed to fetch escrow merkle status: {e}")
 
-with tab_profile:
+elif active_tab == "My Profile":
     st.subheader("Create or Update My Profile")
     st.caption("Only a unique username and an optional public BIO are allowed.")
 
@@ -1799,126 +2076,162 @@ with tab_profile:
             else:
                 st.error(res)
 
-with tab_profiles_lookup:
-    st.subheader("Lookup Profile by Username")
-    q_raw = st.text_input("Username to resolve", value="alex")
+elif active_tab == "Messages":
+    st.subheader("💬 Messages")
 
-    if st.button("Resolve"):
-        q = normalize_username(q_raw)
-        with st.spinner("Resolving…"):
-            code, res = profiles_resolve(q)
-            if code != 200:
-                st.error(res)
-            else:
-                if not res.get("ok"):
-                    st.warning(f"No profile found for '{q}'.")
-                else:
-                    st.success("Profile found ")
-                    st.markdown("**Profile Blob**")
-                    st.json(res.get("blob"))
-
-                    st.markdown("**Merkle Proof**")
-                    st.write({
-                        "leaf": res.get("leaf"),
-                        "index": res.get("index"),
-                        "root": res.get("root"),
-                        "proof_len": len(res.get("proof") or []),
-                    })
-
-                    verified = None
-                    try:
-                        if verify_merkle:
-                            verified = verify_merkle(res.get("leaf"), res.get("proof") or [], res.get("root"))
-                    except Exception:
-                        verified = None
-
-                    if verified is True:
-                        st.success("Client-side Merkle verification:  valid inclusion")
-                    elif verified is False:
-                        st.error("Client-side Merkle verification:  INVALID")
-                    else:
-                        st.info("Client-side Merkle verification not available.")
-
-with tab_messages:
-    st.subheader("Messages chiffrés end-to-end")
+    # Check if coming from "Contact Seller" button
+    if st.session_state.get('switch_to_messages'):
+        st.success(f"Starting conversation with @{st.session_state.get('message_recipient', 'user')}")
+        del st.session_state['switch_to_messages']
 
     me_has_profile = profile_exists_for_pub(active_pub)
     if not me_has_profile:
-        st.error("Ton profil n'existe pas encore. Publie-le dans l'onglet 'My Profile'.")
+        st.error("Create a profile first in the 'My Profile' tab.")
         st.stop()
 
-    c1, c2 = st.columns([2, 3])
+    # Get all conversations
+    conversations = get_unique_conversations(active_pub, active_key)
 
-    with c1:
-        st.markdown("#### Envoyer un message")
-        recip_username = st.text_input("Destinataire (@username)", value="")
-        memo_opt = st.checkbox(
-            "Attacher un memo on-chain (0 SOL)",
-            value=False,
-            help="Ajoute un memo compact on-chain. Aucun secret en clair n'y figure."
-        )
-        memo_hint = st.text_input("Hint (facultatif, ≤64 chars)", value="") if memo_opt else None
-        text_to_send = st.text_area("Message", height=120, value="")
+    # Initialize selected conversation
+    if 'selected_conversation' not in st.session_state:
+        st.session_state['selected_conversation'] = None
 
-        if st.button("Envoyer", type="primary", use_container_width=True):
-            recip_pub = resolve_pub_for_username(recip_username or "")
-            if not recip_pub:
-                st.error("Profil destinataire introuvable.")
+    # Check if we need to pre-select a conversation (from "Contact Seller")
+    if st.session_state.get('message_recipient'):
+        st.session_state['selected_conversation'] = st.session_state['message_recipient']
+        del st.session_state['message_recipient']
+
+    # Layout: Sidebar (conversations list) + Main (conversation view)
+    col_sidebar, col_main = st.columns([1, 2])
+
+    with col_sidebar:
+        st.markdown("### Conversations")
+
+        # New conversation button
+        if st.button("➕ New Conversation", use_container_width=True):
+            st.session_state['show_new_convo'] = True
+
+        if st.session_state.get('show_new_convo'):
+            with st.form("new_conversation_form"):
+                new_recipient = st.text_input("Recipient username", placeholder="@username")
+                if st.form_submit_button("Start"):
+                    normalized = normalize_username(new_recipient)
+                    if resolve_pub_for_username(normalized):
+                        st.session_state['selected_conversation'] = normalized
+                        st.session_state['show_new_convo'] = False
+                        st.rerun()
+                    else:
+                        st.error("User not found")
+
+        st.divider()
+
+        # Display conversations
+        if not conversations:
+            st.info("No conversations yet")
+        else:
+            for conv in conversations:
+                username = conv['username']
+                unread = conv.get('unread_count', 0)
+                preview = conv.get('last_message_preview', '')
+
+                # Check if this is the selected conversation
+                is_selected = st.session_state.get('selected_conversation') == username
+
+                # Badge for unread messages
+                badge = f" ({unread})" if unread > 0 else ""
+
+                # Button style
+                button_type = "primary" if is_selected else "secondary"
+
+                if st.button(
+                    f"@{username}{badge}",
+                    key=f"conv_{username}",
+                    use_container_width=True,
+                    type=button_type
+                ):
+                    st.session_state['selected_conversation'] = username
+                    st.rerun()
+
+                # Show preview
+                if preview:
+                    st.caption(preview)
+
+    with col_main:
+        selected_user = st.session_state.get('selected_conversation')
+
+        if not selected_user:
+            st.info("👈 Select a conversation or start a new one")
+        else:
+            st.markdown(f"### 💬 Conversation with @{selected_user}")
+            st.caption(f"End-to-end encrypted")
+
+            # Get all messages with this user
+            messages = get_conversation_messages(active_pub, active_key, selected_user)
+
+            # Display messages
+            if not messages:
+                st.info("No messages yet. Start the conversation!")
             else:
-                code, res = messages_send(
-                    active_key,
-                    recip_username,
-                    text_to_send,
-                    attach_memo=memo_opt,
-                    memo_hint=memo_hint
+                for msg in messages:
+                    is_from_me = msg['from_me']
+                    text = msg['text']
+                    ts = msg.get('ts', '')
+
+                    if is_from_me:
+                        # Right-aligned, blue background (your messages)
+                        st.markdown(f"""
+                        <div style='text-align: right; margin: 10px 0;'>
+                            <div style='display: inline-block; background: #0084ff; color: white; padding: 10px 15px; border-radius: 18px; max-width: 70%; text-align: left;'>
+                                {text}
+                            </div>
+                            <div style='font-size: 0.75em; color: #888; margin-top: 4px;'>{ts}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        # Left-aligned, gray background (their messages)
+                        st.markdown(f"""
+                        <div style='text-align: left; margin: 10px 0;'>
+                            <div style='display: inline-block; background: #e4e6eb; color: black; padding: 10px 15px; border-radius: 18px; max-width: 70%; text-align: left;'>
+                                {text}
+                            </div>
+                            <div style='font-size: 0.75em; color: #888; margin-top: 4px;'>{ts}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+            st.divider()
+
+            # Send message input at bottom
+            st.markdown("#### Send Message")
+
+            with st.form(f"send_msg_form_{selected_user}", clear_on_submit=True):
+                new_message = st.text_area(
+                    "Type your message",
+                    height=100,
+                    placeholder="Type a message...",
+                    label_visibility="collapsed"
                 )
-                if code == 200:
-                    st.success("Message envoyé.")
-                else:
-                    st.error(res)
 
-    with c2:
-        st.markdown("#### Boîte de réception")
-        peer_user = st.text_input("Filtrer par @username (optionnel)", value="")
-        peer_pub = resolve_pub_for_username(peer_user) if peer_user.strip() else None
+                col1, col2 = st.columns([3, 1])
 
-        ci, inbox = messages_inbox(active_pub, active_key, peer_pub=peer_pub)
-        if ci != 200:
-            st.error(inbox)
-        else:
-            items = inbox.get("items", [])
-            if not items:
-                st.info("Aucun message reçu.")
-            else:
-                for it in items[:200]:
-                    with st.container(border=True):
-                        top = f"De {short(it['from_pub'], 8)} → {short(it['to_pub'], 8)} · {it['ts']}"
-                        st.caption(top)
-                        try:
-                            preview = decrypt_message_item_with_keyfile(it, active_key)
-                        except Exception as e:
-                            preview = f"[décryptage impossible: {e}]"
-                        st.write(preview)
-                        with st.expander("Raw"):
-                            st.json(it)
+                with col1:
+                    attach_memo = st.checkbox("Attach on-chain memo (optional)", value=False)
 
-        st.markdown("#### Messages envoyés")
-        cs, sent = messages_sent(active_pub, active_key, peer_pub=peer_pub)
-        if cs != 200:
-            st.error(sent)
-        else:
-            items = sent.get("items", [])
-            if not items:
-                st.info("Aucun message envoyé.")
-            else:
-                for it in items[:200]:
-                    with st.container(border=True):
-                        top = f"À {short(it['to_pub'], 8)} · {it['ts']}"
-                        st.caption(top)
-                        try:
-                            preview = decrypt_message_item_with_keyfile(it, active_key)
-                        except Exception as e:
-                            preview = f"[décryptage impossible: {e}]"
-                        st.write(preview)
-                        with st.expander("Raw"):
-                            st.json(it)
+                with col2:
+                    send_button = st.form_submit_button("Send", type="primary", use_container_width=True)
+
+                if send_button and new_message.strip():
+                    with st.spinner("Sending..."):
+                        code, res = messages_send(
+                            active_key,
+                            selected_user,
+                            new_message.strip(),
+                            attach_memo=attach_memo,
+                            memo_hint=None
+                        )
+
+                        if code == 200:
+                            st.success("✅ Message sent!")
+                            time.sleep(0.5)
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Failed to send: {res}")

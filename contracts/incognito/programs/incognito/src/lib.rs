@@ -179,6 +179,7 @@ pub struct InitAddTogetherCompDef<'info> {
     pub payer: Signer<'info>,
     #[account(mut, address = derive_mxe_pda!())]
     pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
     #[account(mut)]
     pub comp_def_account: UncheckedAccount<'info>,
     pub arcium_program: Program<'info, Arcium>,
@@ -192,6 +193,7 @@ pub struct InitDepositShieldedCompDef<'info> {
     pub payer: Signer<'info>,
     #[account(mut, address = derive_mxe_pda!())]
     pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
     #[account(mut)]
     pub comp_def_account: UncheckedAccount<'info>,
     pub arcium_program: Program<'info, Arcium>,
@@ -205,6 +207,7 @@ pub struct InitWithdrawShieldedCompDef<'info> {
     pub payer: Signer<'info>,
     #[account(mut, address = derive_mxe_pda!())]
     pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
     #[account(mut)]
     pub comp_def_account: UncheckedAccount<'info>,
     pub arcium_program: Program<'info, Arcium>,
@@ -218,6 +221,7 @@ pub struct InitDepositNoteCompDef<'info> {
     pub payer: Signer<'info>,
     #[account(mut, address = derive_mxe_pda!())]
     pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
     #[account(mut)]
     pub comp_def_account: UncheckedAccount<'info>,
     pub arcium_program: Program<'info, Arcium>,
@@ -231,6 +235,7 @@ pub struct InitWithdrawNoteCheckCompDef<'info> {
     pub payer: Signer<'info>,
     #[account(mut, address = derive_mxe_pda!())]
     pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: Computation definition account managed by Arcium program
     #[account(mut)]
     pub comp_def_account: UncheckedAccount<'info>,
     pub arcium_program: Program<'info, Arcium>,
@@ -254,10 +259,13 @@ pub struct AddTogether<'info> {
     pub sign_pda_account: Account<'info, SignerAccount>,
     #[account(address = derive_mxe_pda!())]
     pub mxe_account: Account<'info, MXEAccount>,
+    /// CHECK: Mempool account managed by Arcium program
     #[account(mut, address = derive_mempool_pda!())]
     pub mempool_account: UncheckedAccount<'info>,
+    /// CHECK: Execution pool account managed by Arcium program
     #[account(mut, address = derive_execpool_pda!())]
     pub executing_pool: UncheckedAccount<'info>,
+    /// CHECK: Computation account managed by Arcium program
     #[account(mut, address = derive_comp_pda!(computation_offset))]
     pub computation_account: UncheckedAccount<'info>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_ADD_TOGETHER))]
@@ -289,10 +297,13 @@ pub struct DepositShielded<'info> {
     pub sign_pda_account: Account<'info, SignerAccount>,
     #[account(address = derive_mxe_pda!())]
     pub mxe_account: Account<'info, MXEAccount>,
+    /// CHECK: Mempool account managed by Arcium program
     #[account(mut, address = derive_mempool_pda!())]
     pub mempool_account: UncheckedAccount<'info>,
+    /// CHECK: Execution pool account managed by Arcium program
     #[account(mut, address = derive_execpool_pda!())]
     pub executing_pool: UncheckedAccount<'info>,
+    /// CHECK: Computation account managed by Arcium program
     #[account(mut, address = derive_comp_pda!(computation_offset))]
     pub computation_account: UncheckedAccount<'info>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_DEPOSIT_SHIELDED))]
@@ -324,10 +335,13 @@ pub struct WithdrawShielded<'info> {
     pub sign_pda_account: Account<'info, SignerAccount>,
     #[account(address = derive_mxe_pda!())]
     pub mxe_account: Account<'info, MXEAccount>,
+    /// CHECK: Mempool account managed by Arcium program
     #[account(mut, address = derive_mempool_pda!())]
     pub mempool_account: UncheckedAccount<'info>,
+    /// CHECK: Execution pool account managed by Arcium program
     #[account(mut, address = derive_execpool_pda!())]
     pub executing_pool: UncheckedAccount<'info>,
+    /// CHECK: Computation account managed by Arcium program
     #[account(mut, address = derive_comp_pda!(computation_offset))]
     pub computation_account: UncheckedAccount<'info>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_WITHDRAW_SHIELDED))]
@@ -359,10 +373,13 @@ pub struct DepositNote<'info> {
     pub sign_pda_account: Account<'info, SignerAccount>,
     #[account(address = derive_mxe_pda!())]
     pub mxe_account: Account<'info, MXEAccount>,
+    /// CHECK: Mempool account managed by Arcium program
     #[account(mut, address = derive_mempool_pda!())]
     pub mempool_account: UncheckedAccount<'info>,
+    /// CHECK: Execution pool account managed by Arcium program
     #[account(mut, address = derive_execpool_pda!())]
     pub executing_pool: UncheckedAccount<'info>,
+    /// CHECK: Computation account managed by Arcium program
     #[account(mut, address = derive_comp_pda!(computation_offset))]
     pub computation_account: UncheckedAccount<'info>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_DEPOSIT_NOTE))]
@@ -394,10 +411,13 @@ pub struct WithdrawNoteCheck<'info> {
     pub sign_pda_account: Account<'info, SignerAccount>,
     #[account(address = derive_mxe_pda!())]
     pub mxe_account: Account<'info, MXEAccount>,
+    /// CHECK: Mempool account managed by Arcium program
     #[account(mut, address = derive_mempool_pda!())]
     pub mempool_account: UncheckedAccount<'info>,
+    /// CHECK: Execution pool account managed by Arcium program
     #[account(mut, address = derive_execpool_pda!())]
     pub executing_pool: UncheckedAccount<'info>,
+    /// CHECK: Computation account managed by Arcium program
     #[account(mut, address = derive_comp_pda!(computation_offset))]
     pub computation_account: UncheckedAccount<'info>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_WITHDRAW_NOTE_CHECK))]
@@ -418,6 +438,7 @@ pub struct AddTogetherCallback<'info> {
     pub arcium_program: Program<'info, Arcium>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_ADD_TOGETHER))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    /// CHECK: Instructions sysvar account
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
     pub instructions_sysvar: AccountInfo<'info>,
 }
@@ -428,6 +449,7 @@ pub struct DepositShieldedCallback<'info> {
     pub arcium_program: Program<'info, Arcium>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_DEPOSIT_SHIELDED))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    /// CHECK: Instructions sysvar account
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
     pub instructions_sysvar: AccountInfo<'info>,
 }
@@ -438,6 +460,7 @@ pub struct WithdrawShieldedCallback<'info> {
     pub arcium_program: Program<'info, Arcium>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_WITHDRAW_SHIELDED))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    /// CHECK: Instructions sysvar account
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
     pub instructions_sysvar: AccountInfo<'info>,
 }
@@ -448,6 +471,7 @@ pub struct DepositNoteCallback<'info> {
     pub arcium_program: Program<'info, Arcium>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_DEPOSIT_NOTE))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    /// CHECK: Instructions sysvar account
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
     pub instructions_sysvar: AccountInfo<'info>,
 }
@@ -458,6 +482,7 @@ pub struct WithdrawNoteCheckCallback<'info> {
     pub arcium_program: Program<'info, Arcium>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_WITHDRAW_NOTE_CHECK))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    /// CHECK: Instructions sysvar account
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
     pub instructions_sysvar: AccountInfo<'info>,
 }
@@ -524,6 +549,7 @@ pub struct DepositToPool<'info> {
     )]
     pub commitment_marker: Account<'info, CommitmentMarker>,
 
+    /// CHECK: Wrapper stealth address for fee payment (one-time address, no validation needed)
     #[account(mut)]
     pub wrapper_stealth_address: UncheckedAccount<'info>,
 
@@ -565,6 +591,7 @@ pub struct WithdrawFromPool<'info> {
     )]
     pub nullifier_marker: Account<'info, NullifierMarker>,
 
+    /// CHECK: When creating change, must match expected PDA. When not creating change, ignored.
     #[account(mut)]
     pub change_commitment_marker: UncheckedAccount<'info>,
 
