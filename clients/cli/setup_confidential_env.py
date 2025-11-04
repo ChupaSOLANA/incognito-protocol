@@ -4,14 +4,18 @@
 Setup script for arcium-localnet environment:
 
 - Assumes arcium-localnet is already running (with built-in incognito program)
-- (Optionnel) purge du dossier data à la racine du repo
+- ALWAYS purges data directory for a fresh start
+- ALWAYS resets PostgreSQL database (drop and recreate all tables)
+- Generate keypairs and airdrop SOL
 - Initialize incognito pool
-- Setup Token-2022 + CT (mint, wrapper, users with ATAs)
 - Export configuration (PROGRAM_ID from Arcium, paths, etc.)
 
 ⚠️ Does NOT build or deploy - the incognito program is built-in to arcium-localnet.
+⚠️ Token-2022/cSOL support has been removed. Use notes-only system.
+⚠️ DESTRUCTIVE: This script will delete all existing data and database records!
 
-Dépendances CLI : solana, spl-token, npx/ts-node
+Dependencies: solana, npx/tsx
+Optional: PostgreSQL + asyncpg (for database reset functionality)
 """
 
 import os
@@ -25,6 +29,19 @@ import argparse
 import shutil
 import time
 from typing import Optional, List
+
+# Database support (optional - will continue if not available)
+DATABASE_AVAILABLE = False
+try:
+    # Add repo root to path so we can import services.database
+    script_dir = pathlib.Path(__file__).resolve().parent
+    repo_root = script_dir.parent.parent
+    sys.path.insert(0, str(repo_root))
+
+    from services.database.config import init_database, test_connection, config as db_config
+    DATABASE_AVAILABLE = True
+except ImportError:
+    pass
 
 TOKEN_2022_PROGRAM_ID = os.environ.get(
     "TOKEN_2022_PROGRAM_ID",
@@ -80,6 +97,44 @@ def purge_data_dir():
     else:
         data_dir.mkdir(parents=True, exist_ok=True)
         print(f"== Created empty data dir == {data_dir}")
+
+def reset_database():
+    """
+    Reset the PostgreSQL database by dropping and recreating all tables.
+    This will delete all encrypted notes, nullifiers, and audit logs.
+    """
+    if not DATABASE_AVAILABLE:
+        print("== Skipping database reset (database module not available) ==")
+        print("   To enable database support:")
+        print("   1. Install PostgreSQL: brew install postgresql@14")
+        print("   2. Install dependencies: pip install -r requirements-database.txt")
+        print("   3. Set INCOGNITO_MASTER_KEY environment variable")
+        return
+
+    print("== Resetting PostgreSQL database ==")
+
+    # Check if database is accessible
+    try:
+        test_connection()
+        print(f"✓ Connected to database: {db_config.database} at {db_config.host}:{db_config.port}")
+    except Exception as e:
+        print(f"!! WARN: Database not accessible: {e}")
+        print("   Database reset skipped. To enable:")
+        print(f"   1. Ensure PostgreSQL is running")
+        print(f"   2. Create database: createdb -U {db_config.user} {db_config.database}")
+        print(f"   3. Set INCOGNITO_MASTER_KEY environment variable")
+        return
+
+    # Drop and recreate all tables
+    try:
+        print("⚠️  Dropping all existing tables...")
+        init_database(drop_existing=True)
+        print("✓ Database reset complete (all tables dropped and recreated)")
+    except Exception as e:
+        print(f"!! ERROR: Database reset failed: {e}")
+        print("   You may need to manually reset the database:")
+        print(f"   psql -U {db_config.user} -d {db_config.database} -c \"DROP SCHEMA public CASCADE; CREATE SCHEMA public;\"")
+        print(f"   python -m services.database.config init")
 
 def get_current_keypair_path() -> Optional[str]:
     out = run("solana config get")
@@ -524,8 +579,8 @@ def main():
                         help="Only localnet is supported (arcium-localnet)")
     parser.add_argument("--workspace-root", default=None,
                         help="Path to workspace (where Anchor.toml is). Ex: contracts/incognito")
-    parser.add_argument("--skip-token", action="store_true",
-                        help="Skip Token-2022/CT setup")
+    parser.add_argument("--enable-token", action="store_true",
+                        help="[DEPRECATED] Enable Token-2022/CT setup (not recommended)")
     parser.add_argument("--skip-pool", action="store_true",
                         help="Skip pool initialization")
     parser.add_argument("--keys-dir", default=str(DEFAULT_KEYS_DIR),
@@ -534,8 +589,6 @@ def main():
                         help="Comma-separated list of users (e.g., A,B,C)")
     parser.add_argument("--airdrop-sol", type=float, default=DEFAULT_AIRDROP_SOL,
                         help="SOL amount to airdrop to pool + users")
-    parser.add_argument("--purge-data", action="store_true",
-                        help="Purge <repo_root>/data before setup")
     parser.add_argument("--tree-seed-hex", default=os.environ.get("TREE_SEED_HEX", "00"*32),
                         help="Seed (32 bytes hex) for deriving pool PDA. Default: 0x" + "00"*32)
     parser.add_argument("--pool-depth", type=int, default=10,
@@ -571,24 +624,45 @@ def main():
     keys_dir.mkdir(parents=True, exist_ok=True)
     print(f"== Keys dir == {keys_dir}")
 
-    # 3) Optional data purge
-    if args.purge_data:
-        purge_data_dir()
+    # 3) ALWAYS purge data directory for fresh start
+    purge_data_dir()
+    print()
 
-    # 4) Use built-in program ID from arcium-localnet
+    # 4) ALWAYS reset database for fresh start
+    reset_database()
+    print()
+
+    # 5) Use built-in program ID from arcium-localnet
     pid = DEFAULT_PROGRAM_ID
     print(f"== Using built-in incognito program ID: {pid} ==\n")
 
-    # 5) Token-2022 / CT setup
-    if not args.skip_token:
+    # 6) Token-2022 / CT setup (DEPRECATED - skipped by default)
+    if args.enable_token:
         users = [u.strip() for u in args.users.split(",") if u.strip()]
-        print("== Token-2022 / CT setup ==")
+        print("== [DEPRECATED] Token-2022 / CT setup ==")
+        print("⚠️  WARNING: Token-2022/cSOL is deprecated. Use notes-only system instead.")
         setup_token_flow(keys_dir=keys_dir, users=users, airdrop_sol=args.airdrop_sol)
         print()
     else:
-        print("== Skip Token-2022 stage ==\n")
+        # Generate keys and airdrop SOL without Token-2022
+        users = [u.strip() for u in args.users.split(",") if u.strip()]
+        print("== Generating keypairs and airdropping SOL (notes-only mode) ==")
+        wrapper_key = keys_dir / "wrapper.json"
+        users_keys = [keys_dir / f"user{u}.json" for u in users]
 
-    # 6) Initialize pool
+        wrapper_pub = keygen(wrapper_key)
+        users_pubs = [keygen(k) for k in users_keys]
+
+        print("Airdropping SOL...")
+        airdrop(wrapper_pub, args.airdrop_sol * 2)
+        for up in users_pubs:
+            airdrop(up, args.airdrop_sol)
+
+        print(f"✓ Created {len(users)} user keypairs")
+        print(f"✓ Airdropped {args.airdrop_sol} SOL to each user")
+        print()
+
+    # 7) Initialize pool
     authority_keypair_path = detect_provider_wallet_path(workspace_root)
     if not args.skip_pool:
         init_pool_success = init_incognito_pool(workspace_root, authority_keypair_path, args.pool_depth)
@@ -604,7 +678,7 @@ def main():
     else:
         print("== Skip pool initialization ==\n")
 
-    # 7) Export configuration
+    # 8) Export configuration
     cfg_path = write_deploy_config(workspace_root, pid, tree_seed_hex, authority_keypair_path)
     env_path = write_env_file(workspace_root, pid, tree_seed_hex, authority_keypair_path)
 

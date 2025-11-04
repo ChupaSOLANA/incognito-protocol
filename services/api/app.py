@@ -17,8 +17,13 @@ from typing import Any, Dict, List, Optional
 
 import nacl.bindings as nb
 import requests
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, UploadFile, Request
+from fastapi.responses import JSONResponse
 from nacl import utils as nacl_utils
+# Rate limiting imports - using custom middleware
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta
 from nacl.secret import SecretBox
 
 from services.crypto_core import stealth as st
@@ -43,15 +48,15 @@ from services.crypto_core.wrapper_stealth import (
 )
 from pathlib import Path
 
+# Database imports
+from sqlalchemy import select, and_, or_
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from . import cli_adapter as ca
 from . import eventlog as ev
 from .schemas_api import (
     BuyReq,
     BuyRes,
-    ConvertReq,
-    ConvertRes,
-    CsolToNoteReq,
-    CsolToNoteRes,
     DepositReq,
     DepositRes,
     EncryptedBlob,
@@ -107,12 +112,217 @@ except Exception:
 
 app = FastAPI(title="Incognito Protocol API", version="0.1.0")
 
+# ============================================================================
+# LOGGING & ERROR HANDLING
+# ============================================================================
+from services.api.logging_config import setup_logging, get_logger, api_logger
+from services.api.logging_middleware import RequestLoggingMiddleware, SlowRequestLoggingMiddleware
+from services.api.error_handlers import register_exception_handlers
+from services.api.exceptions import (
+    IncognitoException,
+    ValidationException,
+    KeyfileNotFoundException,
+    ResourceNotFoundException,
+    TransactionFailedException,
+    InsufficientBalanceException,
+)
+
+# Setup logging (will be configured fully at startup)
+# Using human-readable format for development, JSON for production
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_FILE = Path(os.getenv("LOG_FILE", "logs/api.log")) if os.getenv("LOG_FILE") else None
+JSON_LOGS = os.getenv("JSON_LOGS", "false").lower() == "true"
+
+setup_logging(log_level=LOG_LEVEL, log_file=LOG_FILE, json_format=JSON_LOGS)
+
+# Register exception handlers
+register_exception_handlers(app)
+
+# Add logging middleware
+app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(SlowRequestLoggingMiddleware, threshold_ms=2000.0)  # Log requests > 2s
+
+api_logger.info("Logging and error handling configured")
+
+# ============================================================================
+# SECURITY MIDDLEWARE
+# ============================================================================
+from services.api.security_middleware import (
+    SecurityHeadersMiddleware,
+    RequestValidationMiddleware,
+    configure_cors
+)
+from services.api.validators import validate_keyfile_path, ValidationError
+
+# Add security middleware
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestValidationMiddleware)
+
+# Configure CORS
+configure_cors(app)
+
+api_logger.info("Security middleware configured")
+
+# ============================================================================
+# RATE LIMITING - Custom Middleware Approach
+# ============================================================================
+# Simple in-memory rate limiter (for production, use Redis)
+rate_limit_storage = defaultdict(list)
+
+def check_rate_limit(client_ip: str, endpoint: str, max_requests: int, window_seconds: int = 60) -> tuple[bool, int]:
+    """
+    Check if request exceeds rate limit.
+
+    Returns: (is_allowed, retry_after_seconds)
+    """
+    key = f"{client_ip}:{endpoint}"
+    now = time.time()
+
+    # Clean old requests outside the window
+    rate_limit_storage[key] = [req_time for req_time in rate_limit_storage[key]
+                               if now - req_time < window_seconds]
+
+    # Check if limit exceeded
+    if len(rate_limit_storage[key]) >= max_requests:
+        oldest_request = min(rate_limit_storage[key])
+        retry_after = int(window_seconds - (now - oldest_request)) + 1
+        return False, retry_after
+
+    # Add current request
+    rate_limit_storage[key].append(now)
+    return True, 0
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Global rate limiting middleware"""
+    client_ip = request.client.host if request.client else "unknown"
+    endpoint = request.url.path
+
+    # Define rate limits per endpoint
+    endpoint_limits = {
+        "/deposit": (10, 60),  # 10 requests per minute
+        "/withdraw": (10, 60),
+        "/marketplace/buy": (20, 60),
+        "/notes/store": (50, 60),
+        "/notes/": (100, 60),  # Prefix match for /notes/{owner_pub}
+        "/listings": (30, 3600) if request.method == "POST" else (200, 60),  # 30/hour for POST, 200/min for GET
+        "/messages/send": (100, 60),
+        "/escrow": (30, 60),
+    }
+
+    # Find matching rate limit
+    max_requests, window = 200, 60  # Default: 200/minute
+    for path_prefix, (limit, win) in endpoint_limits.items():
+        if endpoint.startswith(path_prefix):
+            max_requests, window = limit, win
+            break
+
+    # Check rate limit
+    is_allowed, retry_after = check_rate_limit(client_ip, endpoint, max_requests, window)
+
+    if not is_allowed:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "rate_limit_exceeded",
+                "detail": f"Too many requests. Please slow down and try again in {retry_after} seconds.",
+                "retry_after": retry_after
+            },
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    # Add rate limit headers to response
+    response = await call_next(request)
+    remaining = max_requests - len(rate_limit_storage[f"{client_ip}:{endpoint}"])
+    response.headers["X-RateLimit-Limit"] = str(max_requests)
+    response.headers["X-RateLimit-Remaining"] = str(max(0, remaining))
+    response.headers["X-RateLimit-Reset"] = str(int(time.time() + window))
+
+    return response
+
+api_logger.info("Rate limiting enabled (middleware-based)")
+
+# Database setup - import here to avoid circular imports
+try:
+    from services.database.config import get_async_session, test_connection_async
+    from services.database.models import (
+        EncryptedNote,
+        Listing as DBListing,
+        Escrow as DBEscrow,
+        Message as DBMessage,
+        EscrowState,
+        AuditLog,
+    )
+    from services.crypto_core.field_encryption import hash_pubkey
+
+    DATABASE_ENABLED = True
+    api_logger.info("Database support enabled")
+except Exception as e:
+    DATABASE_ENABLED = False
+    api_logger.warning(f"Database support disabled: {e}. API will use JSON file storage")
+
+# Dependency injection
+async def get_db() -> AsyncSession:
+    """Get database session (FastAPI dependency)"""
+    if not DATABASE_ENABLED:
+        raise HTTPException(status_code=503, detail="Database not configured")
+    async with get_async_session() as session:
+        yield session
+
 @app.on_event("startup")
 async def startup_event():
-    """Initialize wrapper stealth state and escrow platform on startup if needed"""
+    """Initialize wrapper stealth state, escrow platform, and transaction manager on startup"""
+    global DATABASE_ENABLED
+
+    api_logger.info("Starting Incognito Protocol API...")
+
+    # Initialize Sentry for error tracking
+    try:
+        from services.api.sentry_integration import init_sentry
+
+        sentry_enabled = init_sentry(
+            environment=os.getenv("SENTRY_ENVIRONMENT", "development"),
+            traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+            profiles_sample_rate=float(os.getenv("SENTRY_PROFILES_SAMPLE_RATE", "0.1"))
+        )
+
+        if sentry_enabled:
+            api_logger.info("Sentry error tracking enabled")
+        else:
+            api_logger.info("Sentry error tracking disabled (no DSN configured)")
+    except Exception as e:
+        api_logger.warning(f"Sentry initialization failed: {e}")
+
+    # Initialize Transaction Manager for robust transaction handling
+    try:
+        from services.api.transaction_manager import init_transaction_manager
+        import os
+
+        # Get RPC endpoints from environment (with localnet as fallback)
+        rpc_url = os.getenv("SOLANA_RPC_URL", "http://127.0.0.1:8899")
+        backup_rpc = os.getenv("SOLANA_BACKUP_RPC_URL")  # Optional backup
+
+        rpc_endpoints = [rpc_url]
+        if backup_rpc:
+            rpc_endpoints.append(backup_rpc)
+
+        init_transaction_manager(rpc_endpoints)
+        api_logger.info(f"Transaction Manager initialized with {len(rpc_endpoints)} RPC endpoint(s)")
+    except Exception as e:
+        api_logger.warning(f"Transaction Manager initialization failed: {e}. Transactions will use basic send without retry logic")
+
+    # Test database connection
+    if DATABASE_ENABLED:
+        try:
+            await test_connection_async()
+            api_logger.info("Database connection successful")
+        except Exception as e:
+            api_logger.error(f"Database connection failed: {e}. Falling back to JSON file storage")
+            DATABASE_ENABLED = False
+
     try:
         load_wrapper_stealth_state(WRAPPER_STEALTH_STATE_PATH)
-        print(" Wrapper stealth state loaded")
+        api_logger.info("Wrapper stealth state loaded")
     except FileNotFoundError:
         wrapper_keyfile = ca.WRAPPER_KEYPAIR
         if os.path.exists(wrapper_keyfile):
@@ -121,17 +331,48 @@ async def startup_event():
                 wrapper_master_pubkey=wrapper_pubkey,
                 state_path=WRAPPER_STEALTH_STATE_PATH
             )
-            print(f" Initialized wrapper stealth state at {WRAPPER_STEALTH_STATE_PATH}")
+            api_logger.info(f"Initialized wrapper stealth state at {WRAPPER_STEALTH_STATE_PATH}")
         else:
-            print(f" Warning: Wrapper keyfile not found at {wrapper_keyfile}")
+            api_logger.warning(f"Wrapper keyfile not found at {wrapper_keyfile}")
 
     try:
-        print("Initializing escrow platform...")
+        api_logger.info("Initializing escrow platform...")
         ca._ensure_escrow_platform_initialized()
-        print(" Escrow platform ready")
+        api_logger.info("Escrow platform ready")
     except Exception as e:
-        print(f" Warning: Failed to initialize escrow platform: {e}")
-        print("  Escrow features may not work until platform is initialized")
+        api_logger.warning(f"Failed to initialize escrow platform: {e}. Escrow features may not work until platform is initialized")
+
+    api_logger.info("🚀 Incognito Protocol API startup complete")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    api_logger.info("Shutting down Incognito Protocol API...")
+
+    try:
+        from services.api.transaction_manager import get_transaction_manager
+        tx_manager = get_transaction_manager()
+        await tx_manager.close()
+
+        # Log transaction stats
+        stats = tx_manager.stats
+        api_logger.info(
+            f"Transaction Manager stats: {stats['successful_sends']} successful, "
+            f"{stats['failed_sends']} failed, {stats['total_attempts']} total attempts"
+        )
+        api_logger.info("Transaction Manager shut down gracefully")
+    except Exception as e:
+        api_logger.warning(f"Transaction Manager shutdown: {e}")
+
+    # Flush Sentry events
+    try:
+        from services.api.sentry_integration import flush_sentry
+        flush_sentry(timeout=2)
+        api_logger.info("Sentry events flushed")
+    except Exception as e:
+        api_logger.warning(f"Sentry flush: {e}")
+
+    api_logger.info("👋 Incognito Protocol API shutdown complete")
 
 
 REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[2])
@@ -471,7 +712,62 @@ def _save_user_notes(notes_db: Dict[str, List[Dict[str, Any]]]) -> None:
     except Exception:
         pass
 
-def _save_note_for_user(
+async def _save_note_for_user_db(
+    owner_pub: str,
+    encrypted_blob: dict,
+    commitment: str,
+    tx_signature: str,
+    spent: bool = False
+) -> None:
+    """
+    Save a note to database with CLIENT-SIDE encryption.
+
+    The encrypted_blob is already encrypted by the client using their Solana keypair.
+    The API server is BLIND - it cannot decrypt this data.
+
+    Args:
+        owner_pub: User's public key (for query indexing)
+        encrypted_blob: Client-encrypted note data {"ciphertext": "...", "nonce": "..."}
+        commitment: Public commitment (on-chain)
+        tx_signature: Transaction signature
+        spent: Whether note is spent
+    """
+    if not DATABASE_ENABLED:
+        # Fallback to JSON (need to decrypt for JSON storage - this is a limitation)
+        # In production, you'd want to remove JSON fallback entirely
+        print("⚠️  Database disabled, cannot store client-encrypted notes in JSON format")
+        return
+
+    try:
+        async with get_async_session() as session:
+            # Create note with client-encrypted blob (API cannot decrypt!)
+            note = EncryptedNote(
+                owner_pubkey=owner_pub,
+                commitment=commitment,
+                encrypted_blob=encrypted_blob  # Store as-is, can't read it!
+            )
+            note.spent = spent
+
+            session.add(note)
+            await session.commit()
+
+            # Audit log (no amount - we can't see it!)
+            audit = AuditLog(
+                event_type="note_created",
+                event_data={
+                    "commitment": commitment,
+                    "tx_signature": tx_signature,
+                    # No amount_sol - we can't decrypt it!
+                },
+                actor_pubkey=owner_pub,
+            )
+            session.add(audit)
+            await session.commit()
+    except Exception as e:
+        print(f"⚠️  Database save failed: {e}")
+        raise
+
+def _save_note_for_user_json(
     owner_pub: str,
     secret: str,
     nullifier: str,
@@ -481,7 +777,7 @@ def _save_note_for_user(
     tx_signature: str,
     spent: bool = False
 ) -> None:
-    """Save a note for a user"""
+    """Save a note for a user (JSON fallback)"""
     notes_db = _load_user_notes()
     if owner_pub not in notes_db:
         notes_db[owner_pub] = []
@@ -499,8 +795,91 @@ def _save_note_for_user(
     notes_db[owner_pub].append(note)
     _save_user_notes(notes_db)
 
-def _mark_note_spent(owner_pub: str, nullifier: str) -> None:
-    """Mark a note as spent by nullifier"""
+def _save_note_for_user(
+    owner_pub: str,
+    secret: str,
+    nullifier: str,
+    commitment: str,
+    leaf_index: int,
+    amount_sol: float,
+    tx_signature: str,
+    spent: bool = False
+) -> None:
+    """Save a note for a user (synchronous wrapper for backward compatibility)"""
+    _save_note_for_user_json(owner_pub, secret, nullifier, commitment, leaf_index, amount_sol, tx_signature, spent)
+
+async def _mark_note_spent_db(commitment: str, nullifier: str, owner_pub: str = None) -> None:
+    """
+    Mark a note as spent by commitment (CLIENT-SIDE ENCRYPTION compatible).
+
+    With client-side encryption, the API cannot decrypt notes to match nullifiers.
+    Instead, the client sends the commitment (which is public) to identify the note.
+
+    Args:
+        commitment: Note commitment to mark as spent
+        nullifier: Nullifier for audit/registry (not used for lookup)
+        owner_pub: Owner pubkey for audit logging (optional)
+    """
+    if not DATABASE_ENABLED:
+        if owner_pub:
+            return _mark_note_spent_json(owner_pub, nullifier)
+        return
+
+    try:
+        import hashlib
+        async with get_async_session() as session:
+            # Find note by commitment (public field)
+            query = select(EncryptedNote).where(
+                and_(
+                    EncryptedNote.commitment == commitment,
+                    EncryptedNote.spent == False
+                )
+            )
+            result = await session.execute(query)
+            note = result.scalar_one_or_none()
+
+            if not note:
+                print(f"⚠️  Note with commitment {commitment[:8]}... not found or already spent")
+                if owner_pub:
+                    _mark_note_spent_json(owner_pub, nullifier)
+                return
+
+            # Mark as spent
+            note.mark_spent()
+
+            # Register nullifier
+            nullifier_hash = hashlib.sha256(nullifier.encode('utf-8')).hexdigest()
+            from services.database.models import NullifierRegistry
+            null_reg = NullifierRegistry(
+                nullifier=nullifier,
+                commitment=commitment,
+                tx_signature=None
+            )
+            session.add(null_reg)
+
+            await session.commit()
+
+            # Audit log
+            if owner_pub:
+                audit = AuditLog(
+                    event_type="note_spent",
+                    event_data={
+                        "commitment": commitment,
+                        "nullifier_hash": nullifier_hash,
+                    },
+                    actor_pubkey=owner_pub,
+                )
+                session.add(audit)
+                await session.commit()
+
+            print(f"✅ Note {commitment[:8]}... marked as spent")
+    except Exception as e:
+        print(f"⚠️  Database mark spent failed: {e}")
+        if owner_pub:
+            _mark_note_spent_json(owner_pub, nullifier)
+
+def _mark_note_spent_json(owner_pub: str, nullifier: str) -> None:
+    """Mark a note as spent by nullifier (JSON fallback)"""
     notes_db = _load_user_notes()
     if owner_pub in notes_db:
         for note in notes_db[owner_pub]:
@@ -508,13 +887,66 @@ def _mark_note_spent(owner_pub: str, nullifier: str) -> None:
                 note["spent"] = True
         _save_user_notes(notes_db)
 
-def _get_user_notes(owner_pub: str, include_spent: bool = False) -> List[Dict[str, Any]]:
-    """Get all notes for a user"""
+def _mark_note_spent(owner_pub: str, nullifier: str) -> None:
+    """Mark a note as spent by nullifier (synchronous wrapper for backward compatibility)"""
+    _mark_note_spent_json(owner_pub, nullifier)
+
+async def _get_user_notes_db(owner_pub: str, include_spent: bool = False) -> List[Dict[str, Any]]:
+    """
+    Get all notes for a user from database (CLIENT-SIDE ENCRYPTED).
+
+    Returns encrypted blobs - the API server CANNOT decrypt them.
+    Client must decrypt locally with their private key.
+
+    Args:
+        owner_pub: User's public key
+        include_spent: Whether to include spent notes
+
+    Returns:
+        List of notes with encrypted blobs (NOT decrypted!)
+    """
+    if not DATABASE_ENABLED:
+        return _get_user_notes_json(owner_pub, include_spent)
+
+    try:
+        async with get_async_session() as session:
+            pubkey_hash = hash_pubkey(owner_pub)
+
+            # Build query
+            query = select(EncryptedNote).where(EncryptedNote.owner_pubkey_hash == pubkey_hash)
+            if not include_spent:
+                query = query.where(EncryptedNote.spent == False)
+
+            # Execute
+            result = await session.execute(query)
+            db_notes = result.scalars().all()
+
+            # Return encrypted blobs (DON'T decrypt - we can't!)
+            notes = []
+            for db_note in db_notes:
+                notes.append({
+                    "commitment": db_note.commitment,
+                    "encrypted_blob": db_note.encrypted_blob,  # Still encrypted!
+                    "spent": db_note.spent,
+                    "created_at": db_note.created_at.isoformat() if db_note.created_at else None
+                })
+
+            return notes
+    except Exception as e:
+        print(f"⚠️  Database query failed, falling back to JSON: {e}")
+        return _get_user_notes_json(owner_pub, include_spent)
+
+def _get_user_notes_json(owner_pub: str, include_spent: bool = False) -> List[Dict[str, Any]]:
+    """Get all notes for a user from JSON"""
     notes_db = _load_user_notes()
     notes = notes_db.get(owner_pub, [])
     if not include_spent:
         notes = [n for n in notes if not n.get("spent", False)]
     return notes
+
+def _get_user_notes(owner_pub: str, include_spent: bool = False) -> List[Dict[str, Any]]:
+    """Get all notes for a user (synchronous wrapper for backward compatibility)"""
+    return _get_user_notes_json(owner_pub, include_spent)
 
 def _delete_note_file(commitment: str) -> None:
     """
@@ -991,6 +1423,273 @@ def metrics():
     rows = ev.metrics_all()
     return [MetricRow(epoch=r[0], issued_count=r[1], spent_count=r[2], updated_at=r[3]) for r in rows]
 
+# ============================================================================
+# HEALTH CHECK ENDPOINTS (Kubernetes-style)
+# ============================================================================
+
+@app.get("/health")
+async def health():
+    """
+    Comprehensive health check endpoint
+
+    Returns:
+        - status: overall health status (healthy/unhealthy)
+        - timestamp: current timestamp
+        - checks: individual component health checks
+    """
+    from services.api.health_checks import comprehensive_health_check
+
+    health_status = await comprehensive_health_check(
+        database_enabled=DATABASE_ENABLED,
+        rpc_url=SOLANA_RPC_URL if 'SOLANA_RPC_URL' in globals() else None
+    )
+
+    # Return 503 if unhealthy
+    status_code = 200 if health_status["status"] == "healthy" else 503
+
+    return JSONResponse(
+        status_code=status_code,
+        content=health_status
+    )
+
+
+@app.get("/health/ready")
+async def readiness():
+    """
+    Readiness check endpoint (Kubernetes readiness probe)
+
+    Returns 200 if ready to serve traffic, 503 otherwise
+    """
+    from services.api.health_checks import readiness_check
+
+    is_ready = await readiness_check(
+        database_enabled=DATABASE_ENABLED,
+        rpc_url=SOLANA_RPC_URL if 'SOLANA_RPC_URL' in globals() else None
+    )
+
+    if is_ready:
+        return {"status": "ready"}
+    else:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready"}
+        )
+
+
+@app.get("/health/live")
+async def liveness():
+    """
+    Liveness check endpoint (Kubernetes liveness probe)
+
+    Returns 200 if alive, 503 otherwise
+    """
+    from services.api.health_checks import liveness_check
+
+    is_alive = await liveness_check()
+
+    if is_alive:
+        return {"status": "alive"}
+    else:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "dead"}
+        )
+
+
+@app.get("/database/health")
+async def database_health():
+    """
+    Check database health and encryption status.
+
+    Returns:
+        - status: "healthy" or "unhealthy" or "disabled"
+        - database_enabled: True/False
+        - encryption_enabled: True/False (if database enabled)
+        - connection_pool: Pool statistics (if database enabled)
+    """
+    if not DATABASE_ENABLED:
+        return {
+            "status": "disabled",
+            "database_enabled": False,
+            "message": "Database support not configured, using JSON file storage"
+        }
+
+    try:
+        from services.database.config import health_check
+        health = await health_check()
+        return {
+            "status": health["database"],
+            "database_enabled": True,
+            **health
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "database_enabled": True,
+            "error": str(e)
+        }
+
+
+# ============================================================================
+# DATABASE BACKUP ENDPOINTS
+# ============================================================================
+
+@app.post("/admin/backup/create")
+async def create_backup(description: Optional[str] = None):
+    """
+    Create a manual database backup
+
+    Args:
+        description: Optional description for the backup
+
+    Returns:
+        Backup information (path, size, timestamp)
+    """
+    if not DATABASE_ENABLED:
+        raise HTTPException(status_code=503, detail="Database not enabled")
+
+    try:
+        from services.database.backup import get_backup_manager
+
+        backup_manager = get_backup_manager()
+        if not backup_manager:
+            raise HTTPException(status_code=503, detail="Backup system not initialized")
+
+        backup_info = await backup_manager.create_backup(description=description)
+        return backup_info
+
+    except Exception as e:
+        api_logger.error(f"Manual backup failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Backup failed: {str(e)}")
+
+
+@app.get("/admin/backup/list")
+async def list_backups():
+    """
+    List all available database backups
+
+    Returns:
+        List of backup information
+    """
+    if not DATABASE_ENABLED:
+        raise HTTPException(status_code=503, detail="Database not enabled")
+
+    try:
+        from services.database.backup import get_backup_manager
+
+        backup_manager = get_backup_manager()
+        if not backup_manager:
+            raise HTTPException(status_code=503, detail="Backup system not initialized")
+
+        backups = await backup_manager.list_backups()
+        return {"backups": backups, "count": len(backups)}
+
+    except Exception as e:
+        api_logger.error(f"Failed to list backups: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to list backups: {str(e)}")
+
+
+@app.get("/admin/backup/stats")
+async def backup_stats():
+    """
+    Get database backup statistics
+
+    Returns:
+        Backup statistics (total count, size, oldest/newest)
+    """
+    if not DATABASE_ENABLED:
+        raise HTTPException(status_code=503, detail="Database not enabled")
+
+    try:
+        from services.database.backup import get_backup_manager
+
+        backup_manager = get_backup_manager()
+        if not backup_manager:
+            raise HTTPException(status_code=503, detail="Backup system not initialized")
+
+        stats = await backup_manager.get_backup_stats()
+        return stats
+
+    except Exception as e:
+        api_logger.error(f"Failed to get backup stats: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to get backup stats: {str(e)}")
+
+
+@app.post("/admin/backup/verify")
+async def verify_backup():
+    """
+    Verify the most recent database backup
+
+    Returns:
+        Verification result
+    """
+    if not DATABASE_ENABLED:
+        raise HTTPException(status_code=503, detail="Database not enabled")
+
+    try:
+        from services.database.backup import get_backup_manager
+
+        backup_manager = get_backup_manager()
+        if not backup_manager:
+            raise HTTPException(status_code=503, detail="Backup system not initialized")
+
+        is_valid = await backup_manager.verify_latest_backup()
+
+        if is_valid:
+            return {"status": "valid", "message": "Backup verification passed"}
+        else:
+            return JSONResponse(
+                status_code=500,
+                content={"status": "invalid", "message": "Backup verification failed"}
+            )
+
+    except Exception as e:
+        api_logger.error(f"Backup verification failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Backup verification failed: {str(e)}")
+
+
+@app.post("/admin/backup/restore")
+async def restore_backup(
+    filename: str,
+    force: bool = False
+):
+    """
+    Restore database from backup
+
+    Args:
+        filename: Backup filename to restore
+        force: Force restore without safety backup
+
+    Returns:
+        Restoration result
+
+    WARNING: This will overwrite the current database!
+    """
+    if not DATABASE_ENABLED:
+        raise HTTPException(status_code=503, detail="Database not enabled")
+
+    try:
+        from services.database.backup import get_backup_manager
+
+        backup_manager = get_backup_manager()
+        if not backup_manager:
+            raise HTTPException(status_code=503, detail="Backup system not initialized")
+
+        api_logger.warning(f"Database restore requested: {filename}")
+
+        success = await backup_manager.restore_backup(filename, force=force)
+
+        if success:
+            return {"status": "success", "message": f"Database restored from {filename}"}
+        else:
+            raise HTTPException(status_code=500, detail="Restore failed")
+
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        api_logger.error(f"Database restore failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Restore failed: {str(e)}")
+
 @app.get("/merkle/status", response_model=MerkleStatus)
 def merkle_status():
     wst = ca.load_wrapper_state()
@@ -1086,7 +1785,7 @@ def pool_state_debug(cluster: str = "localnet"):
         }
 
 @app.post("/deposit", response_model=DepositRes)
-def deposit(req: DepositReq):
+async def deposit(req: DepositReq):
     """
     Deposit SOL to the on-chain incognito pool.
 
@@ -1122,9 +1821,18 @@ def deposit(req: DepositReq):
         local_merkle_tree=tree
     )
 
-    depositor_keyfile = req.depositor_keyfile
-    if not os.path.isabs(depositor_keyfile):
-        depositor_keyfile = os.path.join(REPO_ROOT, depositor_keyfile)
+    # Validate and sanitize keyfile path (prevents path traversal)
+    try:
+        depositor_keyfile = validate_keyfile_path(
+            req.depositor_keyfile,
+            allowed_dirs=["keys", "test_keys", ".keys"],
+            repo_root=REPO_ROOT
+        )
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid depositor keyfile path: {str(e)}"
+        )
 
     if not os.path.exists(depositor_keyfile):
         raise HTTPException(
@@ -1170,225 +1878,104 @@ def deposit(req: DepositReq):
     result["secret"] = secret.hex()
     result["nullifier"] = nullifier.hex()
     result["commitment"] = commitment.hex()
-
-    depositor_pub = get_pubkey_from_keypair(depositor_keyfile)
-    _save_note_for_user(
-        owner_pub=depositor_pub,
-        secret=secret.hex(),
-        nullifier=nullifier.hex(),
-        commitment=commitment.hex(),
-        leaf_index=leaf_index,
-        amount_sol=req.amount_sol,
-        tx_signature=result["tx_signature"],
-        spent=False
-    )
     result["leaf_index"] = leaf_index
+
+    # NOTE: With client-side encryption, we don't store here
+    # The client will encrypt the note and call POST /notes/store
+    # This allows for true end-to-end encryption
 
     return DepositRes(**result)
 
 
-@app.get("/notes/{owner_pub}", response_model=ListNotesRes)
-def list_notes(owner_pub: str):
+@app.post("/notes/store")
+async def store_encrypted_note(req: dict):
     """
-    Get all available notes for a user.
+    Store a client-side encrypted note in the database.
 
-    Returns list of unspent notes with credentials needed for spending.
+    The client encrypts the note with their Solana keypair before sending.
+    The API server is BLIND - it cannot decrypt this data.
+
+    Request format:
+    {
+        "owner_pubkey": "...",
+        "commitment": "...",
+        "encrypted_blob": {"ciphertext": "...", "nonce": "..."},
+        "tx_signature": "..."
+    }
     """
-    notes = _get_user_notes(owner_pub, include_spent=False)
-
-    note_infos = []
-    total = Decimal("0")
-
-    for note in notes:
-        note_infos.append(NoteInfo(
-            secret=note["secret"],
-            nullifier=note["nullifier"],
-            commitment=note["commitment"],
-            leaf_index=note["leaf_index"],
-            amount_sol=note["amount_sol"],
-            tx_signature=note["tx_signature"]
-        ))
-        total += Decimal(note["amount_sol"])
-
-    return ListNotesRes(
-        ok=True,
-        notes=note_infos,
-        total_balance=str(total)
-    )
-
-@app.post("/csol-to-note", response_model=CsolToNoteRes)
-def csol_to_note(req: CsolToNoteReq):
-    """
-    Convert cSOL back to a privacy note.
-
-    Flow:
-    1. User transfers cSOL to wrapper (confidential transfer)
-    2. Wrapper burns the cSOL (reducing supply)
-    3. Wrapper deposits equivalent SOL to pool (from accumulated SOL from purchases)
-    4. User receives note credentials for the deposit
-
-    This allows sellers to convert their cSOL earnings back to notes for private withdrawals.
-    """
-    user_keyfile = req.user_keyfile
-    if not os.path.isabs(user_keyfile):
-        user_keyfile = os.path.join(REPO_ROOT, user_keyfile)
-
-    if not os.path.exists(user_keyfile):
-        raise HTTPException(
-            status_code=400,
-            detail=f"User keyfile not found at {user_keyfile}"
-        )
-
-    user_pub = get_pubkey_from_keypair(user_keyfile)
-
-    amount_lamports = int(req.amount_sol * 1_000_000_000)
-
-    if amount_lamports <= 50_000_000:
-        raise HTTPException(
-            status_code=400,
-            detail="Conversion amount must be greater than 0.05 SOL (wrapper deposit fee)"
-        )
-
     try:
-        burn_result = ca.csol_user_to_wrapper_and_burn(
-            user_keyfile=user_keyfile,
-            amount_str=_fmt(req.amount_sol)
-        )
-        sig_transfer = burn_result["sig_transfer"]
-        sig_burn = burn_result["sig_burn"]
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"cSOL transfer/burn failed: {str(e)}"
-        )
+        owner_pub = req["owner_pubkey"]
+        commitment = req["commitment"]
+        encrypted_blob = req["encrypted_blob"]
+        tx_signature = req.get("tx_signature", "")
 
-    pool_merkle_path = Path(REPO_ROOT) / "pool_merkle_state.json"
-    if pool_merkle_path.exists():
-        with open(pool_merkle_path, 'r') as f:
-            pool_state = json.load(f)
-        tree = PoolMerkleTree(depth=pool_state.get("depth", 20))
-        for leaf_hex in pool_state.get("leaves", []):
-            tree.insert(bytes.fromhex(leaf_hex))
-    else:
-        tree = PoolMerkleTree(depth=20)
-
-    secret = secrets.token_bytes(32)
-    nullifier = secrets.token_bytes(32)
-
-    commitment, nf_hash, merkle_path = prepare_deposit_params(
-        amount_lamports=amount_lamports,
-        secret=secret,
-        nullifier=nullifier,
-        local_merkle_tree=tree
-    )
-
-    wrapper_keyfile = ca.WRAPPER_KEYPAIR
-    if not os.path.isabs(wrapper_keyfile):
-        wrapper_keyfile = os.path.join(REPO_ROOT, wrapper_keyfile)
-
-    if not os.path.exists(wrapper_keyfile):
-        raise HTTPException(
-            status_code=500,
-            detail=f"Wrapper keyfile not found at {wrapper_keyfile}"
-        )
-
-    try:
-        result = deposit_to_pool_onchain(
-            depositor_keyfile=wrapper_keyfile,
-            amount_lamports=amount_lamports,
+        await _save_note_for_user_db(
+            owner_pub=owner_pub,
+            encrypted_blob=encrypted_blob,
             commitment=commitment,
-            nf_hash=nf_hash,
-            merkle_path=merkle_path,
-            wrapper_keyfile=wrapper_keyfile,
-            wrapper_stealth_state_path=WRAPPER_STEALTH_STATE_PATH,
-            cluster=req.cluster
+            tx_signature=tx_signature,
+            spent=False
         )
-        sig_deposit = result["tx_signature"]
+
+        return {"ok": True, "message": "Note stored successfully"}
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Deposit to pool failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to store note: {str(e)}")
 
-    leaf = h2(commitment, nf_hash)
-    tree.insert(leaf)
-    leaf_index = len(tree.leaves) - 1
 
-    with open(pool_merkle_path, 'w') as f:
-        json.dump({
-            "depth": tree.depth,
-            "leaves": [leaf.hex() for leaf in tree.leaves],
-            "leaf_count": len(tree.leaves)
-        }, f, indent=2)
+@app.get("/notes/{owner_pub}")
+async def list_notes(owner_pub: str):
+    """
+    Get all encrypted notes for a user (CLIENT-SIDE ENCRYPTED).
 
-    _save_note_for_user(
-        owner_pub=user_pub,
-        secret=secret.hex(),
-        nullifier=nullifier.hex(),
-        commitment=commitment.hex(),
-        leaf_index=leaf_index,
-        amount_sol=req.amount_sol,
-        tx_signature=sig_deposit,
-        spent=False
-    )
+    Returns encrypted blobs that only the user can decrypt with their private key.
+    The API server CANNOT see the note contents (secret, nullifier, amount).
 
-    try:
-        os.makedirs(NOTES_DIR, exist_ok=True)
-        commitment_hex = commitment.hex()
-        commitment_prefix = commitment_hex[:8]
-        timestamp = int(datetime.now().timestamp())
-        filename = f"note_{commitment_prefix}_{timestamp}.json"
-        filepath = os.path.join(NOTES_DIR, filename)
-
-        note_data = {
-            "version": "1.0",
-            "network": req.cluster,
-            "deposit_date": datetime.now().isoformat(),
-            "amount_deposited_sol": float(req.amount_sol),
-            "amount_withdrawable_sol": float(req.amount_sol),
-            "wrapper_fee_sol": 0.0,
-            "credentials": {
-                "secret": secret.hex(),
-                "nullifier": nullifier.hex(),
-                "commitment": commitment_hex,
-                "leaf_index": leaf_index
-            },
-            "transaction": {
-                "tx_signature": sig_deposit,
-                "note_type": "csol_conversion"
+    Response format:
+    {
+        "ok": true,
+        "notes": [
+            {
+                "commitment": "...",
+                "encrypted_blob": {"ciphertext": "...", "nonce": "..."},
+                "spent": false,
+                "created_at": "2025-01-04T..."
             }
-        }
+        ]
+    }
 
-        with open(filepath, 'w') as f:
-            json.dump(note_data, f, indent=2)
+    The client must decrypt each encrypted_blob locally to get:
+    - secret
+    - nullifier
+    - amount_sol
+    - leaf_index
+    """
+    notes = await _get_user_notes_db(owner_pub, include_spent=False)
 
-        print(f"   Created note file: {filename}")
-    except Exception as e:
-        print(f"   Warning: Could not create note file: {e}")
-
-    return CsolToNoteRes(
-        status="ok",
-        tx_signature_transfer=sig_transfer,
-        tx_signature_burn=sig_burn,
-        tx_signature_deposit=sig_deposit,
-        secret=secret.hex(),
-        nullifier=nullifier.hex(),
-        commitment=commitment.hex(),
-        leaf_index=leaf_index,
-        amount_sol=str(req.amount_sol)
-    )
+    return {
+        "ok": True,
+        "notes": notes  # Returns encrypted blobs
+    }
 
 @app.post("/withdraw", response_model=WithdrawRes)
-def withdraw(req: WithdrawReq):
+async def withdraw(req: WithdrawReq):
     """
     Withdraw SOL from the on-chain incognito pool.
 
     PRIVACY: User provides their own note credentials (secret, nullifier, commitment).
     No server-side tracking of who owns what. Anyone with valid credentials can withdraw.
     """
-    recipient_keyfile = req.recipient_keyfile
-    if not os.path.isabs(recipient_keyfile):
-        recipient_keyfile = os.path.join(REPO_ROOT, recipient_keyfile)
+    # Validate and sanitize keyfile path (prevents path traversal)
+    try:
+        recipient_keyfile = validate_keyfile_path(
+            req.recipient_keyfile,
+            allowed_dirs=["keys", "test_keys", ".keys"],
+            repo_root=REPO_ROOT
+        )
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid recipient keyfile path: {str(e)}"
+        )
 
     if not os.path.exists(recipient_keyfile):
         raise HTTPException(
@@ -1491,7 +2078,7 @@ def withdraw(req: WithdrawReq):
         raise HTTPException(status_code=500, detail=f"Withdrawal failed: {str(e)}")
 
     recipient_pub = get_pubkey_from_keypair(recipient_keyfile)
-    _mark_note_spent(recipient_pub, req.nullifier)
+    await _mark_note_spent_db(req.commitment, req.nullifier, recipient_pub)
 
     change_note_data = None
     if is_partial and change_commitment is not None:
@@ -1517,306 +2104,14 @@ def withdraw(req: WithdrawReq):
             "tx_signature": result["tx_signature"]
         }
 
-        _save_note_for_user(
-            owner_pub=recipient_pub,
-            secret=change_secret.hex(),
-            nullifier=change_nullifier.hex(),
-            commitment=change_commitment.hex(),
-            leaf_index=change_leaf_index,
-            amount_sol=change_lamports / 1_000_000_000,
-            tx_signature=result["tx_signature"],
-            spent=False
-        )
-
-        print(f" Change note created successfully! Leaf index: {change_leaf_index}")
+        # With client-side encryption, we DON'T store the change note here
+        # Instead, we return it to the client who will encrypt and store it
+        print(f" Change note created successfully! Returning to client for encryption. Leaf index: {change_leaf_index}")
 
     if change_note_data:
         result["change_note"] = change_note_data
 
     return WithdrawRes(**result)
-
-@app.post("/deposit_csol")
-def deposit_csol(
-    depositor_keyfile: str = Body(..., embed=True),
-    amount_sol: float = Body(..., embed=True),
-):
-    """
-    Deposit SOL → cSOL (confidential SOL) without transferring to wrapper.
-    User keeps the cSOL in their account to use for purchases.
-    """
-    if not os.path.exists(depositor_keyfile):
-        raise HTTPException(400, f"Depositor keyfile not found: {depositor_keyfile}")
-
-    depositor_ata = ca.get_ata_for_owner(ca.MINT, depositor_keyfile)
-    fee_tmp, _ = ca.pick_treasury_fee_payer_tmpfile()
-
-    if not fee_tmp:
-        raise HTTPException(400, "No funded treasury stealth key available as fee-payer.")
-
-    try:
-        print(f"[DEBUG] Depositing {amount_sol} SOL → cSOL for {depositor_keyfile}")
-        ca._run_rc(
-            [
-                "spl-token",
-                "deposit-confidential-tokens",
-                ca.MINT,
-                _fmt(amount_sol),
-                "--address",
-                depositor_ata,
-                "--owner",
-                depositor_keyfile,
-                "--fee-payer",
-                fee_tmp,
-            ]
-        )
-
-        print(f"[DEBUG] Applying pending cSOL balance")
-        ca.spl_apply(depositor_keyfile, fee_tmp)
-
-        balance_result = ca._run(
-            [
-                "spl-token",
-                "balance",
-                ca.MINT,
-                "--owner",
-                depositor_keyfile,
-            ]
-        )
-        balance_sol = float(balance_result.strip()) if balance_result else 0
-
-        print(f"[DEBUG]  Deposited {amount_sol} SOL → cSOL. New balance: {balance_sol} cSOL")
-
-        return {
-            "ok": True,
-            "amount_sol": str(amount_sol),
-            "new_balance_sol": str(balance_sol),
-            "depositor_ata": depositor_ata,
-        }
-
-    except Exception as e:
-        print(f" cSOL deposit failed: {str(e)}")
-        raise HTTPException(500, f"cSOL deposit failed: {str(e)}")
-
-@app.post("/convert", response_model=ConvertRes)
-def convert(req: ConvertReq):
-    """
-    Convert cSOL back to a privacy note for withdrawal.
-
-    Flow:
-    1. User sends cSOL confidentially to wrapper
-    2. Wrapper creates a new note for the user
-    3. User can later withdraw SOL from vault using the note
-
-    This maintains the accounting: cSOL supply increases, note is created,
-    and reconcile_csol_supply() will sync vault/supply when needed.
-    """
-    user_keyfile = req.sender_keyfile
-    if not os.path.isabs(user_keyfile):
-        user_keyfile = os.path.join(REPO_ROOT, user_keyfile)
-
-    if not os.path.exists(user_keyfile):
-        raise HTTPException(
-            status_code=400,
-            detail=f"User keyfile not found at {user_keyfile}"
-        )
-
-    user_pub = get_pubkey_from_keypair(user_keyfile)
-    amount_lamports = int(req.amount_sol * 1_000_000_000)
-
-    if amount_lamports <= 50_000_000:
-        raise HTTPException(
-            status_code=400,
-            detail="Conversion amount must be greater than 0.05 SOL (wrapper deposit fee)"
-        )
-
-    # Step 1: Transfer cSOL confidentially to wrapper
-    sender_ata = ca.get_ata_for_owner(ca.MINT, user_keyfile)
-    wrapper_ata = ca.get_wrapper_ata()
-    fee_tmp, _ = ca.pick_treasury_fee_payer_tmpfile()
-
-    if not fee_tmp:
-        raise HTTPException(
-            status_code=400,
-            detail="No funded treasury stealth key available as fee-payer."
-        )
-
-    try:
-        # Deposit tokens to confidential balance
-        ca._run_rc(
-            [
-                "spl-token",
-                "deposit-confidential-tokens",
-                ca.MINT,
-                _fmt(req.amount_sol),
-                "--address",
-                sender_ata,
-                "--owner",
-                user_keyfile,
-                "--fee-payer",
-                fee_tmp,
-            ]
-        )
-        ca.spl_apply(user_keyfile, fee_tmp)
-
-        # Transfer confidentially to wrapper
-        ca._run(
-            [
-                "spl-token",
-                "transfer",
-                ca.MINT,
-                _fmt(req.amount_sol),
-                wrapper_ata,
-                "--owner",
-                user_keyfile,
-                "--confidential",
-                "--fee-payer",
-                fee_tmp,
-            ]
-        )
-        ca.spl_apply(ca.WRAPPER_KEYPAIR, fee_tmp)
-        sig_transfer = "confidential_transfer"  # We don't capture the actual sig in this flow
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"cSOL confidential transfer failed: {str(e)}"
-        )
-    finally:
-        try:
-            os.remove(fee_tmp)
-        except Exception:
-            pass
-
-    # Update user's cSOL balance tracking
-    try:
-        _csol_sub(user_pub, Decimal(str(req.amount_sol)))
-    except Exception:
-        pass
-
-    # Step 2: Create note for user to withdraw later
-    pool_merkle_path = Path(REPO_ROOT) / "pool_merkle_state.json"
-    if pool_merkle_path.exists():
-        with open(pool_merkle_path, 'r') as f:
-            pool_state = json.load(f)
-        tree = PoolMerkleTree(depth=pool_state.get("depth", 20))
-        for leaf_hex in pool_state.get("leaves", []):
-            tree.insert(bytes.fromhex(leaf_hex))
-    else:
-        tree = PoolMerkleTree(depth=20)
-
-    secret = secrets.token_bytes(32)
-    nullifier = secrets.token_bytes(32)
-
-    commitment, nf_hash, merkle_path = prepare_deposit_params(
-        amount_lamports=amount_lamports,
-        secret=secret,
-        nullifier=nullifier,
-        local_merkle_tree=tree
-    )
-
-    wrapper_keyfile = ca.WRAPPER_KEYPAIR
-    if not os.path.isabs(wrapper_keyfile):
-        wrapper_keyfile = os.path.join(REPO_ROOT, wrapper_keyfile)
-
-    if not os.path.exists(wrapper_keyfile):
-        raise HTTPException(
-            status_code=500,
-            detail=f"Wrapper keyfile not found at {wrapper_keyfile}"
-        )
-
-    # Wrapper deposits to pool on behalf of user (creating the note)
-    try:
-        result = deposit_to_pool_onchain(
-            depositor_keyfile=wrapper_keyfile,
-            amount_lamports=amount_lamports,
-            commitment=commitment,
-            nf_hash=nf_hash,
-            merkle_path=merkle_path,
-            wrapper_keyfile=wrapper_keyfile,
-            wrapper_stealth_state_path=WRAPPER_STEALTH_STATE_PATH,
-            cluster=req.cluster
-        )
-        sig_deposit = result["tx_signature"]
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Deposit to pool failed: {str(e)}"
-        )
-
-    # Update Merkle tree
-    leaf = h2(commitment, nf_hash)
-    tree.insert(leaf)
-    leaf_index = len(tree.leaves) - 1
-
-    with open(pool_merkle_path, 'w') as f:
-        json.dump({
-            "depth": tree.depth,
-            "leaves": [leaf.hex() for leaf in tree.leaves],
-            "leaf_count": len(tree.leaves)
-        }, f, indent=2)
-
-    # Save note for user
-    _save_note_for_user(
-        owner_pub=user_pub,
-        secret=secret.hex(),
-        nullifier=nullifier.hex(),
-        commitment=commitment.hex(),
-        leaf_index=leaf_index,
-        amount_sol=req.amount_sol,
-        tx_signature=sig_deposit,
-        spent=False
-    )
-
-    # Create note file
-    try:
-        os.makedirs(NOTES_DIR, exist_ok=True)
-        commitment_hex = commitment.hex()
-        commitment_prefix = commitment_hex[:8]
-        timestamp = int(datetime.now().timestamp())
-        filename = f"note_{commitment_prefix}_{timestamp}.json"
-        filepath = os.path.join(NOTES_DIR, filename)
-
-        note_data = {
-            "version": "1.0",
-            "network": req.cluster,
-            "deposit_date": datetime.now().isoformat(),
-            "amount_deposited_sol": float(req.amount_sol),
-            "amount_withdrawable_sol": float(req.amount_sol),
-            "wrapper_fee_sol": 0.0,
-            "credentials": {
-                "secret": secret.hex(),
-                "nullifier": nullifier.hex(),
-                "commitment": commitment_hex,
-                "leaf_index": leaf_index
-            },
-            "transaction": {
-                "tx_signature": sig_deposit,
-                "note_type": "csol_conversion"
-            }
-        }
-
-        with open(filepath, 'w') as f:
-            json.dump(note_data, f, indent=2)
-
-        print(f"   Created note file: {filename}")
-    except Exception as e:
-        print(f"   Warning: Could not create note file: {e}")
-
-    # Emit event
-    try:
-        ca.emit("CSOLConverted", amount=amount_lamports, direction="from_csol")
-    except Exception:
-        pass
-
-    return ConvertRes(
-        status="ok",
-        tx_signature_transfer=sig_transfer,
-        tx_signature_deposit=sig_deposit,
-        secret=secret.hex(),
-        nullifier=nullifier.hex(),
-        commitment=commitment.hex(),
-        leaf_index=leaf_index,
-        amount_sol=str(req.amount_sol)
-    )
 
 @app.get("/stealth/{owner_pub}", response_model=StealthList)
 def list_stealth(owner_pub: str, include_balances: bool = True, min_sol: float = 0.01):
@@ -1921,7 +2216,20 @@ def marketplace_buy(req: BuyReq):
     4. Return change note credentials to buyer (if applicable)
     5. Open escrow record
     """
-    buyer_pub = ca.get_pubkey_from_keypair(req.buyer_keyfile)
+    # Validate buyer keyfile path (prevents path traversal)
+    try:
+        buyer_keyfile_validated = validate_keyfile_path(
+            req.buyer_keyfile,
+            allowed_dirs=["keys", "test_keys", ".keys"],
+            repo_root=REPO_ROOT
+        )
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid buyer keyfile path: {str(e)}"
+        )
+
+    buyer_pub = ca.get_pubkey_from_keypair(buyer_keyfile_validated)
     listing = ca.listing_get(req.listing_id)
     if not listing:
         raise HTTPException(400, "Listing not found")
@@ -2021,7 +2329,7 @@ def marketplace_buy(req: BuyReq):
         shipping_placeholder = f"listing:{req.listing_id}" if encrypted_shipping_blob else "no_shipping"
 
         escrow_result = ca.escrow_create_order(
-            buyer_keypair_path=req.buyer_keyfile,
+            buyer_keypair_path=buyer_keyfile_validated,
             amount_sol=_fmt(total_price),
             order_id=order_id_u64,
             seller_pub=seller_pub,
@@ -3472,13 +3780,27 @@ def _resolve_recipient_pub_or_username(
 
 @app.post("/messages/send", response_model=MessageSendRes)
 def messages_send(req: MessageSendReq):
-    if not os.path.exists(req.sender_keyfile):
-        raise HTTPException(status_code=400, detail=f"sender_keyfile not found: {req.sender_keyfile}")
-    sender_pub_ed = ca.get_pubkey_from_keypair(req.sender_keyfile)
+    # Validate sender keyfile path (prevents path traversal)
+    try:
+        sender_keyfile_validated = validate_keyfile_path(
+            req.sender_keyfile,
+            allowed_dirs=["keys", "test_keys", ".keys"],
+            repo_root=REPO_ROOT
+        )
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid sender keyfile path: {str(e)}"
+        )
+
+    if not os.path.exists(sender_keyfile_validated):
+        raise HTTPException(status_code=400, detail=f"sender_keyfile not found: {sender_keyfile_validated}")
+
+    sender_pub_ed = ca.get_pubkey_from_keypair(sender_keyfile_validated)
     recip_pub_ed = _resolve_recipient_pub_or_username(req.recipient_pub, req.recipient_username)
 
 
-    with open(req.sender_keyfile, 'r') as f:
+    with open(sender_keyfile_validated, 'r') as f:
         sender_kp_data = json.load(f)
     sender_sk64 = bytes(sender_kp_data[:64])
     sender_ed_pub32 = bytes(sender_kp_data[32:64])
@@ -3502,7 +3824,7 @@ def messages_send(req: MessageSendReq):
     if req.attach_onchain_memo:
         memo_payload = b"\x02" + sender_ed_pub32 + bytes.fromhex(nonce_hex) + bytes.fromhex(ct_hex)
         memo_b64 = base64.b64encode(memo_payload).decode()
-        memo_sig = _send_memo_transfer(req.sender_keyfile, recip_pub_ed, memo_b64)
+        memo_sig = _send_memo_transfer(sender_keyfile_validated, recip_pub_ed, memo_b64)
 
     row_blob = {
         "from_pub": sender_pub_ed,

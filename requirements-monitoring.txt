@@ -1,0 +1,4 @@
+# Health checks and monitoring dependencies
+psutil>=5.9.0        # System metrics (CPU, memory, disk)
+sentry-sdk>=1.40.0   # Error tracking and performance monitoring
+httpx>=0.25.0        # Async HTTP client for RPC health checks

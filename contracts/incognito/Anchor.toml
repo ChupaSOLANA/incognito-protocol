@@ -17,10 +17,6 @@ cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 
 [[test.genesis]]
-address = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
-program = "../token-2022-src/dist/spl_token_2022.so"
-
-[[test.genesis]]
 address = "5QvQbnrL7fKpM5pCMS3zNqgTK8ALNkgHgRvgd49YF7v4"
 program = "../escrow/target/deploy/escrow.so"
 
@@ -31,3 +27,115 @@ test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\""
 [[test.genesis]]
 address = "BKck65TgoKRokMjQM3datB9oRwJ8rAj2jxPXvHXUvcL6"
 program = "/Users/alex/Desktop/incognito-protocol-1/contracts/incognito/artifacts/arcium_program_0.3.0.so"
+
+[[test.validator.account]]
+address = "FHriyvoZotYiFnbUzKFjzRSb2NiaC8RPWY7jtKuKhg65"
+filename = "artifacts/arcium_clock.json"
+
+[[test.validator.account]]
+address = "7MGSS4iKNM4sVib7bDZDJhVqB6EcchPwVnTKenCY1jt3"
+filename = "artifacts/arcium_fee_pool.json"
+
+[[test.validator.account]]
+address = "BoVUVSJAhob2cvM5z4JZTdS6VWRSznh3bbzQD1TFjvDP"
+filename = "artifacts/arx_mint.json"
+
+[[test.validator.account]]
+address = "79DsTcZCqQzwjwaU4Yx44sByaYfWGiARBecHTK7Y4NxE"
+filename = "artifacts/wallet_acc_79Ds_4NxE.json"
+
+[[test.validator.account]]
+address = "6yAr9Be9kndebuVyZD6X3NmDgGVHWQXFXKFfDnPkhZj8"
+filename = "artifacts/arx_ata_79Ds_4NxE.json"
+
+[[test.validator.account]]
+address = "CXTkGkpEXK3GsDGuHL8dhEXShYAnY6z6aLAA7z6HxVz7"
+filename = "artifacts/wallet_acc_CXTk_xVz7.json"
+
+[[test.validator.account]]
+address = "7RjHsZ1WAYWJc5ge1dh3rR3ZndwqrRrGRzL117sQhH7S"
+filename = "artifacts/wallet_acc_callback_7RjH_hH7S.json"
+
+[[test.validator.account]]
+address = "4tpLE1z2925WKPQ6nwjRARRmgJyLfy8NaegkBogEPaEH"
+filename = "artifacts/arx_ata_CXTk_xVz7.json"
+
+[[test.validator.account]]
+address = "FJY4VtVChyTFg51Gsx1YPiJjAfyJFL2tF8t1rhqcACqX"
+filename = "artifacts/operator_acc_CXTk_xVz7.json"
+
+[[test.validator.account]]
+address = "ELoRR19zrps1G3UYKcAxr7LKbw3kbqkVUXVY9dETMWN7"
+filename = "artifacts/arx_node_CXTk_xVz7.json"
+
+[[test.validator.account]]
+address = "7FeAQrcYZednD7zev5tioFvJ1sxsiLYpXCJms1cJGXEC"
+filename = "artifacts/wallet_acc_7FeA_GXEC.json"
+
+[[test.validator.account]]
+address = "CSQsNoDccR1PTt8AeurTQWLHBvbHeEEzNpAtXYckqDxJ"
+filename = "artifacts/wallet_acc_callback_CSQs_qDxJ.json"
+
+[[test.validator.account]]
+address = "2RUqfQbWbgtSY8TSwGCCJhFdT2z3iuKZjtxagSvYjxaR"
+filename = "artifacts/arx_ata_7FeA_GXEC.json"
+
+[[test.validator.account]]
+address = "DM6gGpfnaPAZanY34gVANARzrx85nhHewJV8wBmiVL6F"
+filename = "artifacts/operator_acc_7FeA_GXEC.json"
+
+[[test.validator.account]]
+address = "XdfSwb8ZajhN7CerfBSJVhyfx5fyLtv34QVKSRgMFA9"
+filename = "artifacts/arx_node_7FeA_GXEC.json"
+
+[[test.validator.account]]
+address = "GgSqqAyH7AVY3Umcv8NvncrjFaNJuQLmxzxFxPoPW2Yd"
+filename = "artifacts/cluster_acc_0.json"
+
+[[test.validator.account]]
+address = "GM7Efu8iwYJaJdV19ZWJjXRp3ZnhQqwBC3LfDGyCmo7B"
+filename = "artifacts/deposit_note_raw_circuit_0.json"
+
+[[test.validator.account]]
+address = "DZ7RnniyRs5VQR7nf7uqP3B4NszqZFnaCjBMgGQ76GAF"
+filename = "artifacts/add_together_raw_circuit_0.json"
+
+[[test.validator.account]]
+address = "GvajXaSHeHxr2v3sTP7GvEM1gsmNYgre475xQ9ViXz2m"
+filename = "artifacts/deposit_shielded_raw_circuit_0.json"
+
+[[test.validator.account]]
+address = "52aidaaEKkVhh9mtDfkr5pxKAHYYCKhbAPiG8fQBhgb2"
+filename = "artifacts/withdraw_note_check_raw_circuit_0.json"
+
+[[test.validator.account]]
+address = "9mnd2VkeSHCQp47Tn4PFjSXeSct17WPA2yQfjzd15xCQ"
+filename = "artifacts/withdraw_shielded_raw_circuit_0.json"
+
+[[test.validator.account]]
+address = "4ragL6VZwFVrEZw6r5vu4xwR1ZQTRCjidzcTf5AE5Hno"
+filename = "artifacts/withdraw_shared_raw_circuit_0.json"
+
+[[test.validator.account]]
+address = "GTMVWNpaXfquEu43xiUigvyHAMgZXNQfjvNsSWdJJHYQ"
+filename = "artifacts/deposit_shared_raw_circuit_0.json"
+
+[[test.validator.account]]
+address = "DnUAMZ6zPhpkbfsBf9LbguXVmdRkavqGVh6jQu894H11"
+filename = "artifacts/mxe_keygen_comp_def.json"
+
+[[test.validator.account]]
+address = "GKHwFyfRrEX4tgjq2fQKCxddQ4VdG6vR1F2x9GB5pKiL"
+filename = "artifacts/mxe_keygen_comp.json"
+
+[[test.validator.account]]
+address = "6cLV8iX35g2jsoLjeSh4uq4KcNax6pQSkS3NLNDMwGGV"
+filename = "artifacts/mxe_acc.json"
+
+[[test.validator.account]]
+address = "86TGn2hLt6Gn3mq5wLMXuNeNKEwiriaaBUeFojHLwJtV"
+filename = "artifacts/mempool_acc.json"
+
+[[test.validator.account]]
+address = "9r69NGV3gEhpgBgMJBuaTAr1BW6kTzAXmrPSpzSiT6rT"
+filename = "artifacts/executing_pool_acc.json"

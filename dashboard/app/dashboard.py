@@ -47,6 +47,17 @@ try:
 except Exception:
     SigningKey = None
 
+# Import client-side encryption utility
+try:
+    from services.crypto_core.client_encryption import (
+        encrypt_note_from_keypair_file,
+        decrypt_note_from_keypair_file
+    )
+    CLIENT_ENCRYPTION_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ Client-side encryption not available: {e}")
+    CLIENT_ENCRYPTION_AVAILABLE = False
+
 try:
     from services.crypto_core import messages
     from services.crypto_core.merkle import verify_merkle
@@ -460,7 +471,7 @@ def api_post(path: str, payload: dict) -> Tuple[int, dict]:
 
         if (
             r.status_code == 200
-            and path in ("/deposit", "/withdraw", "/convert", "/sweep", "/marketplace/buy")
+            and path in ("/deposit", "/withdraw", "/sweep", "/marketplace/buy")
             and AUTO_UPDATE_ROOTS
         ):
             try:
@@ -1073,6 +1084,73 @@ st.metric("SOL balance", text)
 
 st.divider()
 
+# Helper function to fetch and decrypt notes CLIENT-SIDE
+def fetch_user_notes(owner_pub: str, keypair_path: str) -> Tuple[int, List[Dict[str, Any]], Decimal]:
+    """
+    Fetch encrypted notes from API and decrypt them CLIENT-SIDE.
+
+    The API returns encrypted blobs that only the user can decrypt.
+    Decryption happens locally in the browser with the user's private key.
+
+    Args:
+        owner_pub: User's public key
+        keypair_path: Path to user's Solana keypair file
+
+    Returns:
+        (status_code, decrypted_notes, total_balance)
+    """
+    try:
+        # Fetch encrypted notes from API
+        response = requests.get(f"{API_URL}/notes/{owner_pub}", timeout=10)
+
+        if response.status_code != 200:
+            return (response.status_code, [], Decimal("0"))
+
+        data = response.json()
+        encrypted_notes = data.get("notes", [])
+
+        # Decrypt each note CLIENT-SIDE
+        decrypted_notes = []
+        total_balance = Decimal("0")
+
+        for enc_note in encrypted_notes:
+            try:
+                if not CLIENT_ENCRYPTION_AVAILABLE:
+                    st.warning("⚠️ Client-side encryption not available")
+                    break
+
+                # Decrypt with user's keypair
+                note_data = decrypt_note_from_keypair_file(
+                    enc_note["encrypted_blob"],
+                    keypair_path
+                )
+
+                # Combine decrypted data with public fields
+                decrypted_note = {
+                    "secret": note_data["secret"],
+                    "nullifier": note_data["nullifier"],
+                    "amount_sol": Decimal(str(note_data["amount_sol"])),
+                    "leaf_index": note_data["leaf_index"],
+                    "commitment": enc_note["commitment"],
+                    "spent": enc_note.get("spent", False),
+                    "created_at": enc_note.get("created_at", "Unknown")
+                }
+
+                decrypted_notes.append(decrypted_note)
+
+                # Calculate total balance (client-side!)
+                total_balance += Decimal(str(note_data["amount_sol"]))
+
+            except Exception as e:
+                st.warning(f"⚠️ Failed to decrypt note {enc_note['commitment'][:8]}: {e}")
+                continue
+
+        return (200, decrypted_notes, total_balance)
+
+    except Exception as e:
+        st.error(f"Error fetching notes: {e}")
+        return (500, [], Decimal("0"))
+
 # Use custom tabs with session state to preserve active tab across reruns
 if 'active_tab' not in st.session_state:
     st.session_state['active_tab'] = 0  # Default to first tab
@@ -1080,8 +1158,7 @@ if 'active_tab' not in st.session_state:
 tab_names = [
     "Deposit",
     "Withdraw",
-    "Convert",
-    "Stealth & Sweep",
+    "Notes",
     "Listings",
     "Orders / Shipping",
     "My Profile",
@@ -1167,24 +1244,56 @@ if active_tab == "Deposit":
 
             credential_json = json.dumps(credential_data, indent=2)
 
-            commitment_short = res.get('commitment')[:8]
-            note_filename = f"note_{commitment_short}_{int(time.time())}.json"
-            note_path = NOTES_DIR / note_filename
+            # NOTE: Credential files disabled - notes are now encrypted in database
+            # commitment_short = res.get('commitment')[:8]
+            # note_filename = f"note_{commitment_short}_{int(time.time())}.json"
+            # note_path = NOTES_DIR / note_filename
+            # NOTES_DIR.mkdir(parents=True, exist_ok=True)
+            # with open(note_path, 'w') as f:
+            #     f.write(credential_json)
 
-            NOTES_DIR.mkdir(parents=True, exist_ok=True)
+            # NEW: Client-side encrypt and store note
+            if CLIENT_ENCRYPTION_AVAILABLE:
+                try:
+                    # Prepare note data for encryption
+                    note_data = {
+                        "secret": res.get('secret'),
+                        "nullifier": res.get('nullifier'),
+                        "amount_sol": vault_amount_sol,
+                        "leaf_index": res.get('leaf_index')
+                    }
 
-            with open(note_path, 'w') as f:
-                f.write(credential_json)
+                    # Encrypt locally with user's keypair
+                    encrypted_blob = encrypt_note_from_keypair_file(note_data, active_key)
+
+                    # Store encrypted note via API
+                    store_payload = {
+                        "owner_pubkey": active_pub,
+                        "commitment": res.get('commitment'),
+                        "encrypted_blob": encrypted_blob,
+                        "tx_signature": res.get('tx_signature', '')
+                    }
+
+                    store_code, store_res = api_post("/notes/store", store_payload)
+                    if store_code == 200:
+                        st.info("✅ Note encrypted CLIENT-SIDE and stored securely (only you can decrypt!)")
+                    else:
+                        st.warning(f"⚠️ Note not stored in database: {store_res}")
+
+                except Exception as e:
+                    st.error(f"Failed to encrypt/store note: {e}")
+            else:
+                st.warning("⚠️ Client-side encryption not available - note not stored")
 
             st.success(" Deposit successful!")
             st.markdown("---")
-            st.markdown("###  Credential File Saved")
+            st.markdown("###  Credentials (Save These Securely)")
             st.info(f"""
-            **Credential file saved to**: `{note_path.relative_to(REPO_ROOT)}`
+            **Note**: Credentials are now encrypted and stored in the database.
 
              You deposited **{amt} SOL**. After 0.05 SOL wrapper fee, **{vault_amount_sol:.2f} SOL** is available for withdrawal.
 
-            **To withdraw**: Upload this file in the Withdraw tab.
+            **To withdraw**: Use your credentials below or retrieve from the Notes tab.
             """)
 
             with st.expander("View Credentials"):
@@ -1200,91 +1309,57 @@ if active_tab == "Deposit":
 elif active_tab == "Withdraw":
     st.subheader("Withdraw (from Privacy Pool → you)")
 
-    st.info(" Select or upload your credential file to withdraw funds")
+    st.info(" Select a note from your encrypted database to withdraw funds")
 
-    available_notes = []
-    if NOTES_DIR.exists():
-        available_notes = sorted(NOTES_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    # Fetch user's notes from database and decrypt CLIENT-SIDE
+    status_code, user_notes, total_balance = fetch_user_notes(active_pub, active_key)
 
-    use_existing = False
-    selected_note_path = None
+    if status_code != 200 or not user_notes:
+        st.warning(" No notes found in database. Please deposit first.")
+        st.stop()
 
-    if available_notes:
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            use_existing = st.checkbox("Use existing note from /notes folder", value=True)
+    # Display total balance
+    st.metric("Total Balance (Unspent Notes)", f"{total_balance} SOL")
 
-        if use_existing:
-            note_options = {str(p.relative_to(REPO_ROOT)): p for p in available_notes}
-            selected_note_relative = st.selectbox("Select note", list(note_options.keys()))
-            selected_note_path = note_options[selected_note_relative]
-
-    uploaded_file = None
-    if not use_existing:
-        uploaded_file = st.file_uploader("Upload Credential File", type=['json'], key="withdraw_cred_upload")
-
-    credentials_data = None
-
-    if use_existing and selected_note_path:
-        try:
-            with open(selected_note_path, 'r') as f:
-                credentials_data = json.load(f)
-
-            if "credentials" not in credentials_data:
-                st.error(" Invalid credential file format")
-                credentials_data = None
-            else:
-                st.success(f" Loaded credentials: {credentials_data['amount_withdrawable_sol']} SOL available")
-
-                with st.expander("Credential Details"):
-                    st.json(credentials_data)
-
-        except Exception as e:
-            st.error(f" Error loading file: {str(e)}")
-            credentials_data = None
-
-    elif uploaded_file is not None:
-        try:
-            credentials_data = json.load(uploaded_file)
-
-            if "credentials" not in credentials_data:
-                st.error(" Invalid credential file format")
-                credentials_data = None
-            else:
-                st.success(f" Loaded credentials: {credentials_data['amount_withdrawable_sol']} SOL available")
-
-                with st.expander("Credential Details"):
-                    st.json(credentials_data)
-
-        except Exception as e:
-            st.error(f" Error loading file: {str(e)}")
-            credentials_data = None
-
-    selected_deposit = None
-    amt_input = None
-
-    if credentials_data:
-        creds = credentials_data["credentials"]
-        max_amount = Decimal(str(credentials_data["amount_withdrawable_sol"]))
-
-        selected_deposit = {
-            "secret": creds["secret"],
-            "nullifier": creds["nullifier"],
-            "commitment": creds["commitment"],
-            "leaf_index": creds["leaf_index"],
-            "amount_sol": float(max_amount)
-        }
-
-        st.write(f"**Withdrawable Amount**: {max_amount} SOL")
-
-        withdraw_all = st.checkbox("Withdraw full amount", value=True, key="withdraw_all_file")
-        if not withdraw_all:
-            amt_input = st.text_input("Amount (SOL)", value=str(max_amount), key="withdraw_amt_file")
-        else:
-            amt_input = str(max_amount)
-
+    # Let user select which note to withdraw
+    if len(user_notes) == 1:
+        st.info(f" You have 1 note available")
+        selected_note_index = 0
     else:
-        st.warning(" Please upload a credential file to withdraw")
+        st.info(f" You have {len(user_notes)} notes available. Select one to withdraw:")
+
+        note_options = []
+        for i, note in enumerate(user_notes):
+            note_amount = Decimal(str(note.get('amount_sol', 0)))
+            note_commitment = note.get('commitment', '')[:16]
+            note_options.append(f"Note #{i+1}: {note_amount} SOL (commitment: {note_commitment}...)")
+
+        selected_note_display = st.selectbox("Select note to withdraw", note_options)
+        selected_note_index = note_options.index(selected_note_display)
+
+    # Get selected note
+    selected_note = user_notes[selected_note_index]
+    max_amount = Decimal(str(selected_note.get('amount_sol', 0)))
+
+    selected_deposit = {
+        "secret": selected_note["secret"],
+        "nullifier": selected_note["nullifier"],
+        "commitment": selected_note["commitment"],
+        "leaf_index": selected_note["leaf_index"],
+        "amount_sol": float(max_amount)
+    }
+
+    st.write(f"**Withdrawable Amount**: {max_amount} SOL")
+
+    with st.expander("View Note Details"):
+        st.json(selected_note)
+
+    # Withdraw amount selection
+    withdraw_all = st.checkbox("Withdraw full amount", value=True, key="withdraw_all_db")
+    if not withdraw_all:
+        amt_input = st.text_input("Amount (SOL)", value=str(max_amount), key="withdraw_amt_db")
+    else:
+        amt_input = str(max_amount)
 
     if st.button("Withdraw", type="primary"):
         if not selected_deposit:
@@ -1314,18 +1389,44 @@ elif active_tab == "Withdraw":
                     c, res = api_post("/withdraw", payload)
 
                 if c == 200:
-                    st.success("Withdraw confirmed ")
-
-                    if use_existing and selected_note_path:
-                        try:
-                            selected_note_path.unlink()
-                            st.info(f" Consumed note file deleted: `{selected_note_path.relative_to(REPO_ROOT)}`")
-                        except Exception as e:
-                            st.warning(f" Could not delete note file: {str(e)}")
+                    st.success("Withdraw confirmed! Note marked as spent in database.")
 
                     if "change_note" in res and res["change_note"] is not None:
                         change = res["change_note"]
                         st.info(f" Change note created: {change['amount_sol']} SOL")
+
+                        # NEW: Client-side encrypt and store change note
+                        if CLIENT_ENCRYPTION_AVAILABLE:
+                            try:
+                                # Prepare change note data for encryption
+                                change_note_data = {
+                                    "secret": change["secret"],
+                                    "nullifier": change["nullifier"],
+                                    "amount_sol": change["amount_sol"],
+                                    "leaf_index": change["leaf_index"]
+                                }
+
+                                # Encrypt locally with user's keypair
+                                encrypted_change_blob = encrypt_note_from_keypair_file(change_note_data, active_key)
+
+                                # Store encrypted change note via API
+                                store_payload = {
+                                    "owner_pubkey": active_pub,
+                                    "commitment": change["commitment"],
+                                    "encrypted_blob": encrypted_change_blob,
+                                    "tx_signature": change.get("tx_signature", "")
+                                }
+
+                                store_code, store_res = api_post("/notes/store", store_payload)
+                                if store_code == 200:
+                                    st.success("✅ Change note encrypted CLIENT-SIDE and stored securely!")
+                                else:
+                                    st.warning(f"⚠️ Change note not stored in database: {store_res}")
+
+                            except Exception as e:
+                                st.error(f"Failed to encrypt/store change note: {e}")
+                        else:
+                            st.warning("⚠️ Client-side encryption not available - change note not stored")
 
                         change_credential_data = {
                             "version": "1.0",
@@ -1348,24 +1449,23 @@ elif active_tab == "Withdraw":
 
                         change_credential_json = json.dumps(change_credential_data, indent=2)
 
-                        change_commitment_short = change['commitment'][:8]
-                        change_note_filename = f"change_{change_commitment_short}_{int(time.time())}.json"
-                        change_note_path = NOTES_DIR / change_note_filename
-
-                        NOTES_DIR.mkdir(parents=True, exist_ok=True)
-
-                        with open(change_note_path, 'w') as f:
-                            f.write(change_credential_json)
+                        # NOTE: Credential files disabled - notes are now encrypted in database
+                        # change_commitment_short = change['commitment'][:8]
+                        # change_note_filename = f"change_{change_commitment_short}_{int(time.time())}.json"
+                        # change_note_path = NOTES_DIR / change_note_filename
+                        # NOTES_DIR.mkdir(parents=True, exist_ok=True)
+                        # with open(change_note_path, 'w') as f:
+                        #     f.write(change_credential_json)
 
                         st.markdown("---")
-                        st.markdown("###  Change Note Created")
+                        st.markdown("###  Change Note Created (Encrypted in Database)")
                         st.info(f"""
-                        **Change credential file saved to**: `{change_note_path.relative_to(REPO_ROOT)}`
+                        **Note**: Change note is encrypted and stored in the database.
 
                         Change amount: **{change['amount_sol']} SOL**
 
                         A new note has been created for your remaining balance.
-                        **To withdraw the change**: Upload this file in the Withdraw tab.
+                        **To withdraw the change**: Retrieve from the Notes tab or use credentials below.
                         """)
 
                         with st.expander("View Change Note Credentials"):
@@ -1390,164 +1490,112 @@ elif active_tab == "Withdraw":
                     flash("Withdraw failed ", "error")
                     st.error(res)
 
-elif active_tab == "Convert":
-    st.subheader("Convert cSOL → Privacy Note")
-    st.caption("Convert your cSOL back to a privacy note for withdrawal. Minimum: 0.05 SOL (wrapper deposit fee)")
+elif active_tab == "Notes":
+    st.subheader("My Notes (Privacy Pool)")
+    st.info(" Your encrypted notes stored in the database")
 
-    amt_c = st.number_input(
-        "Amount (SOL)",
-        value=1.0,
-        min_value=0.06,
-        step=0.1,
-        key="convert_amt",
-        help="Amount must be greater than 0.05 SOL to cover wrapper deposit fee"
-    )
+    # Fetch user's notes from database and decrypt CLIENT-SIDE
+    status_code, user_notes, total_balance = fetch_user_notes(active_pub, active_key)
 
-    if st.button("Convert cSOL to Privacy Note", type="primary", use_container_width=True):
-        payload = {"sender_keyfile": active_key, "amount_sol": float(amt_c)}
+    if status_code != 200:
+        st.error(f"Error fetching notes from database (status {status_code})")
+        st.stop()
 
-        flash("Converting cSOL to privacy note…")
-        with st.spinner("Processing conversion…"):
-            c, res = api_post("/convert", payload)
-            if c == 200:
-                st.success(f"✅ Converted {amt_c} cSOL to privacy note!", icon="✅")
-                st.info("💡 Your note has been created. You can now withdraw SOL using the note.")
-                time.sleep(1)
-                safe_rerun()
-            else:
-                error_msg = res.get("detail", str(res)) if isinstance(res, dict) else str(res)
-                st.toast(f"❌ Convert failed: {error_msg}", icon="❌")
-                st.error(error_msg)
-                if "insufficient" in error_msg.lower() or "balance" in error_msg.lower():
-                    st.warning("💡 Tip: You may not have enough cSOL balance. Try applying your pending balance first or use a smaller amount.")
+    if not user_notes:
+        st.warning(" No notes found. Make a deposit to create your first note!")
+        st.stop()
 
-elif active_tab == "Stealth & Sweep":
-    st.subheader(f"Stealth addresses & Sweep (≥ {MIN_STEALTH_SOL} SOL)")
+    # Display total balance prominently
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Total Balance (Unspent Notes)", f"{total_balance} SOL")
+    with col2:
+        st.metric("Total Notes", len(user_notes))
 
-    stealth_data = get_stealth(active_pub, True, MIN_STEALTH_SOL)
-    if isinstance(stealth_data, dict) and "items" in stealth_data:
-        items = stealth_data.get("items", [])
-        total = stealth_data.get("total_sol", "0")
+    st.divider()
 
-        st.markdown("#### Stealth addresses")
-        if items:
-            rows = []
-            for it in items:
-                pk = it.get("stealth_pubkey")
-                bal = it.get("balance_sol") or "0"
-                shown_bal = "•••" if st.session_state["blur_amounts"] else fmt_amt(bal)
-                rows.append({"Stealth address": short(pk, 8), "Balance (SOL)": shown_bal})
-            st.table(rows)
-        else:
-            st.info("No stealth addresses above the threshold yet.")
+    # Display notes in a table format
+    st.markdown("### All Notes")
 
-        shown_total = "•••" if st.session_state["blur_amounts"] else total
-        st.success(f"**Total across listed:** {shown_total} SOL")
+    for i, note in enumerate(user_notes):
+        note_amount = Decimal(str(note.get('amount_sol', 0)))
+        note_commitment = note.get('commitment', '')
+        note_spent = note.get('spent', False)
+        note_created = note.get('created_at', 'Unknown')
 
-        st.divider()
-        st.subheader("Sweep funds from stealth → destination pubkey")
+        # Color-code based on spent status
+        status_emoji = "🔴" if note_spent else "🟢"
+        status_text = "SPENT" if note_spent else "AVAILABLE"
 
-        options: List[str] = []
-        opt_to_pub: Dict[str, str] = {}
-        pub_to_bal: Dict[str, str] = {}
+        with st.expander(
+            f"{status_emoji} Note #{i+1}: **{note_amount} SOL** - {status_text}",
+            expanded=False
+        ):
+            col_info, col_actions = st.columns([3, 1])
 
-        for it in items:
-            pk = it.get("stealth_pubkey")
-            bal = str(it.get("balance_sol") or "0")
-            label = f"{short(pk, 8)} — {fmt_amt(bal)} SOL"
-            options.append(label)
-            opt_to_pub[label] = pk
-            pub_to_bal[pk] = bal
+            with col_info:
+                st.markdown(f"**Amount**: {note_amount} SOL")
+                st.markdown(f"**Status**: {status_text}")
+                st.markdown(f"**Commitment**: `{note_commitment[:32]}...`")
+                st.markdown(f"**Created**: {note_created}")
 
-        if not options:
-            st.warning("No stealth addresses above the threshold to sweep.")
-        else:
-            st.session_state.setdefault("sweep_selected", [])
+                # Show full credentials in a collapsible section
+                with st.expander("View Full Credentials"):
+                    st.json({
+                        "secret": note.get('secret', ''),
+                        "nullifier": note.get('nullifier', ''),
+                        "commitment": note.get('commitment', ''),
+                        "leaf_index": note.get('leaf_index', 0),
+                        "amount_sol": float(note_amount),
+                        "spent": note_spent
+                    })
 
-            c1, _ = st.columns([1, 3])
-            with c1:
-                if st.button("Select all"):
-                    st.session_state["sweep_selected"] = options[:]
-                    safe_rerun()
+            with col_actions:
+                if not note_spent:
+                    if st.button("Withdraw This Note", key=f"withdraw_note_{i}", type="primary"):
+                        # Switch to withdraw tab and pre-select this note
+                        st.session_state['active_tab'] = 1  # Withdraw tab index
+                        st.session_state['preselect_note_index'] = i
+                        st.rerun()
 
-            prev_selected = st.session_state.get("sweep_selected", [])
-            if prev_selected:
-                sanitized = [x for x in prev_selected if x in options]
-                if len(sanitized) != len(prev_selected):
-                    st.session_state["sweep_selected"] = sanitized
-                default_for_widget = st.session_state["sweep_selected"]
-            else:
-                default_for_widget = []
+    st.divider()
 
-            selected_labels = st.multiselect(
-                "Stealth addresses",
-                options=options,
-                default=default_for_widget,
-                help="Pick one or many. Use Select all to include every listed address.",
-                key="sweep_multisel",
-            )
-            st.session_state["sweep_selected"] = selected_labels
+    # Export credentials option
+    st.markdown("### Export Credentials")
+    st.caption("Download all your note credentials as a JSON file for backup")
 
-            selected_pubkeys = [opt_to_pub[l] for l in selected_labels if l in opt_to_pub]
+    if st.button("Export All Credentials", type="secondary"):
+        export_data = {
+            "version": "1.0",
+            "network": "localnet",
+            "owner_pubkey": active_pub,
+            "export_date": datetime.now().isoformat(),
+            "total_balance_sol": float(total_balance),
+            "total_notes": len(user_notes),
+            "notes": [
+                {
+                    "note_number": i+1,
+                    "amount_sol": float(Decimal(str(note.get('amount_sol', 0)))),
+                    "spent": note.get('spent', False),
+                    "credentials": {
+                        "secret": note.get('secret', ''),
+                        "nullifier": note.get('nullifier', ''),
+                        "commitment": note.get('commitment', ''),
+                        "leaf_index": note.get('leaf_index', 0)
+                    },
+                    "created_at": note.get('created_at', 'Unknown')
+                }
+                for i, note in enumerate(user_notes)
+            ]
+        }
 
-            from decimal import Decimal as _D
-            selected_total_dec = (
-                sum(_D(str(pub_to_bal[pk])) for pk in selected_pubkeys)
-                if selected_pubkeys else _D("0")
-            )
-            selected_total_str = fmt_amt(selected_total_dec)
-            shown_selected_total = "•••" if st.session_state["blur_amounts"] else selected_total_str
-
-            st.success(
-                f"Selected: **{len(selected_pubkeys)} / {len(options)}** addresses · "
-                f"Total: **{shown_selected_total} SOL**"
-            )
-
-            dest_pub = st.text_input(
-                "Destination pubkey",
-                value="",
-                help="You can paste any pubkey.",
-            ).strip()
-
-            all_amt_sw = st.checkbox(
-                "Sweep ALL available from selected addresses (excl. buffer)",
-                value=True,
-                key="sweep_all",
-            )
-
-            amt_sw = None
-            if not all_amt_sw:
-                amt_sw = st.text_input("Amount (SOL)", value=selected_total_str, key="sweep_amt").strip()
-
-            if st.button("Sweep", type="primary"):
-                if not dest_pub:
-                    st.error("Destination pubkey required.")
-                else:
-                    prev_sol = get_sol_balance(active_pub)
-                    prev_stealth = _read_stealth_total(active_pub)
-
-                    payload = {
-                        "owner_pub": active_pub,
-                        "secret_keyfile": active_key,
-                        "dest_pub": dest_pub,
-                    }
-                    if selected_pubkeys:
-                        payload["stealth_pubkeys"] = selected_pubkeys
-                    if not all_amt_sw and amt_sw:
-                        payload["amount_sol"] = amt_sw
-
-                    flash("Submitting sweep…")
-                    with st.spinner("Sending sweep…"):
-                        c, res = api_post("/sweep", payload)
-                        if c == 200:
-                            st.success("Sweep confirmed ")
-                            st.session_state["sweep_selected"] = []
-                            wait_for_state_update(active_pub, prev_sol, prev_stealth)
-                        else:
-                            flash("Sweep failed ", "error")
-                            st.error(res)
-    else:
-        st.warning("Stealth info not available from API.")
+        export_json = json.dumps(export_data, indent=2)
+        st.download_button(
+            label="Download Credentials JSON",
+            data=export_json,
+            file_name=f"incognito_notes_backup_{active_pub[:8]}_{int(time.time())}.json",
+            mime="application/json"
+        )
 
 elif active_tab == "Listings":
     st.subheader("Marketplace Listings")
@@ -1794,7 +1842,7 @@ elif active_tab == "Listings":
                             phone_v = st.text_input("Phone (optional)", placeholder="+1 234 567 8900")
 
                             st.markdown("#### 💰 Payment Method")
-                            payment_method = "Auto (cSOL first, then notes)"
+                            payment_method = "Privacy Notes"
                             selected_note = None
 
                             if has_notes:
@@ -1893,6 +1941,28 @@ elif active_tab == "Listings":
                                         if res.get("change_note"):
                                             change_note = res["change_note"]
                                             st.info(f"📝 Change note created: {change_note['amount_sol']:.4f} SOL (leaf {change_note['leaf_index']})")
+
+                                            # Encrypt and store change note client-side
+                                            if CLIENT_ENCRYPTION_AVAILABLE:
+                                                try:
+                                                    change_data = {
+                                                        "secret": change_note["secret"],
+                                                        "nullifier": change_note["nullifier"],
+                                                        "amount_sol": change_note["amount_sol"],
+                                                        "leaf_index": change_note["leaf_index"]
+                                                    }
+                                                    encrypted_blob = encrypt_note_from_keypair_file(change_data, active_key)
+                                                    store_payload = {
+                                                        "owner_pubkey": active_pub,
+                                                        "commitment": change_note["commitment"],
+                                                        "encrypted_blob": encrypted_blob,
+                                                        "tx_signature": change_note.get("tx_signature", "")
+                                                    }
+                                                    store_code, store_res = api_post("/notes/store", store_payload)
+                                                    if store_code == 200:
+                                                        st.success("✅ Change note encrypted and stored!")
+                                                except Exception as e:
+                                                    st.warning(f"⚠️ Failed to store change note: {e}")
                                         wait_for_state_update(active_pub, prev_sol, None)
                                         st.session_state[f'show_buy_modal_{listing_id}'] = False
                                         time.sleep(1)
@@ -1930,7 +2000,7 @@ elif active_tab == "Orders / Shipping":
                         st.caption("Amount")
                         st.write(
                             f"{o.get('quantity')} × {fmt_amt(o.get('unit_price'))} = "
-                            f"{fmt_amt(o.get('total_price'))} cSOL"
+                            f"{fmt_amt(o.get('total_price'))} SOL"
                         )
 
                     with c4:

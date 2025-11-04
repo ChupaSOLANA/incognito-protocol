@@ -3,7 +3,26 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import List, Optional, Literal, Dict, Any
 
-from pydantic import BaseModel, Field, conint, condecimal, root_validator
+from pydantic import BaseModel, Field, conint, condecimal, root_validator, validator
+
+# Import validation utilities
+from services.api.validators import (
+    validate_commitment,
+    validate_nullifier,
+    validate_secret,
+    validate_nonce,
+    validate_solana_pubkey,
+    validate_sol_amount,
+    validate_lamports,
+    validate_username,
+    validate_base64,
+    validate_uri,
+    validate_signature_hex,
+    validate_cluster,
+    validate_leaf_index,
+    validate_quantity,
+    ValidationError,
+)
 
 class _DecimalAsStr(BaseModel):
     class Config:
@@ -34,6 +53,16 @@ class DepositReq(_DecimalAsStr):
     amount_sol: condecimal(gt=0) = Field(..., description="Deposit amount in SOL (must be > 0.05 for wrapper fee).")
     cluster: str = Field(default="localnet", description="Solana cluster: localnet/devnet/mainnet-beta")
 
+    @validator("amount_sol")
+    def validate_amount(cls, v):
+        """Validate SOL amount for security"""
+        return validate_sol_amount(v, "amount_sol")
+
+    @validator("cluster")
+    def validate_cluster_name(cls, v):
+        """Validate cluster name"""
+        return validate_cluster(v)
+
 class DepositRes(Ok):
     tx_signature: str = Field(..., description="Transaction signature")
     wrapper_stealth_address: str = Field(..., description="Stealth address that received 0.05 SOL wrapper fee")
@@ -54,6 +83,36 @@ class WithdrawReq(_DecimalAsStr):
     commitment: str = Field(..., description="Commitment from deposit (hex)")
     leaf_index: int = Field(..., description="Index of commitment in Merkle tree (from deposit response)")
     cluster: str = Field(default="localnet", description="Solana cluster: localnet/devnet/mainnet-beta")
+
+    @validator("amount_sol", "deposited_amount_sol")
+    def validate_amounts(cls, v):
+        """Validate SOL amounts for security"""
+        return validate_sol_amount(v, "amount_sol")
+
+    @validator("secret")
+    def validate_secret_hex(cls, v):
+        """Validate secret hex format"""
+        return validate_secret(v)
+
+    @validator("nullifier")
+    def validate_nullifier_hex(cls, v):
+        """Validate nullifier hex format"""
+        return validate_nullifier(v)
+
+    @validator("commitment")
+    def validate_commitment_hex(cls, v):
+        """Validate commitment hex format"""
+        return validate_commitment(v)
+
+    @validator("leaf_index")
+    def validate_leaf_idx(cls, v):
+        """Validate leaf index"""
+        return validate_leaf_index(v)
+
+    @validator("cluster")
+    def validate_cluster_name(cls, v):
+        """Validate cluster name"""
+        return validate_cluster(v)
 
 class WithdrawRes(Ok):
     tx_signature: str = Field(..., description="Transaction signature")
@@ -76,41 +135,9 @@ class ListNotesRes(Ok):
     notes: List[NoteInfo] = Field(..., description="List of available notes")
     total_balance: str = Field(..., description="Total balance across all notes (SOL)")
 
-class ConvertReq(_DecimalAsStr):
-    sender_keyfile: str = Field(..., description="Keyfile of the cSOL owner.")
-    amount_sol: condecimal(gt=0) = Field(..., description="Amount to convert (SOL).")
-    cluster: str = Field(default="localnet", description="Solana cluster: localnet/devnet/mainnet-beta")
 
-class ConvertRes(Ok):
-    tx_signature_transfer: str = Field(..., description="Transaction signature for cSOL confidential transfer to wrapper")
-    tx_signature_deposit: str = Field(..., description="Transaction signature for note creation")
-    secret: str = Field(..., description="Secret for new note (hex)")
-    nullifier: str = Field(..., description="Nullifier for new note (hex)")
-    commitment: str = Field(..., description="Commitment for new note (hex)")
-    leaf_index: int = Field(..., description="Index of new note in Merkle tree")
-    amount_sol: str = Field(..., description="Amount in the new note (SOL)")
 
-class CsolToNoteReq(_DecimalAsStr):
-    """
-    Convert cSOL back to a privacy note.
 
-    User sends cSOL to wrapper, wrapper burns it and creates a new note
-    representing SOL in the vault that can be withdrawn privately.
-    """
-    user_keyfile: str = Field(..., description="User's keypair file (owner of cSOL)")
-    amount_sol: condecimal(gt=0) = Field(..., description="Amount of cSOL to convert (SOL)")
-    cluster: str = Field(default="localnet", description="Solana cluster: localnet/devnet/mainnet-beta")
-
-class CsolToNoteRes(Ok):
-    """Response with new note credentials for the converted cSOL"""
-    tx_signature_transfer: str = Field(..., description="Transaction signature for cSOL transfer")
-    tx_signature_burn: str = Field(..., description="Transaction signature for cSOL burn")
-    tx_signature_deposit: str = Field(..., description="Transaction signature for note creation")
-    secret: str = Field(..., description="Secret for new note (hex)")
-    nullifier: str = Field(..., description="Nullifier for new note (hex)")
-    commitment: str = Field(..., description="Commitment for new note (hex)")
-    leaf_index: int = Field(..., description="Index of new note in Merkle tree")
-    amount_sol: str = Field(..., description="Amount in the new note (SOL)")
 
 class StealthItem(_DecimalAsStr):
     stealth_pubkey: str
@@ -134,6 +161,26 @@ class SweepReq(_DecimalAsStr):
         None, description="Optional list of specific stealth addresses to sweep from (overrides automatic selection)."
     )
 
+    @validator("owner_pub", "dest_pub")
+    def validate_pubkeys(cls, v):
+        """Validate pubkeys"""
+        return validate_solana_pubkey(v, "pubkey")
+
+    @validator("amount_sol")
+    def validate_amount(cls, v):
+        """Validate sweep amount if provided"""
+        if v:
+            return validate_sol_amount(v, "amount_sol")
+        return v
+
+    @validator("stealth_pubkeys")
+    def validate_stealth_pubkeys_list(cls, v):
+        """Validate stealth pubkeys if provided"""
+        if v:
+            for pub in v:
+                validate_solana_pubkey(pub, "stealth_pubkey")
+        return v
+
 class SweepRes(Ok):
     requested: str
     sent_total: str
@@ -141,18 +188,12 @@ class SweepRes(Ok):
 
 class BuyReq(_DecimalAsStr):
     """
-    Buy a listing using dual payment system (cSOL or notes).
+    Buy a listing using privacy pool notes.
 
-    Payment priority:
-    1. Try cSOL confidential transfer (if buyer has cSOL balance)
-    2. If no cSOL, use note payment (if note credentials provided)
-
-    Note credentials (OPTIONAL - only needed if paying with notes):
+    Note credentials (REQUIRED):
       - secret, nullifier, commitment: 32-byte hex strings proving note ownership
       - leaf_index: Position in on-chain Merkle tree
       - deposited_amount_sol: Original note amount (must be >= listing price)
-
-    If paying with cSOL, these fields can be omitted or set to empty/dummy values.
 
     Optionally include `encrypted_shipping` — an object containing:
       - ephemeral_pub_b58: str
@@ -166,16 +207,46 @@ class BuyReq(_DecimalAsStr):
     listing_id: str = Field(..., description="Unique listing identifier.")
     quantity: conint(ge=1) = 1
 
-    secret: Optional[str] = Field(default="", description="32-byte note secret (hex) - optional if paying with cSOL")
-    nullifier: Optional[str] = Field(default="", description="32-byte note nullifier (hex) - optional if paying with cSOL")
-    commitment: Optional[str] = Field(default="", description="32-byte note commitment (hex) - optional if paying with cSOL")
-    leaf_index: Optional[int] = Field(default=0, description="Note's position in on-chain Merkle tree - optional if paying with cSOL")
-    deposited_amount_sol: Optional[Decimal] = Field(default=None, description="Original amount deposited in the note (SOL) - optional if paying with cSOL, must be > 0 if provided")
+    secret: str = Field(..., description="32-byte note secret (hex)")
+    nullifier: str = Field(..., description="32-byte note nullifier (hex)")
+    commitment: str = Field(..., description="32-byte note commitment (hex)")
+    leaf_index: int = Field(..., description="Note's position in on-chain Merkle tree")
+    deposited_amount_sol: Decimal = Field(..., description="Original amount deposited in the note (SOL), must be > 0")
 
     encrypted_shipping: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Optional encrypted shipping payload for the seller (ephemeral_pub_b58, nonce_hex, ciphertext_b64, thread_id_b64, algo).",
     )
+
+    @validator("secret")
+    def validate_secret_hex(cls, v):
+        """Validate secret hex format"""
+        return validate_secret(v)
+
+    @validator("nullifier")
+    def validate_nullifier_hex(cls, v):
+        """Validate nullifier hex format"""
+        return validate_nullifier(v)
+
+    @validator("commitment")
+    def validate_commitment_hex(cls, v):
+        """Validate commitment hex format"""
+        return validate_commitment(v)
+
+    @validator("leaf_index")
+    def validate_leaf_idx(cls, v):
+        """Validate leaf index"""
+        return validate_leaf_index(v)
+
+    @validator("deposited_amount_sol")
+    def validate_amount(cls, v):
+        """Validate deposited amount"""
+        return validate_sol_amount(v, "deposited_amount_sol")
+
+    @validator("quantity")
+    def validate_qty(cls, v):
+        """Validate quantity"""
+        return validate_quantity(v)
 
 class BuyRes(Ok):
     listing_id: str
@@ -208,6 +279,42 @@ class ListingCreateReq(_DecimalAsStr):
     quantity: conint(ge=0) = 1
     image_uris: Optional[List[str]] = None
 
+    @validator("unit_price_sol")
+    def validate_price(cls, v):
+        """Validate unit price"""
+        return validate_sol_amount(v, "unit_price_sol")
+
+    @validator("quantity")
+    def validate_qty(cls, v):
+        """Validate quantity"""
+        if v < 0:
+            raise ValueError("quantity cannot be negative")
+        return v
+
+    @validator("title")
+    def validate_title_length(cls, v):
+        """Validate title length and format"""
+        if not v or not v.strip():
+            raise ValueError("title cannot be empty")
+        if len(v) > 200:
+            raise ValueError("title must be at most 200 characters")
+        return v.strip()
+
+    @validator("description")
+    def validate_description_length(cls, v):
+        """Validate description length"""
+        if v and len(v) > 5000:
+            raise ValueError("description must be at most 5000 characters")
+        return v
+
+    @validator("image_uris")
+    def validate_image_uris_list(cls, v):
+        """Validate image URIs"""
+        if v:
+            for uri in v:
+                validate_uri(uri)
+        return v
+
 class ListingCreateRes(_DecimalAsStr):
     ok: bool = True
     listing: Listing
@@ -238,6 +345,25 @@ class ProfileBlob(_DecimalAsStr):
     version: conint(ge=1) = 1
     meta: Optional[Dict[str, Any]] = None
     sig: str = Field(..., description="Owner signature (hex) over canonical blob (without 'sig').")
+
+    @validator("username")
+    def validate_username_format(cls, v):
+        """Validate username for security"""
+        return validate_username(v)
+
+    @validator("pubs")
+    def validate_pubkeys(cls, v):
+        """Validate all pubkeys"""
+        if not v:
+            raise ValueError("pubs cannot be empty")
+        for pub in v:
+            validate_solana_pubkey(pub, "pubkey")
+        return v
+
+    @validator("sig")
+    def validate_signature(cls, v):
+        """Validate signature format"""
+        return validate_signature_hex(v)
 
 class ProfileRevealReq(_DecimalAsStr):
     blob: ProfileBlob
@@ -286,12 +412,39 @@ class EncryptedBlob(_DecimalAsStr):
     nonce_hex: str = Field(..., description="24-byte XChaCha20 nonce (hex).")
     ciphertext_hex: str = Field(..., description="Ciphertext (hex).")
 
+    @validator("nonce_hex")
+    def validate_nonce_format(cls, v):
+        """Validate nonce hex format"""
+        return validate_nonce(v)
+
 class EncryptedBlobV2(_DecimalAsStr):
     ephemeral_pub_b58: str
     nonce_hex: str
     ciphertext_b64: str
     algo: Optional[str] = "x25519+xsalsa20poly1305"
     thread_id_b64: Optional[str] = None
+
+    @validator("ephemeral_pub_b58")
+    def validate_ephemeral_pub(cls, v):
+        """Validate ephemeral pubkey"""
+        return validate_solana_pubkey(v, "ephemeral_pub_b58")
+
+    @validator("nonce_hex")
+    def validate_nonce_format(cls, v):
+        """Validate nonce hex format"""
+        return validate_nonce(v)
+
+    @validator("ciphertext_b64")
+    def validate_ciphertext_base64(cls, v):
+        """Validate ciphertext is valid base64"""
+        return validate_base64(v, "ciphertext_b64")
+
+    @validator("thread_id_b64")
+    def validate_thread_id_base64(cls, v):
+        """Validate thread_id is valid base64 if provided"""
+        if v:
+            return validate_base64(v, "thread_id_b64")
+        return v
 
 class EscrowRecord(_DecimalAsStr):
     id: str = Field(..., description="Escrow id (hex).")
@@ -312,7 +465,7 @@ class EscrowRecord(_DecimalAsStr):
 
     note_hex: Optional[str] = Field(None, description="Escrow note (hex).")
     nonce_hex: Optional[str] = Field(None, description="Escrow nonce (hex).")
-    payment_mode: Optional[str] = Field(None, description="Payment mode used (note, csol, sol).")
+    payment_mode: Optional[str] = Field(None, description="Payment mode used (always 'note' for new transactions)")
     buyer_note_commitment: Optional[str] = Field(None, description="Buyer note commitment if payment was note.")
     buyer_note_nullifier: Optional[str] = Field(None, description="Buyer note nullifier if payment was note.")
     escrow_pda: Optional[str] = Field(None, description="On-chain escrow PDA address.")
@@ -328,15 +481,29 @@ class EscrowOpenReq(_DecimalAsStr):
     buyer_keyfile: str = Field(..., description="Buyer keyfile (./keys/user*.json).")
     seller_pub: str = Field(..., description="Seller public key (base58).")
     amount_sol: condecimal(gt=0) = Field(..., description="Escrow amount in SOL.")
-    payment: Optional[Literal["auto", "csol", "sol"]] = Field(
-        "auto", description="Use cSOL if possible; fallback to SOL-backed notes."
-    )
     listing_id: Optional[str] = Field(None, description="Listing id (hex).")
     quantity: Optional[conint(ge=1)] = Field(1, description="Purchase quantity.")
     details_ct: Optional[EncryptedBlob] = Field(
         None,
         description="Opaque encrypted details (XChaCha20-Poly1305); server stores but cannot read.",
     )
+
+    @validator("seller_pub")
+    def validate_seller_pubkey(cls, v):
+        """Validate seller pubkey"""
+        return validate_solana_pubkey(v, "seller_pub")
+
+    @validator("amount_sol")
+    def validate_amount(cls, v):
+        """Validate escrow amount"""
+        return validate_sol_amount(v, "amount_sol")
+
+    @validator("quantity")
+    def validate_qty(cls, v):
+        """Validate quantity"""
+        if v:
+            return validate_quantity(v)
+        return v
 
 class EscrowOpenRes(Ok):
     escrow: EscrowRecord
@@ -389,6 +556,32 @@ class MessageSendReq(_DecimalAsStr):
     attach_onchain_memo: bool = Field(False, description="If true, also sends a 0-SOL tx with compact memo.")
     memo_hint: Optional[str] = Field(None, description="Optional short hint (<=64 chars).")
 
+    @validator("recipient_pub")
+    def validate_recipient_pubkey(cls, v):
+        """Validate recipient pubkey if provided"""
+        if v:
+            return validate_solana_pubkey(v, "recipient_pub")
+        return v
+
+    @validator("recipient_username")
+    def validate_recipient_username_format(cls, v):
+        """Validate recipient username if provided"""
+        if v:
+            return validate_username(v)
+        return v
+
+    @validator("plaintext_b64")
+    def validate_plaintext_base64(cls, v):
+        """Validate plaintext is valid base64"""
+        return validate_base64(v, "plaintext_b64")
+
+    @validator("memo_hint")
+    def validate_memo_hint_length(cls, v):
+        """Validate memo hint length"""
+        if v and len(v) > 64:
+            raise ValueError("memo_hint must be at most 64 characters")
+        return v
+
     @root_validator
     def _one_recipient(cls, v):
         if not v.get("recipient_pub") and not v.get("recipient_username"):
@@ -440,12 +633,8 @@ __all__ = [
     "MetricRow",
     "DepositReq",
     "DepositRes",
-    "HandoffReq",
-    "HandoffRes",
     "WithdrawReq",
     "WithdrawRes",
-    "ConvertReq",
-    "ConvertRes",
     "StealthItem",
     "StealthList",
     "SweepReq",

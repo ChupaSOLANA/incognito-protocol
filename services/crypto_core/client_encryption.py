@@ -1,0 +1,229 @@
+"""
+Client-side encryption for end-to-end encrypted note storage.
+
+Uses NaCl (libsodium) with Solana Ed25519 keypairs for encryption.
+Only the user with their private key can decrypt their data.
+
+The API server is blind - it stores encrypted blobs it cannot read.
+
+Usage:
+    # Encrypt (client-side)
+    from solders.keypair import Keypair
+    keypair = Keypair.from_bytes(keypair_bytes)
+
+    note_data = {
+        "secret": "abc123...",
+        "nullifier": "def456...",
+        "amount_sol": 10.0,
+        "leaf_index": 0
+    }
+
+    encrypted_blob = encrypt_note(note_data, keypair)
+    # Send encrypted_blob to API
+
+    # Decrypt (client-side)
+    decrypted_data = decrypt_note(encrypted_blob, keypair)
+"""
+
+import json
+import base64
+from typing import Dict, Any
+from nacl.public import PrivateKey, PublicKey, Box
+from nacl.utils import random as nacl_random
+from solders.keypair import Keypair as SoldersKeypair
+
+
+def solana_keypair_to_nacl(keypair: SoldersKeypair) -> tuple[PrivateKey, PublicKey]:
+    """
+    Convert Solana keypair to NaCl keypair for encryption.
+
+    Solana uses Ed25519 keys which can be converted to Curve25519 for encryption.
+
+    Args:
+        keypair: Solana keypair (from solders)
+
+    Returns:
+        (PrivateKey, PublicKey) tuple for NaCl encryption
+    """
+    # Get raw bytes from Solana keypair
+    keypair_bytes = bytes(keypair)
+
+    # Solana keypair format: [private_key (32 bytes) || public_key (32 bytes)]
+    private_key_bytes = keypair_bytes[:32]
+    public_key_bytes = bytes(keypair.pubkey())
+
+    # Create NaCl keys (NaCl will convert Ed25519 to Curve25519 internally)
+    private_key = PrivateKey(private_key_bytes)
+    public_key = PublicKey(public_key_bytes)
+
+    return private_key, public_key
+
+
+def encrypt_note(note_data: Dict[str, Any], keypair: SoldersKeypair) -> Dict[str, str]:
+    """
+    Encrypt note data using user's Solana keypair.
+
+    Uses NaCl's public key encryption (sealed box) so only the user
+    with their private key can decrypt.
+
+    Args:
+        note_data: Dictionary with note fields (secret, nullifier, amount_sol, etc.)
+        keypair: User's Solana keypair
+
+    Returns:
+        Encrypted blob: {"ciphertext": "base64...", "nonce": "base64..."}
+
+    Example:
+        note_data = {
+            "secret": "abc123...",
+            "nullifier": "def456...",
+            "amount_sol": 10.0,
+            "leaf_index": 0
+        }
+        encrypted = encrypt_note(note_data, keypair)
+    """
+    # Convert Solana keypair to NaCl
+    private_key, public_key = solana_keypair_to_nacl(keypair)
+
+    # Create encryption box (encrypt for self)
+    box = Box(private_key, public_key)
+
+    # Serialize note data to JSON
+    plaintext = json.dumps(note_data).encode('utf-8')
+
+    # Generate random nonce
+    nonce = nacl_random(Box.NONCE_SIZE)
+
+    # Encrypt
+    ciphertext = box.encrypt(plaintext, nonce).ciphertext
+
+    # Return base64-encoded blob
+    return {
+        "ciphertext": base64.b64encode(ciphertext).decode('utf-8'),
+        "nonce": base64.b64encode(nonce).decode('utf-8')
+    }
+
+
+def decrypt_note(encrypted_blob: Dict[str, str], keypair: SoldersKeypair) -> Dict[str, Any]:
+    """
+    Decrypt note data using user's Solana keypair.
+
+    Args:
+        encrypted_blob: Dictionary with "ciphertext" and "nonce" keys (base64-encoded)
+        keypair: User's Solana keypair
+
+    Returns:
+        Decrypted note data dictionary
+
+    Raises:
+        nacl.exceptions.CryptoError: If decryption fails (wrong key or tampered data)
+
+    Example:
+        decrypted = decrypt_note(encrypted_blob, keypair)
+        print(decrypted["amount_sol"])  # 10.0
+    """
+    # Convert Solana keypair to NaCl
+    private_key, public_key = solana_keypair_to_nacl(keypair)
+
+    # Create decryption box
+    box = Box(private_key, public_key)
+
+    # Decode base64
+    ciphertext = base64.b64decode(encrypted_blob["ciphertext"])
+    nonce = base64.b64decode(encrypted_blob["nonce"])
+
+    # Decrypt
+    plaintext = box.decrypt(ciphertext, nonce)
+
+    # Parse JSON
+    return json.loads(plaintext.decode('utf-8'))
+
+
+def encrypt_note_from_keypair_file(note_data: Dict[str, Any], keypair_path: str) -> Dict[str, str]:
+    """
+    Convenience function to encrypt note using keypair file path.
+
+    Args:
+        note_data: Note data to encrypt
+        keypair_path: Path to Solana keypair JSON file
+
+    Returns:
+        Encrypted blob
+    """
+    import json
+
+    # Load keypair from file
+    with open(keypair_path, 'r') as f:
+        keypair_bytes = bytes(json.load(f))
+
+    keypair = SoldersKeypair.from_bytes(keypair_bytes)
+
+    return encrypt_note(note_data, keypair)
+
+
+def decrypt_note_from_keypair_file(encrypted_blob: Dict[str, str], keypair_path: str) -> Dict[str, Any]:
+    """
+    Convenience function to decrypt note using keypair file path.
+
+    Args:
+        encrypted_blob: Encrypted blob to decrypt
+        keypair_path: Path to Solana keypair JSON file
+
+    Returns:
+        Decrypted note data
+    """
+    import json
+
+    # Load keypair from file
+    with open(keypair_path, 'r') as f:
+        keypair_bytes = bytes(json.load(f))
+
+    keypair = SoldersKeypair.from_bytes(keypair_bytes)
+
+    return decrypt_note(encrypted_blob, keypair)
+
+
+# Test and example
+if __name__ == "__main__":
+    print("Client-Side Encryption Example\n")
+
+    # Generate test keypair
+    from solders.keypair import Keypair
+    test_keypair = Keypair()
+
+    print(f"Test Pubkey: {test_keypair.pubkey()}")
+
+    # Test note data
+    note_data = {
+        "secret": "a1b2c3d4e5f6789012345678901234567890123456789012345678901234567890",
+        "nullifier": "f1e2d3c4b5a6789012345678901234567890123456789012345678901234567890",
+        "amount_sol": 10.5,
+        "leaf_index": 42
+    }
+
+    print(f"\nOriginal note data:")
+    print(json.dumps(note_data, indent=2))
+
+    # Encrypt
+    encrypted = encrypt_note(note_data, test_keypair)
+    print(f"\nEncrypted blob:")
+    print(f"  ciphertext: {encrypted['ciphertext'][:50]}...")
+    print(f"  nonce: {encrypted['nonce']}")
+
+    # Decrypt
+    decrypted = decrypt_note(encrypted, test_keypair)
+    print(f"\nDecrypted note data:")
+    print(json.dumps(decrypted, indent=2))
+
+    # Verify
+    assert decrypted == note_data
+    print("\n✅ Encryption/decryption verified!")
+
+    # Try with wrong keypair (should fail)
+    print("\n❌ Testing with wrong keypair...")
+    wrong_keypair = Keypair()
+    try:
+        decrypt_note(encrypted, wrong_keypair)
+        print("ERROR: Should have failed!")
+    except Exception as e:
+        print(f"✅ Correctly rejected wrong keypair: {type(e).__name__}")
