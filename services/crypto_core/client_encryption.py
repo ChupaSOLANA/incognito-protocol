@@ -28,50 +28,24 @@ Usage:
 import json
 import base64
 from typing import Dict, Any
-from nacl.public import PrivateKey, PublicKey, Box
+from nacl.secret import SecretBox
 from nacl.utils import random as nacl_random
 from solders.keypair import Keypair as SoldersKeypair
-
-
-def solana_keypair_to_nacl(keypair: SoldersKeypair) -> tuple[PrivateKey, PublicKey]:
-    """
-    Convert Solana keypair to NaCl keypair for encryption.
-
-    Solana uses Ed25519 keys which can be converted to Curve25519 for encryption.
-
-    Args:
-        keypair: Solana keypair (from solders)
-
-    Returns:
-        (PrivateKey, PublicKey) tuple for NaCl encryption
-    """
-    # Get raw bytes from Solana keypair
-    keypair_bytes = bytes(keypair)
-
-    # Solana keypair format: [private_key (32 bytes) || public_key (32 bytes)]
-    private_key_bytes = keypair_bytes[:32]
-    public_key_bytes = bytes(keypair.pubkey())
-
-    # Create NaCl keys (NaCl will convert Ed25519 to Curve25519 internally)
-    private_key = PrivateKey(private_key_bytes)
-    public_key = PublicKey(public_key_bytes)
-
-    return private_key, public_key
 
 
 def encrypt_note(note_data: Dict[str, Any], keypair: SoldersKeypair) -> Dict[str, str]:
     """
     Encrypt note data using user's Solana keypair.
 
-    Uses NaCl's public key encryption (sealed box) so only the user
-    with their private key can decrypt.
+    Uses NaCl's symmetric encryption (SecretBox) with the first 32 bytes of
+    the keypair as the encryption key. Only the user with their keypair can decrypt.
 
     Args:
         note_data: Dictionary with note fields (secret, nullifier, amount_sol, etc.)
         keypair: User's Solana keypair
 
     Returns:
-        Encrypted blob: {"ciphertext": "base64...", "nonce": "base64..."}
+        Encrypted blob: {"ciphertext": "base64...", "nonce": "base64...", "algorithm": "NaCl_secretbox"}
 
     Example:
         note_data = {
@@ -82,25 +56,30 @@ def encrypt_note(note_data: Dict[str, Any], keypair: SoldersKeypair) -> Dict[str
         }
         encrypted = encrypt_note(note_data, keypair)
     """
-    # Convert Solana keypair to NaCl
-    private_key, public_key = solana_keypair_to_nacl(keypair)
+    # Get raw keypair bytes (64 bytes total: 32 private + 32 public)
+    keypair_bytes = bytes(keypair)
 
-    # Create encryption box (encrypt for self)
-    box = Box(private_key, public_key)
+    # Use first 32 bytes as symmetric encryption key
+    encryption_key = keypair_bytes[:32]
+
+    # Create SecretBox with keypair-derived key
+    box = SecretBox(encryption_key)
 
     # Serialize note data to JSON
     plaintext = json.dumps(note_data).encode('utf-8')
 
-    # Generate random nonce
-    nonce = nacl_random(Box.NONCE_SIZE)
+    # Encrypt (SecretBox automatically generates and prepends nonce)
+    encrypted = box.encrypt(plaintext)
 
-    # Encrypt
-    ciphertext = box.encrypt(plaintext, nonce).ciphertext
+    # Extract nonce and ciphertext
+    nonce = encrypted[:SecretBox.NONCE_SIZE]
+    ciphertext = encrypted[SecretBox.NONCE_SIZE:]
 
     # Return base64-encoded blob
     return {
         "ciphertext": base64.b64encode(ciphertext).decode('utf-8'),
-        "nonce": base64.b64encode(nonce).decode('utf-8')
+        "nonce": base64.b64encode(nonce).decode('utf-8'),
+        "algorithm": "NaCl_secretbox"
     }
 
 
@@ -122,11 +101,14 @@ def decrypt_note(encrypted_blob: Dict[str, str], keypair: SoldersKeypair) -> Dic
         decrypted = decrypt_note(encrypted_blob, keypair)
         print(decrypted["amount_sol"])  # 10.0
     """
-    # Convert Solana keypair to NaCl
-    private_key, public_key = solana_keypair_to_nacl(keypair)
+    # Get raw keypair bytes
+    keypair_bytes = bytes(keypair)
 
-    # Create decryption box
-    box = Box(private_key, public_key)
+    # Use first 32 bytes as symmetric encryption key
+    encryption_key = keypair_bytes[:32]
+
+    # Create SecretBox with keypair-derived key
+    box = SecretBox(encryption_key)
 
     # Decode base64
     ciphertext = base64.b64decode(encrypted_blob["ciphertext"])

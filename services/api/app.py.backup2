@@ -1,4 +1,25 @@
 
+"""
+Incognito Protocol API Server
+=============================
+
+A privacy-preserving marketplace and payment system built on Solana.
+
+Features:
+- Privacy pool deposits and withdrawals with Merkle proofs
+- Note-based escrow system for marketplace transactions
+- Encrypted messaging between buyers and sellers
+- Stealth addresses for enhanced privacy
+- PostgreSQL database with client-side encryption
+
+Architecture:
+- FastAPI web framework
+- PostgreSQL for persistent storage
+- Solana blockchain for on-chain privacy pool
+- NaCl cryptography for client-side encryption
+"""
+
+
 from __future__ import annotations
 
 import base64
@@ -388,8 +409,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 CLUSTER_FP_PATH = os.path.join(DATA_DIR, "cluster_fingerprint.json")
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "http://127.0.0.1:8899")
 
-CSOL_LEDGER_PATH = os.path.join(DATA_DIR, "csol_ledger.json")
-CSOL_SUPPLY_FILE = os.path.join(DATA_DIR, "csol_supply.json")
 SHIPPING_EVENTS_PATH = os.path.join(DATA_DIR, "shipping_events.jsonl")
 SHIPPING_MERKLE_PATH = os.path.join(DATA_DIR, "shipping_merkle.json")
 
@@ -400,9 +419,7 @@ USED_STEALTH_PATH = os.path.join(DATA_DIR, "used_stealth.jsonl")
 MESSAGES_EVENTS_PATH = os.path.join(DATA_DIR, "messages.jsonl")
 MESSAGES_MERKLE_PATH = os.path.join(DATA_DIR, "messages_merkle.json")
 
-USER_NOTES_PATH = os.path.join(DATA_DIR, "user_notes.json")
 
-NOTES_DIR = os.path.join(REPO_ROOT, "notes")
 
 IPFS_GATEWAY = os.getenv("IPFS_GATEWAY", "http://127.0.0.1:8080/ipfs/")
 
@@ -411,18 +428,13 @@ TREASURY_KEYFILE = os.getenv(
     "/Users/alex/Desktop/incognito-protocol-1/keys/pool.json",
 )
 
-for p, default in [
-    (CSOL_LEDGER_PATH, "{}"),
-    (CSOL_SUPPLY_FILE, '{"total":"0"}'),
-    (SHIPPING_EVENTS_PATH, ""),
+for p, default in [    (SHIPPING_EVENTS_PATH, ""),
     (SHIPPING_MERKLE_PATH, json.dumps({"leaves": [], "root": None, "version": 1})),
     (PROFILES_EVENTS, ""),
     (PROFILES_MERKLE, json.dumps({"leaves": [], "root": None, "version": 1})),
     (USED_STEALTH_PATH, ""),
     (MESSAGES_EVENTS_PATH, ""),
-    (MESSAGES_MERKLE_PATH, json.dumps({"leaves": [], "root": None, "version": 1})),
-    (USER_NOTES_PATH, "{}"),
-]:
+    (MESSAGES_MERKLE_PATH, json.dumps({"leaves": [], "root": None, "version": 1})),]:
     if not os.path.exists(p):
         try:
             pathlib.Path(p).write_text(default if isinstance(default, str) else json.dumps(default))
@@ -704,20 +716,6 @@ def _shipping_find_by_order(order_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def _load_user_notes() -> Dict[str, List[Dict[str, Any]]]:
-    """Load notes database (owner_pub -> list of notes)"""
-    try:
-        return json.loads(pathlib.Path(USER_NOTES_PATH).read_text())
-    except Exception:
-        return {}
-
-def _save_user_notes(notes_db: Dict[str, List[Dict[str, Any]]]) -> None:
-    """Save notes database"""
-    try:
-        pathlib.Path(USER_NOTES_PATH).write_text(json.dumps(notes_db, indent=2))
-    except Exception:
-        pass
-
 async def _save_note_for_user_db(
     owner_pub: str,
     encrypted_blob: dict,
@@ -793,47 +791,6 @@ async def _save_note_for_user_db(
         print(f"❌ Database save failed: {e}")
         raise
 
-def _save_note_for_user_json(
-    owner_pub: str,
-    secret: str,
-    nullifier: str,
-    commitment: str,
-    leaf_index: int,
-    amount_sol: float,
-    tx_signature: str,
-    spent: bool = False
-) -> None:
-    """Save a note for a user (JSON fallback)"""
-    notes_db = _load_user_notes()
-    if owner_pub not in notes_db:
-        notes_db[owner_pub] = []
-
-    note = {
-        "secret": secret,
-        "nullifier": nullifier,
-        "commitment": commitment,
-        "leaf_index": leaf_index,
-        "amount_sol": str(amount_sol),
-        "tx_signature": tx_signature,
-        "spent": spent
-    }
-
-    notes_db[owner_pub].append(note)
-    _save_user_notes(notes_db)
-
-def _save_note_for_user(
-    owner_pub: str,
-    secret: str,
-    nullifier: str,
-    commitment: str,
-    leaf_index: int,
-    amount_sol: float,
-    tx_signature: str,
-    spent: bool = False
-) -> None:
-    """Save a note for a user (synchronous wrapper for backward compatibility)"""
-    _save_note_for_user_json(owner_pub, secret, nullifier, commitment, leaf_index, amount_sol, tx_signature, spent)
-
 async def _mark_note_spent_db(commitment: str, nullifier: str, owner_pub: str = None) -> None:
     """
     Mark a note as spent by commitment (CLIENT-SIDE ENCRYPTION compatible).
@@ -904,19 +861,6 @@ async def _mark_note_spent_db(commitment: str, nullifier: str, owner_pub: str = 
         print(f"❌ Database mark spent failed: {e}")
         raise
 
-def _mark_note_spent_json(owner_pub: str, nullifier: str) -> None:
-    """Mark a note as spent by nullifier (JSON fallback)"""
-    notes_db = _load_user_notes()
-    if owner_pub in notes_db:
-        for note in notes_db[owner_pub]:
-            if note.get("nullifier") == nullifier:
-                note["spent"] = True
-        _save_user_notes(notes_db)
-
-def _mark_note_spent(owner_pub: str, nullifier: str) -> None:
-    """Mark a note as spent by nullifier (synchronous wrapper for backward compatibility)"""
-    _mark_note_spent_json(owner_pub, nullifier)
-
 async def _get_user_notes_db(owner_pub: str, include_spent: bool = False) -> List[Dict[str, Any]]:
     """
     Get all notes for a user from database (CLIENT-SIDE ENCRYPTED).
@@ -965,164 +909,11 @@ async def _get_user_notes_db(owner_pub: str, include_spent: bool = False) -> Lis
         print(f"❌ Database query failed: {e}")
         raise
 
-def _get_user_notes_json(owner_pub: str, include_spent: bool = False) -> List[Dict[str, Any]]:
-    """Get all notes for a user from JSON"""
-    notes_db = _load_user_notes()
-    notes = notes_db.get(owner_pub, [])
-    if not include_spent:
-        notes = [n for n in notes if not n.get("spent", False)]
-    return notes
-
-def _get_user_notes(owner_pub: str, include_spent: bool = False) -> List[Dict[str, Any]]:
-    """Get all notes for a user (synchronous wrapper for backward compatibility)"""
-    return _get_user_notes_json(owner_pub, include_spent)
-
-def _delete_note_file(commitment: str) -> None:
-    """
-    Delete a note file from the /notes directory based on commitment.
-    Files are named like: note_XXXXXXXX_timestamp.json where XXXXXXXX is first 8 chars of commitment hex.
-    """
-    try:
-        import glob
-        commitment_prefix = commitment[:8]
-        pattern = os.path.join(NOTES_DIR, f"note_{commitment_prefix}_*.json")
-        matching_files = glob.glob(pattern)
-
-        for file_path in matching_files:
-            try:
-                with open(file_path, 'r') as f:
-                    note_data = json.load(f)
-                if note_data.get("credentials", {}).get("commitment") == commitment:
-                    os.remove(file_path)
-                    print(f"   Deleted spent note file: {os.path.basename(file_path)}")
-                    return
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"   Warning: Could not delete note file for {commitment[:8]}: {e}")
-
-def _create_change_note_file(
-    secret: str,
-    nullifier: str,
-    commitment: str,
-    leaf_index: int,
-    amount_sol: float,
-    tx_signature: str
-) -> None:
-    """
-    Create a change note file in the /notes directory.
-    Files are named like: change_XXXXXXXX_timestamp.json
-    """
-    try:
-        os.makedirs(NOTES_DIR, exist_ok=True)
-
-        commitment_prefix = commitment[:8]
-        timestamp = int(datetime.now().timestamp())
-        filename = f"change_{commitment_prefix}_{timestamp}.json"
-        filepath = os.path.join(NOTES_DIR, filename)
-
-        note_data = {
-            "version": "1.0",
-            "network": "localnet",
-            "deposit_date": datetime.now().isoformat(),
-            "amount_deposited_sol": amount_sol,
-            "amount_withdrawable_sol": amount_sol,
-            "wrapper_fee_sol": 0.0,
-            "credentials": {
-                "secret": secret,
-                "nullifier": nullifier,
-                "commitment": commitment,
-                "leaf_index": leaf_index
-            },
-            "transaction": {
-                "tx_signature": tx_signature,
-                "note_type": "change"
-            }
-        }
-
-        with open(filepath, 'w') as f:
-            json.dump(note_data, f, indent=2)
-
-        print(f"   Created change note file: {filename}")
-    except Exception as e:
-        print(f"   Warning: Could not create change note file: {e}")
-
-CSOL_DEC = Decimal("0.000000001")
-CHUNK = Decimal("100")
-
 def _fmt(x: Decimal | float | str) -> str:
     return str(Decimal(str(x)).quantize(CSOL_DEC))
 
 def _q(x: Decimal | str | float) -> Decimal:
     return Decimal(str(x)).quantize(CSOL_DEC)
-
-def _ledger_load() -> dict:
-    try:
-        return json.loads(pathlib.Path(CSOL_LEDGER_PATH).read_text())
-    except Exception:
-        return {}
-
-def _ledger_save(d: dict) -> None:
-    try:
-        pathlib.Path(CSOL_LEDGER_PATH).write_text(json.dumps(d))
-    except Exception:
-        pass
-
-def _csol_get(pub: str) -> Decimal:
-    try:
-        return _q(_ledger_load().get(pub, "0"))
-    except Exception:
-        return Decimal("0")
-
-def _csol_add(pub: str, amt: Decimal | str | float) -> None:
-    d = _ledger_load()
-    cur = _q(d.get(pub, "0"))
-    newv = _q(cur + _q(amt))
-    d[pub] = str(newv)
-    _ledger_save(d)
-
-def _csol_sub(pub: str, amt: Decimal | str | float) -> None:
-    d = _ledger_load()
-    cur = _q(d.get(pub, "0"))
-    newv = _q(cur - _q(amt))
-    if newv <= 0:
-        d.pop(pub, None)
-    else:
-        d[pub] = str(newv)
-    _ledger_save(d)
-
-def _supply_load() -> Decimal:
-    try:
-        d = json.loads(pathlib.Path(CSOL_SUPPLY_FILE).read_text())
-        return _q(d.get("total", "0"))
-    except Exception:
-        return _q("0")
-
-def _supply_save_exact(x: Decimal | str | float) -> None:
-    x = _q(x)
-    try:
-        pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
-        pathlib.Path(CSOL_SUPPLY_FILE).write_text(json.dumps({"total": str(x)}))
-    except Exception:
-        pass
-
-PENDING_BURN_FILE = os.path.join(DATA_DIR, "csol_pending_burn.json")
-
-def _pending_burn_load() -> Decimal:
-    try:
-        j = json.loads(pathlib.Path(PENDING_BURN_FILE).read_text())
-        return _q(j.get("amount", "0"))
-    except Exception:
-        return Decimal("0")
-
-def _pending_burn_save(x: Decimal | str | float) -> None:
-    try:
-        pathlib.Path(PENDING_BURN_FILE).write_text(json.dumps({"amount": str(_q(x))}))
-    except Exception:
-        pass
-
-def _pending_burn_add(x: Decimal | str | float) -> None:
-    _pending_burn_save(_pending_burn_load() + _q(x))
 
 def _write_temp_keypair_from_solders(kp) -> str:
     try:
@@ -1142,24 +933,6 @@ def _spl_out(args: list[str]) -> str:
     if p.returncode != 0:
         raise RuntimeError(p.stderr.strip() or "spl-token failed")
     return p.stdout.strip()
-
-def _csol_supply_onchain() -> Decimal:
-    out = _spl_out(["spl-token", "supply", ca.MINT])
-    return _q(out.split()[0])
-
-def _wrapper_ata() -> str:
-    return ca.get_wrapper_ata()
-
-def _wrapper_reserve_onchain() -> Decimal:
-    try:
-        out = _spl_out(["spl-token", "balance", _wrapper_ata()])
-        return _q(out.split()[0])
-    except Exception:
-        return Decimal("0")
-
-def ceil_to_100(x: Decimal) -> Decimal:
-    x = Decimal(str(x))
-    return ((x + Decimal("99")) // Decimal("100")) * Decimal("100")
 
 def _resolve_treasury_keyfile() -> str:
     kf = TREASURY_KEYFILE or getattr(ca, "TREASURY_KEYPAIR", None)
@@ -1193,195 +966,6 @@ def get_treasury_sol_balance() -> Decimal:
     sol_vault_pub = get_sol_vault_pda()
     bal = ca.get_sol_balance(sol_vault_pub)
     return Decimal(str(bal or "0")).quantize(CSOL_DEC)
-
-def _csol_total_supply_dec() -> Decimal:
-    try:
-        s = _csol_supply_onchain()
-        _supply_save_exact(s)
-        return s
-    except Exception:
-        return _supply_load()
-
-def _csol_reserve_balance_dec() -> Decimal:
-    return _wrapper_reserve_onchain()
-
-def _apply_pending_balance(mint: str, ata: str, owner_kf: str, fee_payer_kf: str) -> None:
-    _spl_out(
-        [
-            "spl-token",
-            "apply-pending-balance",
-            mint,
-            "--address",
-            ata,
-            "--owner",
-            owner_kf,
-            "--fee-payer",
-            fee_payer_kf,
-        ]
-    )
-
-def _withdraw_confidential_tokens(
-    mint: str,
-    ata: str,
-    owner_kf: str,
-    fee_payer_kf: str,
-    amount: Decimal,
-) -> None:
-    _spl_out(
-        [
-            "spl-token",
-            "withdraw-confidential-tokens",
-            mint,
-            _fmt(amount),
-            "--address",
-            ata,
-            "--owner",
-            owner_kf,
-            "--fee-payer",
-            fee_payer_kf,
-        ]
-    )
-
-def _burn_public_tokens_simple(ata: str, owner_kf: str, fee_payer_kf: str, amount: Decimal) -> None:
-    _spl_out(
-        [
-            "spl-token",
-            "burn",
-            ata,
-            _fmt(amount),
-            "--owner",
-            owner_kf,
-            "--fee-payer",
-            fee_payer_kf,
-        ]
-    )
-
-def _burn_chunk(amount: Decimal) -> bool:
-    """
-    Try a simple public burn first.
-    If that fails (likely all balance is confidential), then:
-    apply-pending-balance -> withdraw-confidential-tokens -> burn.
-
-    Uses a pool stealth fee payer (temp keyfile).
-    """
-    mint = ca.MINT
-    ata = _wrapper_ata()
-    owner_kf = ca.WRAPPER_KEYPAIR
-    fee_tmp, _ = ca.pick_treasury_fee_payer_tmpfile()
-    if not fee_tmp:
-        return False
-    try:
-        try:
-            _burn_public_tokens_simple(ata, owner_kf, fee_tmp, amount)
-            return True
-        except Exception:
-            try:
-                _apply_pending_balance(mint, ata, owner_kf, fee_tmp)
-            except Exception:
-                pass
-            _withdraw_confidential_tokens(mint, ata, owner_kf, fee_tmp, amount)
-            _burn_public_tokens_simple(ata, owner_kf, fee_tmp, amount)
-            return True
-    except Exception:
-        return False
-    finally:
-        try:
-            os.remove(fee_tmp)
-        except Exception:
-            pass
-
-def _try_settle_pending_burn() -> None:
-    pb = _pending_burn_load()
-    if pb <= 0:
-        return
-    chunks = int(pb // CHUNK)
-    if chunks <= 0:
-        return
-    settled = Decimal("0")
-    for _ in range(chunks):
-        ok = _burn_chunk(CHUNK)
-        if not ok:
-            break
-        settled += CHUNK
-    if settled > 0:
-        _supply_save_exact(_csol_supply_onchain())
-        _pending_burn_save(pb - settled)
-        print(f"[PENDING_BURN] settled {settled}; remaining {pb - settled}")
-
-def reconcile_csol_supply(assume_delta: Decimal = Decimal("0")) -> Dict[str, Any]:
-    """
-    Objectif: après l'opération, la supply on-chain == target.
-    - target = ceil_100(TreasurySOL + assume_delta), min 100
-    - Mint/Burn par tranches fixes de 100
-    """
-    T = (get_treasury_sol_balance() + _q(assume_delta)).quantize(CSOL_DEC)
-    target = max(Decimal("100"), ceil_to_100(T)).quantize(CSOL_DEC)
-    S_on = _csol_total_supply_dec()
-    gap = (S_on - target).quantize(CSOL_DEC)
-    print(f"[RECONCILE] treasury={T} supply_onchain={S_on} target={target}")
-    if gap == 0:
-        _supply_save_exact(S_on)
-        return {"action": "noop", "treasury": str(T), "target": str(target)}
-    if gap > 0:
-        chunks_needed = int(gap // CHUNK)
-        burned = Decimal("0")
-        for _ in range(chunks_needed):
-            ok = _burn_chunk(CHUNK)
-            if not ok:
-                break
-            burned += CHUNK
-        if burned > 0:
-            _supply_save_exact(_csol_supply_onchain())
-            remaining = (Decimal(chunks_needed) * CHUNK) - burned
-            if remaining > 0:
-                _pending_burn_add(remaining)
-                print(f"[RECONCILE] partial burn burned={burned} pending_burn+={remaining}")
-                return {
-                    "action": "partial_burn",
-                    "amount": str(burned),
-                    "pending": str(remaining),
-                    "treasury": str(T),
-                    "target": str(target),
-                }
-            print(f"[RECONCILE] BURN {burned} (100-lots)")
-            return {"action": "burn", "amount": str(burned), "treasury": str(T), "target": str(target)}
-    chunks_to_mint = int((-gap) // CHUNK)
-    amt = _q(chunks_to_mint) * CHUNK
-    print(f"[RECONCILE] MINT {amt} to wrapper reserve")
-    ca.csol_mint_to_reserve(str(amt))
-    _supply_save_exact(_csol_supply_onchain())
-    return {"action": "mint", "amount": str(amt), "treasury": str(T), "target": str(target)}
-
-def _ensure_reserve_has(amount: Decimal) -> None:
-    """
-    Garantir que la réserve possède amount cSOL. Mint par tranches de 100 jusqu'à couvrir le besoin.
-    """
-    amount = _q(amount)
-    if amount <= 0:
-        return
-    reserve = _csol_reserve_balance_dec()
-    print(f"[ENSURE_RESERVE] need={amount} reserve={reserve}")
-    if reserve >= amount:
-        print("[ENSURE_RESERVE] enough reserve, no mint")
-        return
-    missing = (amount - reserve).quantize(CSOL_DEC)
-    chunks = int((missing + (CHUNK - Decimal("0.000000000"))) // CHUNK)
-    if chunks <= 0:
-        return
-    to_mint = _q(chunks) * CHUNK
-    print(f"[ENSURE_RESERVE] minting {to_mint}")
-    ca.csol_mint_to_reserve(str(to_mint))
-    _supply_save_exact(_csol_supply_onchain())
-
-def _normalize_supply_on_startup():
-    try:
-        s = _csol_supply_onchain()
-        _supply_save_exact(s)
-        print(f"[STARTUP] mirrored on-chain supply: {s}")
-    except Exception:
-        pass
-
-_normalize_supply_on_startup()
 
 def _load_listing(listing_id: str) -> Dict[str, Any]:
     candidates = []
@@ -1442,10 +1026,6 @@ def admin_treasury(keyfile: Optional[str] = None):
     pub = ca.get_pubkey_from_keypair(kf)
     bal = ca.get_sol_balance(pub)
     return {"keyfile": kf, "pub": pub, "balance_sol": str(Decimal(str(bal or 0)).quantize(CSOL_DEC))}
-
-@app.post("/admin/reconcile")
-def admin_reconcile():
-    return reconcile_csol_supply()
 
 @app.get("/metrics", response_model=List[MetricRow])
 def metrics():

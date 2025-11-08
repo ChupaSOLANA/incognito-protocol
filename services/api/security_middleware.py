@@ -87,8 +87,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
 
         # Remove potentially leaky headers
-        response.headers.pop("Server", None)  # Hide server version
-        response.headers.pop("X-Powered-By", None)  # Hide framework info
+        if "Server" in response.headers:
+            del response.headers["Server"]  # Hide server version
+        if "X-Powered-By" in response.headers:
+            del response.headers["X-Powered-By"]  # Hide framework info
 
         return response
 

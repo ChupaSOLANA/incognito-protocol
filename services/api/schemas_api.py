@@ -476,6 +476,8 @@ class EscrowRecord(_DecimalAsStr):
     delivered_at: Optional[str] = Field(None, description="ISO-8601 timestamp when delivery was confirmed.")
     confirm_tx: Optional[str] = Field(None, description="Delivery confirmation transaction signature.")
     finalize_tx: Optional[str] = Field(None, description="Finalization transaction signature.")
+    seller_can_claim: Optional[bool] = Field(None, description="Whether seller is allowed to claim payment note (note-based escrows).")
+    seller_claimed: Optional[bool] = Field(None, description="Whether seller has claimed their payment note (note-based escrows).")
 
 class EscrowOpenReq(_DecimalAsStr):
     buyer_keyfile: str = Field(..., description="Buyer keyfile (./keys/user*.json).")

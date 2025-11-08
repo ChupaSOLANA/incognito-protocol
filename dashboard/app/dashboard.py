@@ -226,6 +226,11 @@ def escrow_buyer_release_early(escrow_id: str, buyer_keyfile: str) -> Tuple[int,
     payload = {"escrow_id": escrow_id, "buyer_keyfile": buyer_keyfile}
     return api_post("/escrow/buyer_release_early", payload)
 
+def escrow_claim_payment(escrow_id: str, seller_keyfile: str) -> Tuple[int, dict]:
+    """Seller claims their payment note after escrow is finalized."""
+    payload = {"escrow_id": escrow_id, "seller_keyfile": seller_keyfile}
+    return api_post("/escrow/claim", payload)
+
 def escrow_list(party_pub: str, role: str, status: Optional[str] = None) -> List[dict]:
     params: Dict[str, Any] = {"party_pub": party_pub, "role": role}
     if status:
@@ -243,17 +248,27 @@ def _escrow_action_buttons_buyer(row: Dict[str, Any], actor: str) -> None:
     eid = row.get("id")
     status = row.get("status")
     is_onchain = bool(row.get("escrow_pda"))
+    is_note_based = row.get("payment_mode") == "note"
 
-    if is_onchain:
-        if status == "SHIPPED":
-            if st.button(" Confirm Delivery", key=f"esc_conf_{eid}", type="primary", use_container_width=True):
+    # Note-based or on-chain escrows
+    if is_note_based or is_onchain:
+        if status == "CREATED":
+            st.info("⏳ Waiting for seller to accept order...")
+
+        elif status == "ACCEPTED":
+            st.info("⏳ Waiting for seller to ship...")
+
+        elif status == "SHIPPED":
+            if st.button("✅ Confirm Delivery", key=f"esc_conf_{eid}", type="primary", use_container_width=True):
                 c, r = escrow_confirm_delivery(eid, actor)
-                st.toast("Delivery confirmed" if c == 200 else f"Failed: {r}")
+                st.toast("✅ Delivery confirmed!" if c == 200 else f"❌ Failed: {r}")
                 safe_rerun()
+
         elif status == "DELIVERED":
             delivered_at = row.get("delivered_at")
             can_finalize_normally = False
 
+            # Show 7-day dispute window countdown
             if delivered_at:
                 from datetime import datetime, timedelta
                 try:
@@ -272,19 +287,19 @@ def _escrow_action_buttons_buyer(row: Dict[str, Any], actor: str) -> None:
                         else:
                             time_str = f"{hours_in_day}h"
 
-                        st.info(f"Automatic finalization in: {time_str}")
+                        st.info(f"⏳ Dispute window: {time_str} remaining")
                     else:
-                        st.success(" Ready for automatic finalization!")
+                        st.success("✅ Ready to finalize!")
                         can_finalize_normally = True
                 except Exception:
-                    st.info("Waiting for 7-day dispute window...")
+                    st.info("⏳ Waiting for 7-day dispute window...")
             else:
-                st.info("Waiting for 7-day dispute window...")
+                st.info("⏳ Waiting for 7-day dispute window...")
 
             col1, col2 = st.columns(2)
 
             with col1:
-                if st.button(" Release Funds Now", key=f"esc_early_{eid}", type="primary", use_container_width=True):
+                if st.button("💰 Release Funds Now", key=f"esc_early_{eid}", type="primary", use_container_width=True):
                     c, r = escrow_buyer_release_early(eid, actor)
                     if c == 200:
                         st.toast("✅ Funds released to seller!", icon="✅")
@@ -295,7 +310,7 @@ def _escrow_action_buttons_buyer(row: Dict[str, Any], actor: str) -> None:
 
             with col2:
                 if can_finalize_normally:
-                    if st.button("Finalize (7d passed)", key=f"esc_fin_{eid}", use_container_width=True):
+                    if st.button("✅ Finalize (7d passed)", key=f"esc_fin_{eid}", use_container_width=True):
                         c, r = escrow_finalize_order(eid)
                         if c == 200:
                             st.toast("✅ Order finalized!", icon="✅")
@@ -304,12 +319,23 @@ def _escrow_action_buttons_buyer(row: Dict[str, Any], actor: str) -> None:
                             st.toast(f"❌ Failed: {error_msg}", icon="❌")
                         safe_rerun()
                 else:
-                    st.button("Finalize (7d passed)", key=f"esc_fin_{eid}", disabled=True, use_container_width=True)
+                    st.button("⏳ Finalize (7d passed)", key=f"esc_fin_{eid}", disabled=True, use_container_width=True)
+
         elif status == "COMPLETED":
-            st.success("Order completed ")
+            seller_can_claim = row.get("seller_can_claim", False)
+            if is_note_based:
+                if seller_can_claim:
+                    st.success("✅ Order completed! Seller can now claim payment.")
+                else:
+                    st.info("✅ Delivery confirmed. Waiting for finalization...")
+            else:
+                st.success("✅ Order completed!")
+
         else:
             st.caption(f"Status: {status}")
+
     else:
+        # Legacy local escrow (non-note, non-onchain)
         cols = st.columns(3)
         if cols[0].button("Release", key=f"esc_rel_{eid}", use_container_width=True):
             c, r = escrow_action(eid, actor, "RELEASE")
@@ -328,24 +354,30 @@ def _escrow_action_buttons_seller(row: Dict[str, Any], actor: str) -> None:
     eid = row.get("id")
     status = row.get("status")
     is_onchain = bool(row.get("escrow_pda"))
+    is_note_based = row.get("payment_mode") == "note"
 
-    if is_onchain:
+    # Note-based or on-chain escrows
+    if is_note_based or is_onchain:
         if status == "CREATED":
             if st.button(" Accept Order", key=f"esc_acc_{eid}", type="primary", use_container_width=True):
                 c, r = escrow_accept_order(eid, actor)
-                st.toast("Order accepted" if c == 200 else f"Failed: {r}")
+                st.toast("✅ Order accepted!" if c == 200 else f"❌ Failed: {r}")
                 safe_rerun()
+
         elif status == "ACCEPTED":
             tracking = st.text_input("Tracking number", key=f"track_{eid}", value="TRACK123")
             if st.button(" Mark Shipped", key=f"esc_ship_{eid}", type="primary", use_container_width=True):
                 c, r = escrow_mark_shipped(eid, actor, tracking)
-                st.toast("Marked as shipped" if c == 200 else f"Failed: {r}")
+                st.toast("✅ Marked as shipped!" if c == 200 else f"❌ Failed: {r}")
                 safe_rerun()
+
         elif status == "SHIPPED":
-            st.info("Waiting for buyer to confirm delivery...")
+            st.info("⏳ Waiting for buyer to confirm delivery...")
             if "tracking_number" in row:
-                st.caption(f"Tracking: {row['tracking_number']}")
+                st.caption(f"📦 Tracking: {row['tracking_number']}")
+
         elif status == "DELIVERED":
+            # Show 7-day dispute window countdown
             delivered_at = row.get("delivered_at")
             if delivered_at:
                 from datetime import datetime, timedelta
@@ -365,27 +397,94 @@ def _escrow_action_buttons_seller(row: Dict[str, Any], actor: str) -> None:
                         else:
                             time_str = f"{hours_in_day}h"
 
-                        st.info(f"7-day dispute window: {time_str} remaining until finalization")
+                        st.info(f"⏳ 7-day dispute window: {time_str} remaining")
                     else:
-                        st.success(" Ready to finalize!")
+                        st.success("✅ Ready for buyer to finalize!")
                 except Exception:
-                    st.info("Waiting for 7-day dispute window to finalize...")
+                    st.info("⏳ Waiting for buyer to finalize...")
             else:
-                st.info("Waiting for 7-day dispute window to finalize...")
+                st.info("⏳ Waiting for buyer to finalize...")
 
-            if st.button("Finalize Now", key=f"esc_fin_{eid}", use_container_width=True):
-                c, r = escrow_finalize_order(eid)
-                if c == 200:
-                    st.toast("✅ Order finalized!", icon="✅")
-                else:
-                    error_msg = r.get("detail", str(r)) if isinstance(r, dict) else str(r)
-                    st.toast(f"❌ Failed: {error_msg}", icon="❌")
-                safe_rerun()
         elif status == "COMPLETED":
-            st.success("Order completed ")
+            seller_can_claim = row.get("seller_can_claim", False)
+            seller_claimed = row.get("seller_claimed", False)
+
+            if is_note_based:
+                # Note-based escrow: Allow seller to claim payment note
+                if seller_claimed:
+                    st.success("✅ Payment claimed! Check your notes in the Withdraw tab.")
+                elif seller_can_claim:
+                    st.info("💰 Payment is ready to claim!")
+                    if st.button("💰 Claim Payment Note", key=f"claim_{eid}", type="primary", use_container_width=True):
+                        with st.spinner("Claiming payment..."):
+                            c, r = escrow_claim_payment(eid, actor)
+
+                            if c == 200 and isinstance(r, dict):
+                                payment_note = r.get("payment_note")
+                                if payment_note:
+                                    # Encrypt and store the note client-side
+                                    try:
+                                        if CLIENT_ENCRYPTION_AVAILABLE:
+                                            # Get seller's public key from keyfile
+                                            seller_pub = ca.get_pubkey_from_keypair(actor)
+
+                                            # Prepare note data for encryption
+                                            note_data = {
+                                                "secret": payment_note["secret"],
+                                                "nullifier": payment_note["nullifier"],
+                                                "amount_sol": payment_note["amount_sol"],
+                                                "leaf_index": payment_note["leaf_index"]
+                                            }
+
+                                            # Encrypt note using seller's keypair
+                                            encrypted_blob = encrypt_note_from_keypair_file(note_data, actor)
+
+                                            # Store encrypted note in database
+                                            store_code, store_res = api_post("/notes/store", {
+                                                "owner_pubkey": seller_pub,
+                                                "commitment": payment_note["commitment"],
+                                                "encrypted_blob": encrypted_blob,
+                                                "tx_signature": payment_note.get("tx_signature", "escrow_claim")
+                                            })
+
+                                            if store_code == 200:
+                                                st.toast("✅ Payment claimed and saved!", icon="✅")
+                                                st.success(f"💰 Claimed {payment_note['amount_sol']} SOL! Check the Withdraw tab to use it.")
+                                                st.info("✅ Note added to database AND on-chain Merkle tree!")
+                                                safe_rerun()
+                                            else:
+                                                st.toast("⚠️ Claimed but failed to save locally. Note details below:", icon="⚠️")
+                                                st.error(f"Database storage error: {store_res}")
+                                                st.info("⚠️ Note is on-chain but NOT in local database. Save these credentials:")
+                                                st.json(payment_note)
+
+                                        else:
+                                            st.error("❌ Client-side encryption not available")
+                                            st.info("⚠️ Note is on-chain but NOT encrypted. Save these credentials manually:")
+                                            st.json(payment_note)
+
+                                    except Exception as e:
+                                        import traceback
+                                        st.error(f"❌ Failed to encrypt note: {e}")
+                                        st.code(traceback.format_exc())
+                                        st.info("⚠️ Note is on-chain but NOT in database. Save these credentials:")
+                                        st.json(payment_note)
+                                else:
+                                    st.error("❌ No payment note in response")
+                            else:
+                                error_msg = r.get("detail", str(r)) if isinstance(r, dict) else str(r)
+                                st.toast(f"❌ Failed to claim: {error_msg}", icon="❌")
+                else:
+                    st.info("⏳ Waiting for buyer to release funds...")
+            else:
+                # On-chain escrow: Already paid
+                st.success("✅ Order completed! Payment received on-chain.")
+
         else:
             st.caption(f"Status: {status}")
+
     else:
+        # Legacy local escrow (non-note, non-onchain)
         can_refund = (status == "REFUND_REQUESTED")
         btn_type = "primary" if can_refund else "secondary"
         clicked = st.button(
@@ -1760,10 +1859,10 @@ elif active_tab == "Listings":
         if not items:
             st.info("No listings available yet. Be the first to sell!")
         else:
-            # Fetch notes once for all listings (performance optimization)
-            notes_code, notes_data = api_get(f"/notes/{active_pub}")
-            has_notes = notes_code == 200 and notes_data.get("notes")
-            notes_balance_sol = float(notes_data.get("total_balance", 0)) if has_notes else 0
+            # Fetch and decrypt notes once for all listings (same as Withdraw tab)
+            notes_code, user_notes, notes_balance_sol = fetch_user_notes(active_pub, active_key)
+            has_notes = notes_code == 200 and len(user_notes) > 0
+            notes_balance_sol = float(notes_balance_sol) if has_notes else 0
 
             for it in items:
                 with st.container(border=True):
@@ -1847,14 +1946,24 @@ elif active_tab == "Listings":
 
                             if has_notes:
                                 st.info(f"📝 Notes available: {notes_balance_sol:.4f} SOL")
-                                use_note = st.checkbox(
-                                    "Pay with specific privacy note",
+
+                                # Auto-select best note (smallest one that covers the price, or largest if none do)
+                                available_notes = user_notes
+                                suitable_notes = [n for n in available_notes if float(n["amount_sol"]) >= listing_price]
+                                if suitable_notes:
+                                    # Use smallest note that covers the price (minimize change)
+                                    selected_note = min(suitable_notes, key=lambda n: float(n["amount_sol"]))
+                                else:
+                                    # No single note covers it, use largest available
+                                    selected_note = max(available_notes, key=lambda n: float(n["amount_sol"]))
+
+                                choose_specific = st.checkbox(
+                                    "Choose specific note",
                                     value=False,
-                                    help="For maximum privacy, use a privacy note"
+                                    help="Select a different note from your available notes"
                                 )
 
-                                if use_note:
-                                    available_notes = notes_data["notes"]
+                                if choose_specific:
                                     note_options = []
                                     for i, note in enumerate(available_notes):
                                         amount = float(note["amount_sol"])
@@ -1867,15 +1976,20 @@ elif active_tab == "Listings":
                                     )
 
                                     selected_note = available_notes[selected_note_idx]
-                                    note_amount = float(selected_note["amount_sol"])
 
-                                    if note_amount < listing_price:
-                                        st.error(f"⚠️ Insufficient: Note has {note_amount:.4f} SOL, need {listing_price:.4f} SOL")
-                                    else:
-                                        change = note_amount - listing_price
-                                        if change > 0:
-                                            st.success(f"✅ Change: {change:.4f} SOL (new note will be created)")
-                                        payment_method = "Notes"
+                                # Show selected note details
+                                note_amount = float(selected_note["amount_sol"])
+                                st.caption(f"Using note with {note_amount:.4f} SOL")
+
+                                if note_amount < listing_price:
+                                    st.error(f"⚠️ Insufficient: Note has {note_amount:.4f} SOL, need {listing_price:.4f} SOL")
+                                else:
+                                    change = note_amount - listing_price
+                                    if change > 0:
+                                        st.success(f"✅ Change: {change:.4f} SOL (new note will be created)")
+                                    payment_method = "Notes"
+                            else:
+                                st.warning("⚠️ No privacy notes available. Please deposit funds first.")
 
                             col_submit, col_cancel = st.columns([1, 1])
                             with col_submit:
@@ -1888,6 +2002,16 @@ elif active_tab == "Listings":
                                 st.rerun()
 
                             if submit_purchase:
+                                # Validate that user has sufficient notes
+                                if not selected_note:
+                                    st.error("⚠️ No privacy notes available. Please deposit funds first.")
+                                    st.stop()
+
+                                note_amount = float(selected_note["amount_sol"])
+                                if note_amount < listing_price:
+                                    st.error(f"⚠️ Insufficient funds: Note has {note_amount:.4f} SOL, need {listing_price:.4f} SOL")
+                                    st.stop()
+
                                 prev_sol = get_sol_balance(active_pub)
                                 prev_stealth = _read_stealth_total(active_pub)
 
@@ -1895,43 +2019,31 @@ elif active_tab == "Listings":
                                     "buyer_keyfile": active_key,
                                     "listing_id": str(listing_id),
                                     "quantity": int(qty_to_buy),
+                                    "secret": selected_note["secret"],
+                                    "nullifier": selected_note["nullifier"],
+                                    "commitment": selected_note["commitment"],
+                                    "leaf_index": int(selected_note["leaf_index"]),
+                                    "deposited_amount_sol": note_amount,
                                 }
 
-                                if selected_note:
-                                    note_amount = float(selected_note["amount_sol"])
-                                    payload.update({
-                                        "secret": selected_note["secret"],
-                                        "nullifier": selected_note["nullifier"],
-                                        "commitment": selected_note["commitment"],
-                                        "leaf_index": int(selected_note["leaf_index"]),
-                                        "deposited_amount_sol": note_amount,
-                                    })
-                                else:
-                                    payload.update({
-                                        "secret": "",
-                                        "nullifier": "",
-                                        "commitment": "",
-                                        "leaf_index": 0,
-                                    })
-
-                            if use_encrypted:
-                                try:
-                                    seller_pub_b58 = str(it.get("seller_pub") or "")
-                                    shipping = {
-                                        "name": name_v.strip(),
-                                        "addr": addr_v.strip(),
-                                        "city": city_v.strip(),
-                                        "zip": zip_v.strip(),
-                                        "country": country_v.strip(),
-                                        "phone": phone_v.strip(),
-                                    }
-                                    thread_id = (
-                                        f"listing:{it['id']}|buyer:{short(active_pub,8)}|ts:{secrets.token_hex(6)}"
-                                    ).encode()
-                                    blob = make_encrypted_shipping(seller_pub_b58, shipping, thread_id)
-                                    payload["encrypted_shipping"] = blob
-                                except Exception as e:
-                                    st.error(f"Failed to generate encrypted shipping: {e}")
+                                if use_encrypted:
+                                    try:
+                                        seller_pub_b58 = str(it.get("seller_pub") or "")
+                                        shipping = {
+                                            "name": name_v.strip(),
+                                            "addr": addr_v.strip(),
+                                            "city": city_v.strip(),
+                                            "zip": zip_v.strip(),
+                                            "country": country_v.strip(),
+                                            "phone": phone_v.strip(),
+                                        }
+                                        thread_id = (
+                                            f"listing:{it['id']}|buyer:{short(active_pub,8)}|ts:{secrets.token_hex(6)}"
+                                        ).encode()
+                                        blob = make_encrypted_shipping(seller_pub_b58, shipping, thread_id)
+                                        payload["encrypted_shipping"] = blob
+                                    except Exception as e:
+                                        st.error(f"Failed to generate encrypted shipping: {e}")
 
                                 flash("Submitting buy…")
                                 with st.spinner("Placing order…"):

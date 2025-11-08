@@ -226,6 +226,10 @@ class Escrow(Base):
     payment_method = Column(String(20), default='note')
     note_commitment = Column(String(64))
 
+    # Payment note for seller to claim after escrow completion
+    # Contains encrypted note credentials for seller to withdraw their payment
+    payment_note = Column(JSONB)
+
     # State machine
     state = Column(Enum(EscrowState, name='escrow_state'), nullable=False,
                   default=EscrowState.CREATED, index=True)
@@ -409,6 +413,10 @@ class MerkleTree(Base):
     # Current state
     root = Column(String(64), nullable=False)
     next_index = Column(Integer, nullable=False, default=0)
+
+    # Full tree state (for reconstructing Merkle proofs)
+    leaves = Column(JSONB, nullable=True)  # Array of leaf hashes (hex strings)
+    depth = Column(Integer, nullable=True, default=20)  # Tree depth
 
     # Metadata
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

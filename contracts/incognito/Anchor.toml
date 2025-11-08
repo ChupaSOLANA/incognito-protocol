@@ -28,6 +28,51 @@ test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\""
 address = "BKck65TgoKRokMjQM3datB9oRwJ8rAj2jxPXvHXUvcL6"
 program = "/Users/alex/Desktop/incognito-protocol-1/contracts/incognito/artifacts/arcium_program_0.3.0.so"
 
+
+
+
+
+
+# [[test.validator.account]]
+# address = "CXTkGkpEXK3GsDGuHL8dhEXShYAnY6z6aLAA7z6HxVz7"
+# filename = "artifacts/wallet_acc_CXTk_xVz7.json"
+# 
+# [[test.validator.account]]
+# address = "7RjHsZ1WAYWJc5ge1dh3rR3ZndwqrRrGRzL117sQhH7S"
+# filename = "artifacts/wallet_acc_callback_7RjH_hH7S.json"
+# 
+# [[test.validator.account]]
+# address = "4tpLE1z2925WKPQ6nwjRARRmgJyLfy8NaegkBogEPaEH"
+# filename = "artifacts/arx_ata_CXTk_xVz7.json"
+# 
+# [[test.validator.account]]
+# address = "FJY4VtVChyTFg51Gsx1YPiJjAfyJFL2tF8t1rhqcACqX"
+# filename = "artifacts/operator_acc_CXTk_xVz7.json"
+# 
+# [[test.validator.account]]
+# address = "ELoRR19zrps1G3UYKcAxr7LKbw3kbqkVUXVY9dETMWN7"
+# filename = "artifacts/arx_node_CXTk_xVz7.json"
+# 
+# [[test.validator.account]]
+# address = "7FeAQrcYZednD7zev5tioFvJ1sxsiLYpXCJms1cJGXEC"
+# filename = "artifacts/wallet_acc_7FeA_GXEC.json"
+# 
+# [[test.validator.account]]
+# address = "CSQsNoDccR1PTt8AeurTQWLHBvbHeEEzNpAtXYckqDxJ"
+# filename = "artifacts/wallet_acc_callback_CSQs_qDxJ.json"
+# 
+# [[test.validator.account]]
+# address = "2RUqfQbWbgtSY8TSwGCCJhFdT2z3iuKZjtxagSvYjxaR"
+# filename = "artifacts/arx_ata_7FeA_GXEC.json"
+# 
+# [[test.validator.account]]
+# address = "DM6gGpfnaPAZanY34gVANARzrx85nhHewJV8wBmiVL6F"
+# filename = "artifacts/operator_acc_7FeA_GXEC.json"
+# 
+# [[test.validator.account]]
+# address = "XdfSwb8ZajhN7CerfBSJVhyfx5fyLtv34QVKSRgMFA9"
+# filename = "artifacts/arx_node_7FeA_GXEC.json"
+
 [[test.validator.account]]
 address = "FHriyvoZotYiFnbUzKFjzRSb2NiaC8RPWY7jtKuKhg65"
 filename = "artifacts/arcium_clock.json"
@@ -49,44 +94,44 @@ address = "6yAr9Be9kndebuVyZD6X3NmDgGVHWQXFXKFfDnPkhZj8"
 filename = "artifacts/arx_ata_79Ds_4NxE.json"
 
 [[test.validator.account]]
-address = "CXTkGkpEXK3GsDGuHL8dhEXShYAnY6z6aLAA7z6HxVz7"
-filename = "artifacts/wallet_acc_CXTk_xVz7.json"
+address = "BTi6ErZEK34uTX6wjo4zRSv11mPYJK8yj9g6AHSpNdhU"
+filename = "artifacts/wallet_acc_BTi6_NdhU.json"
 
 [[test.validator.account]]
-address = "7RjHsZ1WAYWJc5ge1dh3rR3ZndwqrRrGRzL117sQhH7S"
-filename = "artifacts/wallet_acc_callback_7RjH_hH7S.json"
+address = "BFeG7vhNEUibZhSo1vsf7yFMobHhnawC8nNhqMjakL8P"
+filename = "artifacts/wallet_acc_callback_BFeG_kL8P.json"
 
 [[test.validator.account]]
-address = "4tpLE1z2925WKPQ6nwjRARRmgJyLfy8NaegkBogEPaEH"
-filename = "artifacts/arx_ata_CXTk_xVz7.json"
+address = "5hbiqcNjmsGQ1cogx558mYYZb1WTQRaE9RkF2WhMv1KV"
+filename = "artifacts/arx_ata_BTi6_NdhU.json"
 
 [[test.validator.account]]
-address = "FJY4VtVChyTFg51Gsx1YPiJjAfyJFL2tF8t1rhqcACqX"
-filename = "artifacts/operator_acc_CXTk_xVz7.json"
+address = "CiJSjM6R1mPMUxQTLXFdosDa7MpFRLRAbjkc1fb8N118"
+filename = "artifacts/operator_acc_BTi6_NdhU.json"
 
 [[test.validator.account]]
 address = "ELoRR19zrps1G3UYKcAxr7LKbw3kbqkVUXVY9dETMWN7"
-filename = "artifacts/arx_node_CXTk_xVz7.json"
+filename = "artifacts/arx_node_BTi6_NdhU.json"
 
 [[test.validator.account]]
-address = "7FeAQrcYZednD7zev5tioFvJ1sxsiLYpXCJms1cJGXEC"
-filename = "artifacts/wallet_acc_7FeA_GXEC.json"
+address = "5CgUQZTa7GkG5MyxztNbSA9Yx3FCVrcSU6gZbyAARCu2"
+filename = "artifacts/wallet_acc_5CgU_RCu2.json"
 
 [[test.validator.account]]
-address = "CSQsNoDccR1PTt8AeurTQWLHBvbHeEEzNpAtXYckqDxJ"
-filename = "artifacts/wallet_acc_callback_CSQs_qDxJ.json"
+address = "5YmBYmZz6sKAX1ir9niMu3HTkDUzKc5GuFuwUR7QmKbB"
+filename = "artifacts/wallet_acc_callback_5YmB_mKbB.json"
 
 [[test.validator.account]]
-address = "2RUqfQbWbgtSY8TSwGCCJhFdT2z3iuKZjtxagSvYjxaR"
-filename = "artifacts/arx_ata_7FeA_GXEC.json"
+address = "CMUxzHZgP27TqhrrUny4WaEvLC9SQx55UBVV1HCZcg82"
+filename = "artifacts/arx_ata_5CgU_RCu2.json"
 
 [[test.validator.account]]
-address = "DM6gGpfnaPAZanY34gVANARzrx85nhHewJV8wBmiVL6F"
-filename = "artifacts/operator_acc_7FeA_GXEC.json"
+address = "HD2ToLuCs8JUx5T7YwKhPD1P63qfZYSv8kgeExtyNUxo"
+filename = "artifacts/operator_acc_5CgU_RCu2.json"
 
 [[test.validator.account]]
 address = "XdfSwb8ZajhN7CerfBSJVhyfx5fyLtv34QVKSRgMFA9"
-filename = "artifacts/arx_node_7FeA_GXEC.json"
+filename = "artifacts/arx_node_5CgU_RCu2.json"
 
 [[test.validator.account]]
 address = "GgSqqAyH7AVY3Umcv8NvncrjFaNJuQLmxzxFxPoPW2Yd"

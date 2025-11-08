@@ -557,6 +557,27 @@ pub struct DepositToPool<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(commitment: [u8; 32])]
+pub struct AddClaimNote<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(mut, seeds = [POOL_STATE_SEED], bump = pool_state.bump)]
+    pub pool_state: Account<'info, PoolState>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = 8,
+        seeds = [COMMITMENT_SEED, commitment.as_ref()],
+        bump
+    )]
+    pub commitment_marker: Account<'info, CommitmentMarker>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 #[instruction(
     amount: u64,
     commitment: [u8; 32],
@@ -875,6 +896,33 @@ pub mod incognito {
         emit!(RealDepositEvent {
             depositor: ctx.accounts.depositor.key(),
             amount,
+            commitment,
+            nf_hash,
+            index,
+            root: ctx.accounts.pool_state.root,
+        });
+
+        Ok(())
+    }
+
+    pub fn add_claim_note(
+        ctx: Context<AddClaimNote>,
+        commitment: [u8; 32],
+        nf_hash: [u8; 32],
+        merkle_path: Vec<[u8; 32]>,
+    ) -> Result<()> {
+        // Add note to Merkle tree without requiring SOL deposit
+        // Used for change notes and seller payment notes in escrow
+
+        let index = ctx.accounts.pool_state.leaf_count;
+        verify_and_insert_commitment_with_nf_hash(
+            &mut ctx.accounts.pool_state,
+            commitment,
+            nf_hash,
+            merkle_path,
+        )?;
+
+        emit!(ClaimNoteAdded {
             commitment,
             nf_hash,
             index,
@@ -1206,6 +1254,14 @@ pub struct ChangeNoteCreated {
     pub original_nullifier: [u8; 32],
     pub change_commitment: [u8; 32],
     pub change_index: u64,
+}
+
+#[event]
+pub struct ClaimNoteAdded {
+    pub commitment: [u8; 32],
+    pub nf_hash: [u8; 32],
+    pub index: u64,
+    pub root: [u8; 32],
 }
 
 #[error_code]
