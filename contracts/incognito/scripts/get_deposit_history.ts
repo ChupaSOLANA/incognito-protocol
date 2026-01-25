@@ -79,6 +79,7 @@ async function main() {
             // Discriminators are first 8 bytes of SHA-256("global:<function_name>")
             const DEPOSIT_DISCRIMINATOR = Buffer.from("63880f4255921859", "hex");
             const ADD_CLAIM_NOTE_DISCRIMINATOR = Buffer.from("df550ffb16f54875", "hex");
+            const WITHDRAW_DISCRIMINATOR = Buffer.from("3e21805128ea1d4d", "hex");
 
             const discriminator = data.slice(0, 8);
 
@@ -111,6 +112,67 @@ async function main() {
               });
 
               console.error(`Found claim note: ${commitment.slice(0, 16)}...`);
+            } else if (discriminator.equals(WITHDRAW_DISCRIMINATOR)) {
+              // withdraw_from_pool instruction parsing
+              // Layout:
+              // - 8 disc
+              // - 8 amount
+              // - 32 commitment
+              // - 4 + len*32 merkle_path
+              // - 32 nullifier
+              // - 8 index
+              // - 32 recipient
+              // - 1 + 32 (optional) change_commitment
+              // - 1 + 32 (optional) change_nf_hash
+
+              let offset = 8; // Skip discriminator
+              offset += 8; // Skip amount
+              offset += 32; // Skip commitment
+
+              // Parse merkle_path len
+              if (offset + 4 > data.length) continue;
+              const pathLen = data.readUInt32LE(offset);
+              offset += 4;
+              offset += pathLen * 32;
+
+              offset += 32; // Skip nullifier
+              offset += 8;  // Skip index
+              offset += 32; // Skip recipient
+
+              // change_commitment (Option)
+              if (offset + 1 > data.length) continue;
+              const hasChangeCommitment = data.readUInt8(offset);
+              offset += 1;
+
+              let changeCommitment: string | null = null;
+              if (hasChangeCommitment) {
+                if (offset + 32 > data.length) continue;
+                changeCommitment = data.slice(offset, offset + 32).toString('hex');
+                offset += 32;
+              }
+
+              // change_nf_hash (Option)
+              if (offset + 1 > data.length) continue;
+              const hasChangeNfHash = data.readUInt8(offset);
+              offset += 1;
+
+              let changeNfHash: string | null = null;
+              if (hasChangeNfHash) {
+                if (offset + 32 > data.length) continue;
+                changeNfHash = data.slice(offset, offset + 32).toString('hex');
+                offset += 32;
+              }
+
+              if (changeCommitment && changeNfHash) {
+                notes.push({
+                  signature: sigInfo.signature,
+                  commitment: changeCommitment,
+                  nf_hash: changeNfHash,
+                  timestamp: sigInfo.blockTime || 0,
+                  type: 'change'
+                });
+                console.error(`Found change note from withdraw: ${changeCommitment.slice(0, 16)}...`);
+              }
             }
           } catch (e) {
             // Not a recognized instruction, skip

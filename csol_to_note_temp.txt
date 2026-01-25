@@ -1,0 +1,123 @@
+@app.post("/csol-to-note", response_model=CsolToNoteRes)
+def csol_to_note(req: CsolToNoteReq):
+    """
+    Convert cSOL back to a privacy note.
+
+    Flow:
+    1. User transfers cSOL to wrapper (confidential transfer)
+    2. Wrapper burns the cSOL (reducing supply)
+    3. Wrapper deposits equivalent SOL to pool (from accumulated SOL from purchases)
+    4. User receives note credentials for the deposit
+
+    This allows sellers to convert their cSOL earnings back to notes for private withdrawals.
+    """
+    user_keyfile = req.user_keyfile
+    if not os.path.isabs(user_keyfile):
+        user_keyfile = os.path.join(REPO_ROOT, user_keyfile)
+
+    if not os.path.exists(user_keyfile):
+        raise HTTPException(
+            status_code=400,
+            detail=f"User keyfile not found at {user_keyfile}"
+        )
+
+    user_pub = get_pubkey_from_keypair(user_keyfile)
+
+    amount_lamports = int(req.amount_sol * 1_000_000_000)
+
+    if amount_lamports <= 50_000_000:
+        raise HTTPException(
+            status_code=400,
+            detail="Conversion amount must be greater than 0.05 SOL (wrapper deposit fee)"
+        )
+
+    try:
+        burn_result = ca.csol_user_to_wrapper_and_burn(
+            user_keyfile=user_keyfile,
+            amount_str=_fmt(req.amount_sol)
+        )
+        sig_transfer = burn_result["sig_transfer"]
+        sig_burn = burn_result["sig_burn"]
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"cSOL transfer/burn failed: {str(e)}"
+        )
+
+    pool_merkle_path = Path(REPO_ROOT) / "pool_merkle_state.json"
+    if pool_merkle_path.exists():
+        with open(pool_merkle_path, 'r') as f:
+            pool_state = json.load(f)
+        tree = PoolMerkleTree(depth=pool_state.get("depth", 20))
+        for leaf_hex in pool_state.get("leaves", []):
+            tree.insert(bytes.fromhex(leaf_hex))
+    else:
+        tree = PoolMerkleTree(depth=20)
+
+    secret = secrets.token_bytes(32)
+    nullifier = secrets.token_bytes(32)
+
+    commitment, nf_hash, merkle_path = prepare_deposit_params(
+        amount_lamports=amount_lamports,
+        secret=secret,
+        nullifier=nullifier,
+        local_merkle_tree=tree
+    )
+
+    wrapper_keyfile = ca.WRAPPER_KEYPAIR
+    if not os.path.isabs(wrapper_keyfile):
+        wrapper_keyfile = os.path.join(REPO_ROOT, wrapper_keyfile)
+
+    if not os.path.exists(wrapper_keyfile):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Wrapper keyfile not found at {wrapper_keyfile}"
+        )
+
+    try:
+        result = deposit_to_pool_onchain(
+            depositor_keyfile=wrapper_keyfile,
+            amount_lamports=amount_lamports,
+            commitment=commitment,
+            nf_hash=nf_hash,
+            merkle_path=merkle_path,
+            wrapper_keyfile=wrapper_keyfile,
+            wrapper_stealth_state_path=WRAPPER_STEALTH_STATE_PATH,
+            cluster=req.cluster
+        )
+        sig_deposit = result["tx_signature"]
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Deposit to pool failed: {str(e)}"
+        )
+
+    leaf = h2(commitment, nf_hash)
+    tree.insert(leaf)
+    leaf_index = len(tree.leaves) - 1
+
+    with open(pool_merkle_path, 'w') as f:
+        json.dump({
+            "depth": tree.depth,
+            "leaves": [leaf.hex() for leaf in tree.leaves],
+            "leaf_count": len(tree.leaves)
+        }, f, indent=2)
+
+    _save_note_for_user(
+        owner_pub=user_pub,
+        secret=secret.hex(),
+        nullifier=nullifier.hex(),
+        commitment=commitment.hex(),
+        leaf_index=leaf_index,
+        amount_sol=req.amount_sol,
+        tx_signature=sig_deposit,
+        spent=False
+    )
+
+    try:
+        os.makedirs(NOTES_DIR, exist_ok=True)
+        commitment_hex = commitment.hex()
+        commitment_prefix = commitment_hex[:8]
+        timestamp = int(datetime.now().timestamp())
+        filename = f"note_{commitment_prefix}_{timestamp}.json"
+        filepath = os.path.join(NOTES_DIR, filename)

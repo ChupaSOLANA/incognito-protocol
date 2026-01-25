@@ -135,56 +135,57 @@ class ListNotesRes(Ok):
     notes: List[NoteInfo] = Field(..., description="List of available notes")
     total_balance: str = Field(..., description="Total balance across all notes (SOL)")
 
+class ConvertReq(_DecimalAsStr):
+    owner_keyfile: str = Field(..., description="Owner keypair path (./keys/user*.json)")
+    amount: condecimal(gt=0) = Field(..., description="Amount of SOL to convert to cSOL")
+    
+    @validator("amount")
+    def validate_amount(cls, v):
+        return validate_sol_amount(v, "amount")
 
+class ConvertRes(Ok):
+    amount_converted: str
+    tx_signature: str
 
+class CsolToNoteReq(_DecimalAsStr):
+    owner_keyfile: str = Field(..., description="Owner keypair path (./keys/user*.json)")
+    amount_csol: condecimal(gt=0) = Field(..., description="Amount of cSOL to burn for new note")
+    
+    @validator("amount_csol")
+    def validate_amount(cls, v):
+        return validate_sol_amount(v, "amount_csol")
 
+class CsolToNoteRes(Ok):
+    amount_burned: str
+    tx_signature: str
+    new_note: NoteInfo
 
 class StealthItem(_DecimalAsStr):
-    stealth_pubkey: str
-    eph_pub_b58: str
-    counter: conint(ge=0)
-    balance_sol: Optional[str] = None
+    pub: str
+    note_commitment: Optional[str] = None
 
-class StealthList(_DecimalAsStr):
-    owner_pub: str
+    @validator("pub")
+    def validate_pubkey(cls, v):
+        """Validate stealth public key"""
+        return validate_solana_pubkey(v, "pub")
+
+class StealthList(Ok):
     items: List[StealthItem]
-    total_sol: Optional[str] = None
 
 class SweepReq(_DecimalAsStr):
-    owner_pub: str = Field(..., description="Owner public key (base58).")
-    secret_keyfile: str = Field(..., description="Secret keyfile (JSON list[64] or compatible).")
-    dest_pub: str = Field(..., description="Destination public key (base58).")
-    amount_sol: Optional[condecimal(gt=0)] = Field(
-        None, description="Amount to sweep; if omitted, sweep all (minus buffers)."
-    )
-    stealth_pubkeys: Optional[List[str]] = Field(
-        None, description="Optional list of specific stealth addresses to sweep from (overrides automatic selection)."
-    )
-
-    @validator("owner_pub", "dest_pub")
-    def validate_pubkeys(cls, v):
-        """Validate pubkeys"""
-        return validate_solana_pubkey(v, "pubkey")
-
-    @validator("amount_sol")
-    def validate_amount(cls, v):
-        """Validate sweep amount if provided"""
-        if v:
-            return validate_sol_amount(v, "amount_sol")
-        return v
-
-    @validator("stealth_pubkeys")
-    def validate_stealth_pubkeys_list(cls, v):
-        """Validate stealth pubkeys if provided"""
-        if v:
-            for pub in v:
-                validate_solana_pubkey(pub, "stealth_pubkey")
-        return v
+    owner_keyfile: str = Field(..., description="Owner keypair path")
+    target_address: str = Field(..., description="Destination public key")
+    
+    @validator("target_address")
+    def validate_target(cls, v):
+        return validate_solana_pubkey(v, "target_address")
 
 class SweepRes(Ok):
-    requested: str
-    sent_total: str
-    txs: List[str]
+    tx_signature: str
+    swept_lamports: int
+
+
+
 
 class BuyReq(_DecimalAsStr):
     """
@@ -584,7 +585,7 @@ class MessageSendReq(_DecimalAsStr):
             raise ValueError("memo_hint must be at most 64 characters")
         return v
 
-    @root_validator
+    @root_validator(skip_on_failure=True)
     def _one_recipient(cls, v):
         if not v.get("recipient_pub") and not v.get("recipient_username"):
             raise ValueError("Provide recipient_pub or recipient_username")
@@ -637,6 +638,12 @@ __all__ = [
     "DepositRes",
     "WithdrawReq",
     "WithdrawRes",
+    "NoteInfo",
+    "ListNotesRes",
+    "ConvertReq",
+    "ConvertRes",
+    "CsolToNoteReq",
+    "CsolToNoteRes",
     "StealthItem",
     "StealthList",
     "SweepReq",

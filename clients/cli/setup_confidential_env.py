@@ -11,10 +11,9 @@ Setup script for arcium-localnet environment:
 - Export configuration (PROGRAM_ID from Arcium, paths, etc.)
 
 ⚠️ Does NOT build or deploy - the incognito program is built-in to arcium-localnet.
-⚠️ Token-2022/cSOL support has been removed. Use notes-only system.
 ⚠️ DESTRUCTIVE: This script will delete all existing data and database records!
 
-Dependencies: solana, npx/tsx
+Dependencies: solana, spl-token, npx/tsx
 Optional: PostgreSQL + asyncpg (for database reset functionality)
 """
 
@@ -579,8 +578,8 @@ def main():
                         help="Only localnet is supported (arcium-localnet)")
     parser.add_argument("--workspace-root", default=None,
                         help="Path to workspace (where Anchor.toml is). Ex: contracts/incognito")
-    parser.add_argument("--enable-token", action="store_true",
-                        help="[DEPRECATED] Enable Token-2022/CT setup (not recommended)")
+    parser.add_argument("--skip-token", action="store_true",
+                        help="Skip Token-2022/CT setup")
     parser.add_argument("--skip-pool", action="store_true",
                         help="Skip pool initialization")
     parser.add_argument("--keys-dir", default=str(DEFAULT_KEYS_DIR),
@@ -636,31 +635,14 @@ def main():
     pid = DEFAULT_PROGRAM_ID
     print(f"== Using built-in incognito program ID: {pid} ==\n")
 
-    # 6) Token-2022 / CT setup (DEPRECATED - skipped by default)
-    if args.enable_token:
+    # 6) Token-2022 / CT setup
+    if not args.skip_token:
         users = [u.strip() for u in args.users.split(",") if u.strip()]
-        print("== [DEPRECATED] Token-2022 / CT setup ==")
-        print("⚠️  WARNING: Token-2022/cSOL is deprecated. Use notes-only system instead.")
+        print("== Token-2022 / CT setup ==")
         setup_token_flow(keys_dir=keys_dir, users=users, airdrop_sol=args.airdrop_sol)
         print()
     else:
-        # Generate keys and airdrop SOL without Token-2022
-        users = [u.strip() for u in args.users.split(",") if u.strip()]
-        print("== Generating keypairs and airdropping SOL (notes-only mode) ==")
-        wrapper_key = keys_dir / "wrapper.json"
-        users_keys = [keys_dir / f"user{u}.json" for u in users]
-
-        wrapper_pub = keygen(wrapper_key)
-        users_pubs = [keygen(k) for k in users_keys]
-
-        print("Airdropping SOL...")
-        airdrop(wrapper_pub, args.airdrop_sol * 2)
-        for up in users_pubs:
-            airdrop(up, args.airdrop_sol)
-
-        print(f"✓ Created {len(users)} user keypairs")
-        print(f"✓ Airdropped {args.airdrop_sol} SOL to each user")
-        print()
+        print("== Skip Token-2022 stage ==\n")
 
     # 7) Initialize pool
     authority_keypair_path = detect_provider_wallet_path(workspace_root)

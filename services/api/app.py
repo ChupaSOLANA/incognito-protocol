@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import base64
 import base58
+import base58
 import hashlib
+import glob
 import json
 import os
 import pathlib
@@ -55,6 +57,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from . import cli_adapter as ca
 from . import eventlog as ev
 from .schemas_api import (
+    BuyReq,
+    BuyRes,
     BuyReq,
     BuyRes,
     DepositReq,
@@ -519,6 +523,21 @@ def _autowipe_on_cluster_change():
         pathlib.Path(SHIPPING_MERKLE_PATH).write_text(
             json.dumps({"leaves": [], "root": None, "version": 1})
         )
+        # Also wipe pool merkle state and escrow state on cluster change
+        pool_merkle_path = os.path.join(REPO_ROOT, "pool_merkle_state.json")
+        _unlink(pool_merkle_path)
+        _unlink(ESCROW_STATE_PATH)
+        _unlink(ESCROW_MERKLE_PATH)
+        _unlink(USER_NOTES_PATH)
+        _unlink(MESSAGES_EVENTS_PATH)
+        _unlink(MESSAGES_MERKLE_PATH)
+        # Recreate empty escrow state files
+        pathlib.Path(ESCROW_STATE_PATH).write_text(json.dumps({"escrows": [], "nullifiers": []}))
+        pathlib.Path(ESCROW_MERKLE_PATH).write_text(json.dumps({"leaves": [], "root": ""}))
+        pathlib.Path(USER_NOTES_PATH).write_text("{}")
+        pathlib.Path(MESSAGES_EVENTS_PATH).write_text("")
+        pathlib.Path(MESSAGES_MERKLE_PATH).write_text(json.dumps({"leaves": [], "root": None, "version": 1}))
+        print("[AUTO_WIPE] Cleared pool_merkle_state.json, escrow state, and user notes on cluster change")
     finally:
         _save_fp(cur_fp)
 
@@ -1453,6 +1472,50 @@ def metrics():
     return [MetricRow(epoch=r[0], issued_count=r[1], spent_count=r[2], updated_at=r[3]) for r in rows]
 
 # ============================================================================
+
+# ============================================================================
+# DEBUG ENDPOINTS (Local Dev Only)
+# ============================================================================
+
+@app.get("/debug/wallets")
+def debug_wallets():
+    """
+    List all local keypairs in the keys/ directory.
+    WARNING: This exposes private keys. For simulation only.
+    """
+    keys_dir = Path(REPO_ROOT) / "keys"
+    wallets = []
+
+    if keys_dir.exists():
+        for path in glob.glob(str(keys_dir / "*.json")):
+            try:
+                with open(path, "r") as f:
+                    secret = json.load(f)
+
+                # Get pubkey from secret
+                # Secret is list of 64 ints (secret + pub)
+                if isinstance(secret, list) and len(secret) == 64:
+                    pub_bytes = bytes(secret[32:])
+                    pubkey = base58.b58encode(pub_bytes).decode("ascii")
+
+                    filename = os.path.basename(path)
+                    label = filename.replace(".json", "")
+
+                    wallets.append({
+                        "label": label,
+                        "pubkey": pubkey,
+                        "secret": secret,
+                        "path": path,
+                        "filename": filename
+                    })
+            except Exception as e:
+                print(f"Failed to load {path}: {e}")
+
+    # Sort by filename
+    wallets.sort(key=lambda x: x["filename"])
+    return {"wallets": wallets}
+
+# ============================================================================
 # HEALTH CHECK ENDPOINTS (Kubernetes-style)
 # ============================================================================
 
@@ -2211,6 +2274,7 @@ async def withdraw(req: WithdrawReq):
         raise HTTPException(status_code=500, detail=f"Withdrawal failed: {str(e)}")
 
     recipient_pub = get_pubkey_from_keypair(recipient_keyfile)
+
     await _mark_note_spent_db(req.commitment, req.nullifier, recipient_pub)
 
     change_note_data = None
@@ -2264,6 +2328,9 @@ async def withdraw(req: WithdrawReq):
         result["change_note"] = change_note_data
 
     return WithdrawRes(**result)
+
+
+
 
 @app.get("/stealth/{owner_pub}", response_model=StealthList)
 def list_stealth(owner_pub: str, include_balances: bool = True, min_sol: float = 0.01):
@@ -2887,7 +2954,7 @@ def escrow_ship(
         raise HTTPException(500, f"Escrow ship failed: {str(e)}")
 
 @app.post("/escrow/confirm")
-def escrow_confirm(
+async def escrow_confirm(
     escrow_id: str = Body(..., embed=True),
     buyer_keyfile: str = Body(..., embed=True),
 ):
@@ -2901,8 +2968,8 @@ def escrow_confirm(
     is_note_based = escrow.get("payment_mode") == "note" and not escrow.get("escrow_pda")
 
     if is_note_based:
-        # NOTE-BASED ESCROW: No on-chain transaction, just update status
-        print(f"[ESCROW_CONFIRM] Note-based escrow - NO on-chain transaction")
+        # NOTE-BASED ESCROW: Auto-release payment by creating a payment note for seller
+        print(f"[ESCROW_CONFIRM] Note-based escrow - auto-releasing payment to seller")
 
         # Verify buyer
         buyer_pub = ca.get_pubkey_from_keypair(buyer_keyfile)
@@ -2912,20 +2979,180 @@ def escrow_confirm(
         if escrow.get("status") != "SHIPPED":
             raise HTTPException(400, f"Cannot confirm escrow in status: {escrow.get('status')}")
 
-        # Update status and mark that seller can now claim payment note
+        # === AUTO-RELEASE PAYMENT: Create payment note for seller ===
+        import secrets as sec
+        import subprocess
+        from services.crypto_core.onchain_pool import h1, h2, MerkleTree as PoolMerkleTree
+        from services.crypto_core.client_encryption import encrypt_note_from_keypair_file
+
+        amount_sol = Decimal(escrow.get("amount_sol", "0"))
+        seller_pub = escrow.get("seller_pub")
+
+        # Generate payment note credentials
+        seller_secret = sec.token_bytes(32)
+        seller_nullifier = sec.token_bytes(32)
+        seller_commitment = h2(seller_secret, seller_nullifier)
+        seller_nf_hash = h1(seller_nullifier)
+
+        print(f"[ESCROW_CONFIRM] Creating payment note for seller: {seller_pub[:16]}...")
+
+        # Fetch current on-chain tree state
+        deposit_history_script = Path(REPO_ROOT) / "contracts" / "incognito" / "scripts" / "get_deposit_history.ts"
+
+        env = os.environ.copy()
+        env["ANCHOR_PROVIDER_URL"] = "http://localhost:8899"
+        env["ANCHOR_WALLET"] = str(Path(REPO_ROOT) / "keys" / "wrapper.json")
+
+        existing_leaves = []
+        try:
+            result = subprocess.run(
+                ["npx", "tsx", str(deposit_history_script)],
+                cwd=deposit_history_script.parent.parent,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result.returncode == 0:
+                try:
+                    notes = json.loads(result.stdout)
+                    for note in notes:
+                        commitment_bytes = bytes.fromhex(note["commitment"])
+                        nf_hash_bytes = bytes.fromhex(note["nf_hash"])
+                        leaf = h2(commitment_bytes, nf_hash_bytes)
+                        existing_leaves.append(leaf.hex())
+                    print(f"[ESCROW_CONFIRM] Fetched {len(existing_leaves)} existing leaves from on-chain")
+                except json.JSONDecodeError:
+                    print(f"[ESCROW_CONFIRM] ⚠️ Could not parse on-chain history, using local file")
+
+            # Fallback to local file
+            if len(existing_leaves) == 0:
+                pool_merkle_path = Path(REPO_ROOT) / "pool_merkle_state.json"
+                if pool_merkle_path.exists():
+                    with open(pool_merkle_path, 'r') as f:
+                        local_state = json.load(f)
+                    existing_leaves = local_state.get("leaves", [])
+                    print(f"[ESCROW_CONFIRM] Loaded {len(existing_leaves)} leaves from local file")
+        except Exception as e:
+            print(f"[ESCROW_CONFIRM] ⚠️ Error fetching tree state: {e}")
+
+        # Add payment note to on-chain Merkle tree
+        script_path = Path(REPO_ROOT) / "contracts" / "incognito" / "scripts" / "add_claim_note.ts"
+        existing_leaves_csv = ",".join(existing_leaves) if existing_leaves else ""
+
+        leaf_index = 0
+        tx_signature = None
+
+        try:
+            result = subprocess.run(
+                ["npx", "tsx", str(script_path), seller_commitment.hex(), seller_nf_hash.hex(), existing_leaves_csv],
+                cwd=script_path.parent.parent,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result.returncode == 0:
+                output = json.loads(result.stdout)
+                if output.get("success"):
+                    leaf_index = output["index"]
+                    tx_signature = output.get("tx")
+                    print(f"[ESCROW_CONFIRM] ✅ Payment note added at index {leaf_index}")
+                else:
+                    print(f"[ESCROW_CONFIRM] ⚠️ add_claim_note returned: {output}")
+            else:
+                print(f"[ESCROW_CONFIRM] ⚠️ add_claim_note failed: {result.stderr[:200]}")
+        except Exception as e:
+            print(f"[ESCROW_CONFIRM] ⚠️ Error adding payment note: {e}")
+
+        # Update local pool_merkle_state.json
+        try:
+            pool_merkle_path = Path(REPO_ROOT) / "pool_merkle_state.json"
+            tree = PoolMerkleTree(depth=MERKLE_TREE_DEPTH)
+            for leaf_hex in existing_leaves:
+                tree.insert(bytes.fromhex(leaf_hex))
+            payment_leaf = h2(seller_commitment, seller_nf_hash)
+            tree.insert(payment_leaf)
+            with open(pool_merkle_path, 'w') as f:
+                json.dump({
+                    "depth": tree.depth,
+                    "leaves": [leaf.hex() for leaf in tree.leaves],
+                    "leaf_count": len(tree.leaves)
+                }, f, indent=2)
+            print(f"[ESCROW_CONFIRM] ✅ Local tree updated with {len(tree.leaves)} leaves")
+        except Exception as e:
+            print(f"[ESCROW_CONFIRM] ⚠️ Error updating local tree: {e}")
+
+        # Create payment note data
+        payment_note = {
+            "secret": seller_secret.hex(),
+            "nullifier": seller_nullifier.hex(),
+            "commitment": seller_commitment.hex(),
+            "amount_sol": float(amount_sol),
+            "leaf_index": leaf_index,
+            "tx_signature": tx_signature,
+            "escrow_id": escrow_id,
+            "generated_at": _utcnow_iso()
+        }
+
+        # Save encrypted note for seller (find seller keyfile from keys directory)
+        seller_keyfile = None
+        keys_dir = Path(REPO_ROOT) / "keys"
+        for kf in keys_dir.glob("*.json"):
+            try:
+                test_pub = ca.get_pubkey_from_keypair(str(kf))
+                if test_pub == seller_pub:
+                    seller_keyfile = str(kf)
+                    break
+            except:
+                pass
+
+        if seller_keyfile:
+            try:
+                payment_note_plaintext = {
+                    "secret": seller_secret.hex(),
+                    "nullifier": seller_nullifier.hex(),
+                    "commitment": seller_commitment.hex(),
+                    "leaf_index": leaf_index,
+                    "amount_sol": float(amount_sol),
+                }
+                encrypted_blob = encrypt_note_from_keypair_file(payment_note_plaintext, seller_keyfile)
+                await _save_note_for_user_db(
+                    owner_pub=seller_pub,
+                    encrypted_blob=encrypted_blob,
+                    commitment=seller_commitment.hex(),
+                    tx_signature=tx_signature,
+                    spent=False
+                )
+                print(f"[ESCROW_CONFIRM] ✅ Payment note encrypted and saved for seller")
+            except Exception as e:
+                print(f"[ESCROW_CONFIRM] ⚠️ Could not save encrypted note: {e}")
+        else:
+            print(f"[ESCROW_CONFIRM] ⚠️ Seller keyfile not found, returning payment note in response")
+
+        # Update escrow status
         delivered_at = _utcnow_iso()
-        escrow["status"] = "DELIVERED"
+        escrow["status"] = "RELEASED"  # Changed from DELIVERED to RELEASED
         escrow["updated_at"] = delivered_at
         escrow["delivered_at"] = delivered_at
-        escrow["seller_can_claim"] = True  # Seller can now generate payment note
+        escrow["seller_can_claim"] = True
+        escrow["seller_claimed"] = True
+        escrow["claimed_at"] = delivered_at
+        escrow["payment_note"] = payment_note
         _escrow_save(st_esc)
 
         return {
             "ok": True,
             "escrow_id": escrow_id,
             "method": "note_based",
-            "message": "Delivery confirmed - seller can now claim payment"
+            "message": "Delivery confirmed and payment released to seller",
+            "payment_released": True,
+            "payment_note": payment_note if not seller_keyfile else None,  # Only include if we couldn't save it
+            "tx_signature": tx_signature
         }
+
 
     # OLD ON-CHAIN ESCROW PATH
     escrow_pda = escrow.get("escrow_pda")
@@ -4674,3 +4901,83 @@ def list_keypairs():
             })
 
     return {"keypairs": keypairs}
+
+@app.get("/debug/wallets")
+async def debug_get_wallets():
+    """
+    Get all available keyfiles in ./keys directory.
+    ONLY ENABLED FOR LOCAL DEV / DEBUGGING.
+    """
+    keys_dir = pathlib.Path("keys")
+    if not keys_dir.exists():
+        return {"wallets": []}
+
+    wallets = []
+    # Read all .json files
+    for key_file in keys_dir.glob("*.json"):
+        try:
+            with open(key_file, "r") as f:
+                data = json.load(f)
+                # Check for standard solana keypair format (list of ints)
+                if isinstance(data, list) and len(data) == 64:
+                    # Derive pubkey
+                    keypair = nb.crypto_sign_seed_keypair(bytes(data)[:32])
+                    pubkey_bytes = keypair[0]
+                    pubkey = base58.b58encode(pubkey_bytes).decode("utf-8")
+                    
+                    wallets.append({
+                        "label": key_file.stem,
+                        "pubkey": pubkey,
+                        "secret": data, # Expose secret key 
+                        "path": str(key_file.resolve()),
+                        "filename": key_file.name
+                    })
+        except Exception as e:
+            print(f"Error reading {key_file}: {e}")
+            continue
+            
+    return {"wallets": wallets}
+
+@app.get("/debug/balance/{pubkey}")
+async def debug_get_balance(pubkey: str):
+    """
+    Get SOL balance for a pubkey.
+    ONLY ENABLED FOR LOCAL DEV / DEBUGGING.
+    """
+    try:
+        from solana.rpc.types import TokenAccountOpts
+        from solders.pubkey import Pubkey
+        
+        # Use simple get_balance
+        if 'solana_client' in globals():
+             client = globals()['solana_client']
+        else:
+             # Fallback if global not accessible
+             from solana.rpc.api import Client
+             client = Client("http://localhost:8899")
+
+        balance_resp = client.get_balance(Pubkey.from_string(pubkey))
+        # Handle response format (might be object or int)
+        # get_balance returns GetBalanceResp, value is int (lamports)
+        if hasattr(balance_resp, 'value'):
+             lamports = balance_resp.value
+        else:
+             lamports = balance_resp.get('result', {}).get('value', 0)
+
+        sol = lamports / 1e9
+        return {"pubkey": pubkey, "lamports": lamports, "sol": sol}
+    except Exception as e:
+        # Fallback to pure RPC if client fails or not found
+        rpc_url = "http://localhost:8899"
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBalance",
+                "params": [pubkey]
+            }
+            res = requests.post(rpc_url, json=payload).json()
+            lamports = res.get("result", {}).get("value", 0)
+            return {"pubkey": pubkey, "lamports": lamports, "sol": lamports / 1e9}
+        except Exception as e2:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch balance: {str(e)} / {str(e2)}")

@@ -1590,6 +1590,7 @@ elif active_tab == "Withdraw":
                     st.error(res)
 
 elif active_tab == "Notes":
+
     st.subheader("My Notes (Privacy Pool)")
     st.info(" Your encrypted notes stored in the database")
 

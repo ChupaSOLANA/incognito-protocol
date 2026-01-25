@@ -196,8 +196,10 @@ def configure_cors(app):
         allow_origins=[
             "http://localhost:3000",  # React/Next.js dev server
             "http://localhost:8501",  # Streamlit dashboard
+            "http://localhost:8080",  # Vite/Replit dev server
             "http://127.0.0.1:3000",
             "http://127.0.0.1:8501",
+            "http://127.0.0.1:8080",
             # Add your production frontend URLs here:
             # "https://yourdomain.com",
         ],

@@ -1159,7 +1159,7 @@ pub mod incognito {
         ctx: Context<WithdrawNoteCheckCallback>,
         output: ComputationOutputs<WithdrawNoteCheckOutput>,
     ) -> Result<()> {
-        let group = match output {
+        let group = match output { 
             ComputationOutputs::Success(WithdrawNoteCheckOutput { field_0 }) => field_0,
             _ => return Err(ErrorCode::AbortedComputation.into()),
         };
