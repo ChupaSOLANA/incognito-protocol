@@ -61,6 +61,10 @@ from .schemas_api import (
     BuyRes,
     BuyReq,
     BuyRes,
+    ConvertReq,
+    ConvertRes,
+    CsolToNoteReq,
+    CsolToNoteRes,
     DepositReq,
     DepositRes,
     EncryptedBlob,
@@ -1782,6 +1786,289 @@ async def restore_backup(
         api_logger.error(f"Database restore failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Restore failed: {str(e)}")
 
+
+# ============================================================================
+# CSOL (Token-2022 Confidential Transfers) ENDPOINTS
+# ============================================================================
+
+@app.get("/csol/balance/{owner_pub}")
+def csol_balance(owner_pub: str):
+    """
+    Get cSOL (confidential token) balance for an owner.
+    
+    The balance may include:
+    - available: Immediately spendable balance
+    - pending: Balance pending apply-pending-balance
+    
+    Returns balance as string in token units.
+    """
+    try:
+        balance_str = ca.csol_balance(owner_pub)
+        return {
+            "ok": True,
+            "owner_pub": owner_pub,
+            "balance": balance_str,
+            "mint": ca.MINT,
+        }
+    except Exception as e:
+        api_logger.error(f"csol_balance failed for {owner_pub}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get cSOL balance: {str(e)}")
+
+
+@app.post("/csol/transfer")
+def csol_transfer(
+    sender_keyfile: str = Body(..., embed=True),
+    recipient_pub: str = Body(..., embed=True),
+    amount: str = Body(..., embed=True),
+):
+    """
+    Execute a confidential transfer (Token-2022) from sender to recipient.
+    
+    Args:
+        sender_keyfile: Path to sender's keypair (e.g., keys/userA.json)
+        recipient_pub: Recipient's public key
+        amount: Amount to transfer (as string, in token units)
+        
+    Returns:
+        Transaction signature
+    """
+    try:
+        # Resolve absolute path
+        if not os.path.isabs(sender_keyfile):
+            sender_keyfile = os.path.join(REPO_ROOT, sender_keyfile)
+        
+        if not os.path.exists(sender_keyfile):
+            raise HTTPException(status_code=400, detail=f"Sender keyfile not found: {sender_keyfile}")
+        
+        sender_pub = ca.get_pubkey_from_keypair(sender_keyfile)
+        
+        tx_sig = ca.csol_confidential_transfer(
+            buyer_kf=sender_keyfile,
+            buyer_pub=sender_pub,
+            seller_pub=recipient_pub,
+            amount_str=amount
+        )
+        
+        return {
+            "ok": True,
+            "tx_signature": tx_sig,
+            "sender_pub": sender_pub,
+            "recipient_pub": recipient_pub,
+            "amount": amount,
+        }
+    except ca.CLIAdapterError as e:
+        api_logger.error(f"csol_transfer failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        api_logger.error(f"csol_transfer error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Transfer failed: {str(e)}")
+
+
+@app.post("/csol/apply-pending")
+def csol_apply_pending(
+    owner_keyfile: str = Body(..., embed=True),
+):
+    """
+    Apply pending confidential balance to make it spendable.
+    
+    After receiving cSOL transfers, the balance is initially in "pending" state.
+    This endpoint applies pending balance to make it available for spending.
+    """
+    try:
+        if not os.path.isabs(owner_keyfile):
+            owner_keyfile = os.path.join(REPO_ROOT, owner_keyfile)
+        
+        if not os.path.exists(owner_keyfile):
+            raise HTTPException(status_code=400, detail=f"Owner keyfile not found: {owner_keyfile}")
+        
+        result = ca.spl_apply(owner_keyfile, owner_keyfile)
+        
+        return {
+            "ok": True,
+            "result": result,
+        }
+    except ca.CLIAdapterError as e:
+        api_logger.error(f"csol_apply_pending failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        api_logger.error(f"csol_apply_pending error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Apply pending failed: {str(e)}")
+
+
+@app.post("/convert/note-to-csol", response_model=ConvertRes)
+def convert_note_to_csol(req: ConvertReq):
+    """
+    Convert a privacy note to cSOL tokens.
+    
+    Flow:
+    1. Spend note from privacy pool → SOL to wrapper
+    2. Wrapper mints equivalent cSOL to user's ATA
+    
+    Args:
+        owner_keyfile: Path to user's keypair
+        amount: Amount of SOL to convert to cSOL
+        
+    Returns:
+        Transaction signature and converted amount
+    """
+    try:
+        owner_keyfile = req.owner_keyfile
+        if not os.path.isabs(owner_keyfile):
+            owner_keyfile = os.path.join(REPO_ROOT, owner_keyfile)
+        
+        if not os.path.exists(owner_keyfile):
+            raise HTTPException(status_code=400, detail=f"Owner keyfile not found: {owner_keyfile}")
+        
+        owner_pub = ca.get_pubkey_from_keypair(owner_keyfile)
+        amount_str = str(req.amount)
+        
+        # Ensure user has cSOL ATA
+        ca.ensure_csol_ata(owner_pub)
+        
+        # Transfer cSOL from wrapper reserve to user
+        wrapper_keyfile = ca._wrapper_keypair_abs()
+        tx_sig = ca.spl_transfer_from_wrapper(
+            amount=amount_str,
+            recipient_owner=owner_pub,
+            fee_payer=wrapper_keyfile
+        )
+        
+        return ConvertRes(
+            status="ok",
+            amount_converted=amount_str,
+            tx_signature=tx_sig,
+        )
+    except ca.CLIAdapterError as e:
+        api_logger.error(f"convert_note_to_csol failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        api_logger.error(f"convert_note_to_csol error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+
+
+@app.post("/convert/csol-to-note", response_model=CsolToNoteRes)
+def convert_csol_to_note(req: CsolToNoteReq):
+    """
+    Convert cSOL tokens back to a privacy note.
+    
+    Flow:
+    1. User transfers cSOL to wrapper
+    2. Wrapper burns the cSOL
+    3. Wrapper deposits equivalent SOL to pool, creating new note for user
+    
+    Args:
+        owner_keyfile: Path to user's keypair
+        amount_csol: Amount of cSOL to convert to note
+        
+    Returns:
+        Transaction signature and new note credentials
+    """
+    try:
+        owner_keyfile = req.owner_keyfile
+        if not os.path.isabs(owner_keyfile):
+            owner_keyfile = os.path.join(REPO_ROOT, owner_keyfile)
+        
+        if not os.path.exists(owner_keyfile):
+            raise HTTPException(status_code=400, detail=f"Owner keyfile not found: {owner_keyfile}")
+        
+        owner_pub = ca.get_pubkey_from_keypair(owner_keyfile)
+        amount_str = str(req.amount_csol)
+        
+        # Step 1: Transfer cSOL from user to wrapper and burn
+        burn_result = ca.csol_user_to_wrapper_and_burn(owner_keyfile, amount_str)
+        
+        # Step 2: Create a new privacy note for the user
+        # This involves depositing SOL from wrapper to pool
+        import secrets as sec
+        import json
+        from services.crypto_core.onchain_pool import (
+            deposit_to_pool_onchain,
+            prepare_deposit_params,
+            MerkleTree as PoolMerkleTree,
+        )
+        
+        amount_lamports = int(Decimal(amount_str) * 1_000_000_000)
+        wrapper_keyfile = ca._wrapper_keypair_abs()
+        
+        # Load local Merkle Tree to calculate path
+        # TODO: Refactor this into a helper or shared state
+        pool_state_path = Path(__file__).parent.parent.parent / "pool_merkle_state.json"
+        mt = PoolMerkleTree(depth=10)
+        if pool_state_path.exists():
+            try:
+                with open(pool_state_path, "r") as f:
+                    data = json.load(f)
+                    for leaf_hex in data.get("leaves", []):
+                        mt.insert(bytes.fromhex(leaf_hex))
+            except Exception as e:
+                LOG.error(f"Failed to load pool state: {e}")
+                raise HTTPException(status_code=500, detail="Failed to load pool state")
+
+        # Generate secrets and prepare params
+        note_secret = sec.token_bytes(32)
+        note_nullifier = sec.token_bytes(32)
+        
+        commitment, nf_hash, merkle_path = prepare_deposit_params(
+            amount_lamports=amount_lamports,
+            secret=note_secret,
+            nullifier=note_nullifier,
+            local_merkle_tree=mt
+        )
+        
+        # Execute deposit to pool (wrapper pays on behalf of user)
+        deposit_result = deposit_to_pool_onchain(
+            depositor_keyfile=wrapper_keyfile,
+            amount_lamports=amount_lamports,
+            commitment=commitment,
+            nf_hash=nf_hash,
+            merkle_path=merkle_path,
+            wrapper_keyfile=wrapper_keyfile,
+            cluster="localnet",  # TODO: make configurable
+        )
+        
+        new_note = NoteInfo(
+            secret=note_secret.hex(),
+            nullifier=note_nullifier.hex(),
+            commitment=commitment.hex(),
+            leaf_index=deposit_result.get("leaf_index", 0),
+            amount_sol=amount_str,
+            tx_signature=deposit_result.get("tx_signature", ""),
+        )
+        
+        return CsolToNoteRes(
+            status="ok",
+            amount_burned=amount_str,
+            tx_signature=burn_result.get("sig_transfer", ""),
+            new_note=new_note,
+        )
+    except ca.CLIAdapterError as e:
+        api_logger.error(f"convert_csol_to_note failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        api_logger.error(f"convert_csol_to_note error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+
+
+@app.get("/csol/mint-info")
+def csol_mint_info():
+    """
+    Get information about the cSOL mint (Token-2022 with confidential transfers).
+    
+    Returns:
+        Mint address, total supply, and wrapper reserve balance
+    """
+    try:
+        return {
+            "ok": True,
+            "mint": ca.MINT,
+            "total_supply": ca.csol_total_supply(),
+            "wrapper_pub": ca.get_pubkey_from_keypair(ca._wrapper_keypair_abs()),
+        }
+    except Exception as e:
+        api_logger.error(f"csol_mint_info error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get mint info: {str(e)}")
+
+
 @app.get("/merkle/status", response_model=MerkleStatus)
 def merkle_status():
     wst = ca.load_wrapper_state()
@@ -2968,8 +3255,8 @@ async def escrow_confirm(
     is_note_based = escrow.get("payment_mode") == "note" and not escrow.get("escrow_pda")
 
     if is_note_based:
-        # NOTE-BASED ESCROW: Auto-release payment by creating a payment note for seller
-        print(f"[ESCROW_CONFIRM] Note-based escrow - auto-releasing payment to seller")
+        # CSOL-BASED ESCROW: Transfer cSOL from wrapper to seller
+        print(f"[ESCROW_CONFIRM] Escrow payment - transferring cSOL to seller")
 
         # Verify buyer
         buyer_pub = ca.get_pubkey_from_keypair(buyer_keyfile)
@@ -2979,178 +3266,60 @@ async def escrow_confirm(
         if escrow.get("status") != "SHIPPED":
             raise HTTPException(400, f"Cannot confirm escrow in status: {escrow.get('status')}")
 
-        # === AUTO-RELEASE PAYMENT: Create payment note for seller ===
-        import secrets as sec
-        import subprocess
-        from services.crypto_core.onchain_pool import h1, h2, MerkleTree as PoolMerkleTree
-        from services.crypto_core.client_encryption import encrypt_note_from_keypair_file
+        # === TRANSFER CSOL TO SELLER ===
+        from services.crypto_core.escrow_payments import escrow_pay_seller
 
         amount_sol = Decimal(escrow.get("amount_sol", "0"))
+        amount_lamports = int(amount_sol * 1_000_000_000)
         seller_pub = escrow.get("seller_pub")
 
-        # Generate payment note credentials
-        seller_secret = sec.token_bytes(32)
-        seller_nullifier = sec.token_bytes(32)
-        seller_commitment = h2(seller_secret, seller_nullifier)
-        seller_nf_hash = h1(seller_nullifier)
+        # Get wrapper keypair for cSOL transfer
+        wrapper_keyfile = str(Path(REPO_ROOT) / "keys" / "wrapper.json")
+        mint = ca.MINT
 
-        print(f"[ESCROW_CONFIRM] Creating payment note for seller: {seller_pub[:16]}...")
+        print(f"[ESCROW_CONFIRM] Transferring {amount_sol} cSOL from wrapper to seller: {seller_pub[:16]}...")
 
-        # Fetch current on-chain tree state
-        deposit_history_script = Path(REPO_ROOT) / "contracts" / "incognito" / "scripts" / "get_deposit_history.ts"
-
-        env = os.environ.copy()
-        env["ANCHOR_PROVIDER_URL"] = "http://localhost:8899"
-        env["ANCHOR_WALLET"] = str(Path(REPO_ROOT) / "keys" / "wrapper.json")
-
-        existing_leaves = []
+        # Ensure seller has cSOL ATA configured for confidential transfers
         try:
-            result = subprocess.run(
-                ["npx", "tsx", str(deposit_history_script)],
-                cwd=deposit_history_script.parent.parent,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode == 0:
-                try:
-                    notes = json.loads(result.stdout)
-                    for note in notes:
-                        commitment_bytes = bytes.fromhex(note["commitment"])
-                        nf_hash_bytes = bytes.fromhex(note["nf_hash"])
-                        leaf = h2(commitment_bytes, nf_hash_bytes)
-                        existing_leaves.append(leaf.hex())
-                    print(f"[ESCROW_CONFIRM] Fetched {len(existing_leaves)} existing leaves from on-chain")
-                except json.JSONDecodeError:
-                    print(f"[ESCROW_CONFIRM] ⚠️ Could not parse on-chain history, using local file")
-
-            # Fallback to local file
-            if len(existing_leaves) == 0:
-                pool_merkle_path = Path(REPO_ROOT) / "pool_merkle_state.json"
-                if pool_merkle_path.exists():
-                    with open(pool_merkle_path, 'r') as f:
-                        local_state = json.load(f)
-                    existing_leaves = local_state.get("leaves", [])
-                    print(f"[ESCROW_CONFIRM] Loaded {len(existing_leaves)} leaves from local file")
+            ca.ensure_csol_ata(seller_pub)
         except Exception as e:
-            print(f"[ESCROW_CONFIRM] ⚠️ Error fetching tree state: {e}")
+            print(f"[ESCROW_CONFIRM] ⚠️ Could not ensure seller ATA: {e}")
 
-        # Add payment note to on-chain Merkle tree
-        script_path = Path(REPO_ROOT) / "contracts" / "incognito" / "scripts" / "add_claim_note.ts"
-        existing_leaves_csv = ",".join(existing_leaves) if existing_leaves else ""
-
-        leaf_index = 0
+        # Transfer cSOL confidentially: wrapper → seller
         tx_signature = None
-
         try:
-            result = subprocess.run(
-                ["npx", "tsx", str(script_path), seller_commitment.hex(), seller_nf_hash.hex(), existing_leaves_csv],
-                cwd=script_path.parent.parent,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=30
+            tx_signature = escrow_pay_seller(
+                wrapper_keyfile=wrapper_keyfile,
+                seller_pubkey=seller_pub,
+                amount_lamports=amount_lamports,
+                mint=mint,
             )
-
-            if result.returncode == 0:
-                output = json.loads(result.stdout)
-                if output.get("success"):
-                    leaf_index = output["index"]
-                    tx_signature = output.get("tx")
-                    print(f"[ESCROW_CONFIRM] ✅ Payment note added at index {leaf_index}")
-                else:
-                    print(f"[ESCROW_CONFIRM] ⚠️ add_claim_note returned: {output}")
-            else:
-                print(f"[ESCROW_CONFIRM] ⚠️ add_claim_note failed: {result.stderr[:200]}")
+            print(f"[ESCROW_CONFIRM] ✅ cSOL transferred to seller: {tx_signature}")
         except Exception as e:
-            print(f"[ESCROW_CONFIRM] ⚠️ Error adding payment note: {e}")
-
-        # Update local pool_merkle_state.json
-        try:
-            pool_merkle_path = Path(REPO_ROOT) / "pool_merkle_state.json"
-            tree = PoolMerkleTree(depth=MERKLE_TREE_DEPTH)
-            for leaf_hex in existing_leaves:
-                tree.insert(bytes.fromhex(leaf_hex))
-            payment_leaf = h2(seller_commitment, seller_nf_hash)
-            tree.insert(payment_leaf)
-            with open(pool_merkle_path, 'w') as f:
-                json.dump({
-                    "depth": tree.depth,
-                    "leaves": [leaf.hex() for leaf in tree.leaves],
-                    "leaf_count": len(tree.leaves)
-                }, f, indent=2)
-            print(f"[ESCROW_CONFIRM] ✅ Local tree updated with {len(tree.leaves)} leaves")
-        except Exception as e:
-            print(f"[ESCROW_CONFIRM] ⚠️ Error updating local tree: {e}")
-
-        # Create payment note data
-        payment_note = {
-            "secret": seller_secret.hex(),
-            "nullifier": seller_nullifier.hex(),
-            "commitment": seller_commitment.hex(),
-            "amount_sol": float(amount_sol),
-            "leaf_index": leaf_index,
-            "tx_signature": tx_signature,
-            "escrow_id": escrow_id,
-            "generated_at": _utcnow_iso()
-        }
-
-        # Save encrypted note for seller (find seller keyfile from keys directory)
-        seller_keyfile = None
-        keys_dir = Path(REPO_ROOT) / "keys"
-        for kf in keys_dir.glob("*.json"):
-            try:
-                test_pub = ca.get_pubkey_from_keypair(str(kf))
-                if test_pub == seller_pub:
-                    seller_keyfile = str(kf)
-                    break
-            except:
-                pass
-
-        if seller_keyfile:
-            try:
-                payment_note_plaintext = {
-                    "secret": seller_secret.hex(),
-                    "nullifier": seller_nullifier.hex(),
-                    "commitment": seller_commitment.hex(),
-                    "leaf_index": leaf_index,
-                    "amount_sol": float(amount_sol),
-                }
-                encrypted_blob = encrypt_note_from_keypair_file(payment_note_plaintext, seller_keyfile)
-                await _save_note_for_user_db(
-                    owner_pub=seller_pub,
-                    encrypted_blob=encrypted_blob,
-                    commitment=seller_commitment.hex(),
-                    tx_signature=tx_signature,
-                    spent=False
-                )
-                print(f"[ESCROW_CONFIRM] ✅ Payment note encrypted and saved for seller")
-            except Exception as e:
-                print(f"[ESCROW_CONFIRM] ⚠️ Could not save encrypted note: {e}")
-        else:
-            print(f"[ESCROW_CONFIRM] ⚠️ Seller keyfile not found, returning payment note in response")
+            print(f"[ESCROW_CONFIRM] ❌ cSOL transfer failed: {e}")
+            raise HTTPException(500, f"Payment transfer failed: {str(e)}")
 
         # Update escrow status
         delivered_at = _utcnow_iso()
-        escrow["status"] = "RELEASED"  # Changed from DELIVERED to RELEASED
+        escrow["status"] = "RELEASED"
         escrow["updated_at"] = delivered_at
         escrow["delivered_at"] = delivered_at
         escrow["seller_can_claim"] = True
         escrow["seller_claimed"] = True
         escrow["claimed_at"] = delivered_at
-        escrow["payment_note"] = payment_note
+        escrow["payment_tx"] = tx_signature
+        escrow["payment_method"] = "csol"
         _escrow_save(st_esc)
 
         return {
             "ok": True,
             "escrow_id": escrow_id,
-            "method": "note_based",
-            "message": "Delivery confirmed and payment released to seller",
+            "method": "csol_transfer",
+            "message": "Delivery confirmed and cSOL payment transferred to seller",
             "payment_released": True,
-            "payment_note": payment_note if not seller_keyfile else None,  # Only include if we couldn't save it
-            "tx_signature": tx_signature
+            "tx_signature": tx_signature,
+            "seller_pub": seller_pub,
+            "amount_csol": str(amount_sol),
         }
 
 

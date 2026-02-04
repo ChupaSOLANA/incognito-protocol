@@ -375,10 +375,21 @@ def spl_transfer_from_wrapper(amount: str, recipient_owner: str, fee_payer: str)
     return sig
 
 def spl_apply(owner_keyfile: str, fee_payer: str) -> str:
-    rc, out, err = _run_rc(["spl-token", "apply-pending-balance", MINT, "--owner", owner_keyfile, "--fee-payer", fee_payer])
+    cmd = ["spl-token", "apply-pending-balance", MINT, "--owner", owner_keyfile, "--fee-payer", fee_payer]
+    LOG.info(f"[spl_apply] Running: {' '.join(cmd)}")
+    rc, out, err = _run_rc(cmd)
+    
+    LOG.info(f"[spl_apply] Primary (MINT) rc={rc} stdout={out!r} stderr={err!r}")
+
     if rc == 0:
         return out or "OK"
-    rc2, out2, err2 = _run_rc(["spl-token", "apply", "--owner", owner_keyfile, "--fee-payer", fee_payer])
+
+    cmd2 = ["spl-token", "apply", "--owner", owner_keyfile, "--fee-payer", fee_payer]
+    LOG.info(f"[spl_apply] Running fallback: {' '.join(cmd2)}")
+    rc2, out2, err2 = _run_rc(cmd2)
+    
+    LOG.info(f"[spl_apply] Fallback rc={rc2} stdout={out2!r} stderr={err2!r}")
+
     if rc2 == 0:
         return out2 or "OK"
     raise CLIAdapterError((err or err2).strip() or "apply failed")
@@ -698,8 +709,28 @@ def csol_user_to_wrapper_and_burn(user_keyfile: str, amount_str: str) -> dict:
 
     try:
         spl_apply(user_kf, user_kf)
+        # Give a moment for the balance to be updated on-chain/RPC
+        time.sleep(2)
     except Exception as e:
-        LOG.warning(f"[csol_user_to_wrapper_and_burn] apply-pending for user failed (may be ok): {e}")
+        LOG.warning(f"[csol_user_to_wrapper_and_burn] apply-pending (1) for user failed (may be ok): {e}")
+
+    # WORKAROUND: Force a state refresh by cycling through public state
+    # User confirmed sequence: apply -> withdraw -> deposit -> apply -> transfer
+    try:
+        LOG.info(f"[csol_user_to_wrapper_and_burn] Cycling {amount_str} tokens via Withdraw->Deposit")
+        
+        # Withdraw
+        _run(["spl-token", "withdraw-confidential-tokens", MINT, amount_str, "--owner", user_kf, "--fee-payer", user_kf])
+        
+        # Deposit
+        _run(["spl-token", "deposit-confidential-tokens", MINT, amount_str, "--owner", user_kf, "--fee-payer", user_kf])
+        
+        # Apply again
+        spl_apply(user_kf, user_kf)
+        time.sleep(2)
+        
+    except Exception as e:
+        LOG.warning(f"[csol_user_to_wrapper_and_burn] Cycle workaround failed (ignoring): {e}")
 
     sig_transfer = _run(
         [
